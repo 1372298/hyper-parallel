@@ -24,6 +24,7 @@ from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  
     _get_lb_override,
 )
 from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.shard.utils import get_rank
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
 
@@ -166,7 +167,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
             return 0
 
         if isinstance(dim_map, str):
-            rank = platform.get_rank()
+            rank = get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(dim_map)
             if rank in rank_list:
                 return rank_list.index(rank)
@@ -184,7 +185,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
                     f"Using the last axis for split_id calculation."
                 )
             axis_name = non_none_axes[-1]
-            rank = platform.get_rank()
+            rank = get_rank()
             rank_list = layout.mesh.get_rank_list_along_axis(axis_name)
             if rank in rank_list:
                 return rank_list.index(rank)
