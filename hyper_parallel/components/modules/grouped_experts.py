@@ -383,11 +383,11 @@ class GroupedExperts(nn.Module):
 
         # up
         if permuted.nelement() != 0:
-            fc1_output = grouped_matmul(
+            fc1_output = grouped_matmul(  # pylint: disable=not-callable
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
-                b1 = self.bias1.view(self.num_local_experts, 1, -1)
+                b1 = self.bias1.view(self.num_local_experts, -1)
                 fc1_output = fc1_output + torch.repeat_interleave(b1, self._tokens_per_expert_gmm, dim=0)
         else:
             gate_up_proj_2d = gate_up_proj.view(self.hidden_size, -1)
@@ -406,11 +406,11 @@ class GroupedExperts(nn.Module):
             down_proj = down_proj.view(self.num_local_experts, -1, self.hidden_size)
 
         if fc1_output.nelement() != 0:
-            fc2_output = grouped_matmul(
+            fc2_output = grouped_matmul(  # pylint: disable=not-callable
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
-                b2 = self.bias2.view(self.num_local_experts, 1, -1)
+                b2 = self.bias2.view(self.num_local_experts, -1)
                 fc2_output = fc2_output + torch.repeat_interleave(
                     b2, self._tokens_per_expert_gmm, dim=0,
                 )
@@ -453,7 +453,7 @@ class GroupedExperts(nn.Module):
         """Run grouped experts with the Transformers Experts interface."""
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        permuted_tokens, sorted_indices = moe_token_permute(
+        permuted_tokens, sorted_indices = moe_token_permute(  # pylint: disable=not-callable
             hidden_states_flat,
             top_k_index,
         )
@@ -470,7 +470,7 @@ class GroupedExperts(nn.Module):
             tokens_per_expert,
             permuted_probs,
         )
-        output = moe_token_unpermute(
+        output = moe_token_unpermute(  # pylint: disable=not-callable
             expert_outputs,
             sorted_indices,
             top_k_weights,

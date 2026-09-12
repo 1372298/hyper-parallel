@@ -69,23 +69,27 @@ class ProfilerWithMem:
     # delegate ctx-manager behaviour
     def __enter__(self) -> Any:
         """Enter the wrapped profiler's context manager."""
-        return self._p.__enter__()
+        self.start()
+        return self
 
     def __exit__(self, *a: Any) -> Any:
         """Exit the wrapped profiler's context manager."""
-        return self._p.__exit__(*a)
+        del a
+        self.stop()
+        return False
 
     def start(self) -> Any:
         """Start profiling and begin recording the allocator history."""
         out = self._p.start()
-        get_torch_device().memory._record_memory_history()
+        get_torch_device().memory._record_memory_history()  # pylint: disable=protected-access
         return out
 
     def stop(self) -> Any:
         """Stop profiling and stop recording the allocator history."""
-        out = self._p.stop()
-        get_torch_device().memory._record_memory_history(enabled=None)  # step recording memory snapshot
-        return out
+        try:
+            return self._p.stop()
+        finally:
+            get_torch_device().memory._record_memory_history(enabled=None)  # pylint: disable=protected-access
 
     def step(self, *a: Any, **kw: Any) -> Any:
         """Advance the wrapped profiler by one step."""
@@ -149,17 +153,17 @@ def create_profiler(
             trace_file = p.prof_if.prof_path
         elif IS_CUDA_AVAILABLE:
             p.export_chrome_trace(trace_file)
-        logger.info(f"Profiling result saved at {trace_file}.")
+        logger.info(f"Profiling result saved at {trace_file}.")  # pylint: disable=logging-fstring-interpolation
 
         if profile_memory:
-            get_torch_device().memory._dump_snapshot(gpu_memory_file)
-            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")
+            get_torch_device().memory._dump_snapshot(gpu_memory_file)  # pylint: disable=protected-access
+            logger.info(f"Profiling memory visualization saved at {gpu_memory_file}.")  # pylint: disable=logging-fstring-interpolation
 
         if trace_dir.startswith("hdfs://"):
             if copy is None:
                 raise ValueError("hdfs_io.copy is required for an HDFS profiling trace directory")
             copy(trace_file, trace_dir)
-            logger.info(f"Profiling result uploaded to {trace_dir}.")
+            logger.info(f"Profiling result uploaded to {trace_dir}.")  # pylint: disable=logging-fstring-interpolation
 
     if IS_NPU_AVAILABLE:
         profiler_module = torch_npu.profiler
@@ -167,7 +171,7 @@ def create_profiler(
         npu_trace_handler = torch_npu.profiler.tensorboard_trace_handler(
             CACHE_DIR if trace_dir.startswith("hdfs://") else trace_dir
         )
-        experimental_config = torch_npu.profiler._ExperimentalConfig(
+        experimental_config = torch_npu.profiler._ExperimentalConfig(  # pylint: disable=protected-access
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             data_simplification=False,
@@ -180,7 +184,7 @@ def create_profiler(
     warmup = 0 if start_step == 1 else 1
     wait = start_step - warmup - 1
     active = end_step - start_step
-    logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")
+    logger.info(f"build profiler schedule - wait: {wait}, warmup: {warmup}, active: {active}.")  # pylint: disable=logging-fstring-interpolation
 
     schedule = profiler_module.schedule(
         wait=wait,
