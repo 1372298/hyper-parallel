@@ -25,9 +25,7 @@ from contextvars import ContextVar
 from typing import Any, Dict, Iterator, List, Optional, Set
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.platform import get_platform
-
-platform = get_platform()
+from . import _backend
 
 # ---------------------------------------------------------------------------
 # Module-level buffer pools — process-local, no locking needed for single-
@@ -68,7 +66,7 @@ def _get_cpu_pinned_buf(dtype_key: str, total_numel: int, dtype):
     # No suitable buffer — discard one stale undersized entry.
     if pool:
         pool.pop()
-    return platform.alloc_tensor_buffer(total_numel, dtype, device='cpu', pin_memory=True)
+    return _backend.alloc_tensor_buffer(total_numel, dtype, device='cpu', pin_memory=True)
 
 
 def _return_cpu_pinned_buf(buf):
@@ -84,11 +82,11 @@ def _collect_device_storage_ptrs(tensors: Any) -> Set[int]:
 
     def _collect(x):
         local_tensor = x.to_local() if isinstance(x, DTensor) else x
-        if isinstance(local_tensor, platform.Tensor) and str(local_tensor.device).lower() != "cpu":
+        if isinstance(local_tensor, _backend.Tensor) and str(local_tensor.device).lower() != "cpu":
             storage_ptrs.add(local_tensor.untyped_storage().data_ptr())
         return x
 
-    platform.tree_map(_collect, tensors)
+    _backend.tree_map(_collect, tensors)
     return storage_ptrs
 
 
@@ -109,12 +107,12 @@ class SwapTensor:
         self.group_swap = group_swap # opt-in for group copy fusion (MUST_SWAP tensors only)
         self.cpu_pool = cpu_pool
         self._cpu_pool_buffer = None
-        if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
+        if isinstance(val, _backend.Tensor) and str(val.device).lower() != 'cpu':
             self.ver = val._version
             self._state = self.STATE_DEVICE
             val_storage = val.untyped_storage()
             self.storage_size = val_storage.size()
-            self.is_slice_tensor = self.storage_size != val.numel() * platform.get_element_size(val)
+            self.is_slice_tensor = self.storage_size != val.numel() * _backend.get_element_size(val)
             self.val_cpu = None
         else:
             self.ver = None
@@ -190,7 +188,7 @@ class SwapTensor:
 
         if self.val_cpu is None:
             raise ValueError("val_cpu must not be None during async_load")
-        with platform.preserve_version_counter(self.val):
+        with _backend.preserve_version_counter(self.val):
             if self.cpu_pool is not None or self.is_slice_tensor:
                 self.val.data.copy_(self.val_cpu, non_blocking=True)
             else:
@@ -214,7 +212,7 @@ class SwapTensor:
                 f"Cannot load grouped tensor from {self.funcname}: device storage was not restored. "
                 f"expected size:{self.storage_size}, current size:{self.val.untyped_storage().size()}"
             )
-        with platform.preserve_version_counter(self.val):
+        with _backend.preserve_version_counter(self.val):
             self.val.copy_(source.reshape(self.val.shape), non_blocking=True)
         self._state = self.STATE_H2D
 
@@ -272,11 +270,11 @@ class SwapTensor:
 
         if self.val_cpu is None:
             if self.cpu_pool is None:
-                self.val_cpu = platform.empty_like(
+                self.val_cpu = _backend.empty_like(
                     self.val, device="cpu", pin_memory=True
                 )
             else:
-                logical_bytes = self.val.numel() * platform.get_element_size(self.val)
+                logical_bytes = self.val.numel() * _backend.get_element_size(self.val)
                 self._cpu_pool_buffer = self.cpu_pool.acquire(logical_bytes)
                 try:
                     self.val_cpu = self._cpu_pool_buffer.view(self.val.dtype).reshape(self.val.shape)
@@ -290,8 +288,8 @@ class SwapTensor:
                 self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
         except Exception:
             if self.cpu_pool is not None and self._cpu_pool_buffer is not None:
-                release_event = platform.new_event()
-                release_event.record(platform.get_current_stream())
+                release_event = _backend.new_event()
+                release_event.record(_backend.get_current_stream())
                 self.release_cpu_buffer(release_event)
             self.val_cpu = None
             raise
@@ -361,7 +359,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_collect, item)
+                _backend.tree_map(_collect, item)
         return collected
 
     def mark_duplicate_swaps(self, seen_keys) -> int:
@@ -390,7 +388,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_protect_tensor, item)
+                _backend.tree_map(_protect_tensor, item)
 
     def launch_load(self):
         """launch async load for all tensors in swap storage"""
@@ -401,7 +399,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_async_load, item)
+                _backend.tree_map(_async_load, item)
 
     def resize_device_storage(self):
         """Resize device storage for all swap tensors (runs on compute stream)."""
@@ -411,7 +409,7 @@ class Storage:
             return x
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_resize, item)
+                _backend.tree_map(_resize, item)
 
     def wait_load(self, release_event=None):
         """wait load for all tensors in swap storage"""
@@ -422,7 +420,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_wait_load, item)
+                _backend.tree_map(_wait_load, item)
         self.clear()
 
     def release_cpu_buffers(self, event=None):
@@ -434,7 +432,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_release, item)
+                _backend.tree_map(_release, item)
 
     def wait_offload(self):
         """wait offload for all tensors in swap storage"""
@@ -445,7 +443,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_wait_offload, item)
+                _backend.tree_map(_wait_offload, item)
 
     def launch_offload(self):
         """launch async offload for all tensors in swap storage"""
@@ -457,7 +455,7 @@ class Storage:
 
         for storage_list in self.values():
             for item in storage_list:
-                platform.tree_map(_async_offload, item)
+                _backend.tree_map(_async_offload, item)
 
 
 class SwapGroup:
@@ -578,7 +576,7 @@ class SwapGroup:
         for storage in self._storages:
             for storage_list in storage.values():
                 for item in storage_list:
-                    platform.tree_map(_try_pack, item)
+                    _backend.tree_map(_try_pack, item)
 
         for dtype_bucket_list in candidate_buckets.values():
             for candidate_bucket in dtype_bucket_list:
@@ -616,20 +614,20 @@ class SwapGroup:
         offloaded individually via the existing per-tensor path.
         """
         total_bytes = self._collect_packable_tensors()
-        with platform.no_grad():
+        with _backend.no_grad():
             if total_bytes > 0:
                 group_device_bufs = {}
                 group_cpu_bufs = {}
                 for bucket_key, swap_tensors in self._packed_by_bucket.items():
-                    group_device_bufs[bucket_key] = platform.cat(
+                    group_device_bufs[bucket_key] = _backend.cat(
                         [st.val.reshape(-1) for st in swap_tensors], dim=0
                     )
 
-        compute_event = platform.new_event()
-        compute_event.record(platform.get_current_stream())
-        self._offload_event = platform.new_event()
-        stream_context = platform.get_stream_context()
-        with platform.no_grad(), stream_context(copy_stream):
+        compute_event = _backend.new_event()
+        compute_event.record(_backend.get_current_stream())
+        self._offload_event = _backend.new_event()
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
 
             if total_bytes > 0:
@@ -651,7 +649,7 @@ class SwapGroup:
                         group_cpu_bufs[bucket_key] = cpu_buf
                         cpu_buf[:numel].copy_(group_device_bufs[bucket_key], non_blocking=True)
                 except Exception:
-                    release_event = platform.new_event()
+                    release_event = _backend.new_event()
                     release_event.record(copy_stream)
                     for bucket_key, cpu_buf in group_cpu_bufs.items():
                         bucket = self._packed_buckets[bucket_key]
@@ -675,9 +673,9 @@ class SwapGroup:
             raise RuntimeError(
                 f"SwapGroup '{self.group_name}' wait_offload() called before launch_offload()."
             )
-        compute_stream = platform.get_current_stream()
-        stream_context = platform.get_stream_context()
-        with platform.no_grad(), stream_context(compute_stream):
+        compute_stream = _backend.get_current_stream()
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(compute_stream):
             self._offload_event.wait(compute_stream)
             self._offload_event = None
             for storage in self._storages:
@@ -694,15 +692,15 @@ class SwapGroup:
         """
         # Restore original storages before scheduling copies. Keeping the same
         # storage object is required for autograd-saved views of packed tensors.
-        with platform.no_grad():
+        with _backend.no_grad():
             for storage in self._storages:
                 storage.resize_device_storage()
 
-        compute_event = platform.new_event()
-        compute_event.record(platform.get_current_stream())
-        self._load_event = platform.new_event()
-        stream_context = platform.get_stream_context()
-        with platform.no_grad(), stream_context(copy_stream):
+        compute_event = _backend.new_event()
+        compute_event.record(_backend.get_current_stream())
+        self._load_event = _backend.new_event()
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
 
             if self._packed_tensor_info and self._group_cpu_buf is not None:
@@ -712,7 +710,7 @@ class SwapGroup:
                     if cpu_buf is None:
                         continue
                     numel = bucket["total_numel"]
-                    group_device_bufs[bucket_key] = platform.alloc_tensor_buffer(
+                    group_device_bufs[bucket_key] = _backend.alloc_tensor_buffer(
                         numel, bucket["dtype"], bucket["device"]
                     )
                     # One-shot H2D per packed bucket.
@@ -752,10 +750,10 @@ class SwapGroup:
             raise RuntimeError(
                 f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
             )
-        compute_stream = platform.get_current_stream()
+        compute_stream = _backend.get_current_stream()
         load_event = self._load_event
-        stream_context = platform.get_stream_context()
-        with platform.no_grad(), stream_context(compute_stream):
+        stream_context = _backend.get_stream_context()
+        with _backend.no_grad(), stream_context(compute_stream):
             load_event.wait(compute_stream)
             for storage in self._storages:
                 storage.wait_load(release_event=load_event)
@@ -1064,7 +1062,7 @@ class SwapManager:
         def _register_hooks_once(module, group_name):
             hooks = [
                 ("_swap_forward_pre_hook_handle",
-                 lambda h: platform.register_forward_pre_hook(module, h, prepend=True),
+                 lambda h: _backend.register_forward_pre_hook(module, h, prepend=True),
                  functools.partial(_forward_pre_hook, group_name)),
 
                 ("_swap_forward_hook_handle",
@@ -1072,11 +1070,11 @@ class SwapManager:
                  functools.partial(_forward_hook, group_name)),
 
                 ("_swap_backward_pre_hook_handle",
-                 lambda h: platform.register_full_backward_pre_hook(module, h, prepend=True),
+                 lambda h: _backend.register_full_backward_pre_hook(module, h, prepend=True),
                  functools.partial(_backward_pre_hook, group_name)),
 
                 ("_swap_backward_hook_handle",
-                 lambda h: platform.register_full_backward_hook(module, h),
+                 lambda h: _backend.register_full_backward_hook(module, h),
                  functools.partial(_backward_hook, group_name)),
             ]
 
@@ -1091,5 +1089,5 @@ class SwapManager:
     def _get_copy_stream(self):
         """Return a singleton copy stream, created on first access."""
         if self._copy_stream is None:
-            self._copy_stream = platform.new_stream()
+            self._copy_stream = _backend.new_stream()
         return self._copy_stream

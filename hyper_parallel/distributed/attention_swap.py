@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, swap_wrapper
+from hyper_parallel.core.activation_memory import CheckpointPolicy, SwapManager, swap_wrapper
 
 logger = logging.getLogger(__name__)
 

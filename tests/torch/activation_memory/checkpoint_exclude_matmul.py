@@ -25,7 +25,7 @@ from typing import Any, Dict
 
 import torch
 
-from hyper_parallel.core.activation_checkpoint import checkpoint_exclude_wrapper, checkpoint_wrapper
+from hyper_parallel.core.activation_memory import checkpoint_exclude_wrapper, checkpoint_wrapper
 
 
 _TOKEN_NUM = 16384
@@ -33,7 +33,7 @@ _HIDDEN_SIZE = 2048
 _LAYER_NUM = 20
 _RESULT_MARKER = "__TORCH_RMSNORM_MATMUL_RESULT__"
 _EXCLUDE_MODULE = importlib.import_module(
-    "hyper_parallel.platform.torch.activation_checkpoint.checkpoint_exclude_wrapper"
+    "hyper_parallel.core.activation_memory.checkpoint_exclude"
 )
 
 
@@ -422,7 +422,7 @@ def _run_mode_in_subprocess(mode: str) -> Dict[str, Any]:
         "-c",
         (
             "import json; "
-            "from tests.torch.activation_checkpoint.checkpoint_exclude_matmul import _run_mode; "
+            "from tests.torch.activation_memory.checkpoint_exclude_matmul import _run_mode; "
             f"print({_RESULT_MARKER!r} + json.dumps(_run_mode({mode!r})))"
         ),
     ]

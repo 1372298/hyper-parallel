@@ -19,9 +19,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from hyper_parallel.platform import get_platform
+import torch
 
-platform = get_platform()
+from . import _backend
 
 _MIN_BUCKET_BYTES = 1024
 _IN_USE = "in_use"
@@ -206,9 +206,9 @@ class PinnedMemoryPool:
 
         if reserved:
             try:
-                buffer = platform.alloc_tensor_buffer(
+                buffer = _backend.alloc_tensor_buffer(
                     aligned_size,
-                    platform.tensor_dtype.uint8,
+                    torch.uint8,
                     device="cpu",
                     pin_memory=True,
                 )

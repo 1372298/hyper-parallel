@@ -20,15 +20,15 @@ import pytest
 import torch
 
 from torch import nn
-from hyper_parallel.core.activation_checkpoint import (
+from hyper_parallel.core.activation_memory import (
     PinnedMemoryPool,
     SwapManager,
     swap_tensor_wrapper,
     swap_wrapper,
 )
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy, swap
-from hyper_parallel.core.activation_checkpoint.swap import SwapGroup
-from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, set_seed, train_one_mode
+from hyper_parallel.core.activation_memory.api import CheckpointPolicy, swap
+from hyper_parallel.core.activation_memory.swap import SwapGroup
+from tests.torch.activation_memory.utils import prepare_data, seed_memory_time_context, set_seed, train_one_mode
 from tests.torch.common_net import SimpleTransformer
 
 

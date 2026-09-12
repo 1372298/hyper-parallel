@@ -22,15 +22,15 @@ from typing import Any, Optional
 import torch
 from torch import nn
 
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
+from hyper_parallel.core.activation_memory.api import (
     CheckpointPolicy,
     checkpoint_wrapper,
+    create_selective_checkpoint_contexts,
+    ignore_sac_ops as _ignore_sac_ops,
 )
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
-from hyper_parallel.platform import get_platform
+from hyper_parallel.core.activation_memory.swap import SwapManager
 
 logger = logging.getLogger(__name__)
-platform = get_platform()
 
 
 def _resolve_torch_op(dotted_path: str):
@@ -262,7 +262,7 @@ def ignore_sac_ops(ops: list[object | None]) -> None:
         ops: Backend operators to ignore. ``None`` entries represent optional
             operators that are unavailable in the installed PyTorch version.
     """
-    platform.ignore_sac_ops(ops)
+    _ignore_sac_ops(ops)
 
 
 def ensure_profiler_ops_sac_ignored() -> None:
@@ -377,7 +377,7 @@ def make_selective_checkpoint_context_fn() -> Callable[[], tuple[object, object]
             The ``(forward_context, recompute_context)`` pair expected by the
             non-reentrant checkpointing ``context_fn`` contract.
         """
-        return platform.create_selective_checkpoint_contexts(
+        return create_selective_checkpoint_contexts(
             _make_selective_checkpoint_policy_fn()
         )
 

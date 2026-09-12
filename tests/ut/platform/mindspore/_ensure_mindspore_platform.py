@@ -98,12 +98,6 @@ def ensure_mindspore_platform_for_context_parallel() -> None:
 def ensure_mindspore_platform_default() -> None:
     """Clear singleton only; next :func:`get_platform` uses ``HYPER_PARALLEL_PLATFORM``."""
     _reset_platform_singleton()
-    _bind_platform_globals(
-        (
-            "hyper_parallel.core.activation_checkpoint",
-            "hyper_parallel.core.activation_checkpoint.activation_checkpoint",
-        )
-    )
 
 
 def ensure_mindspore_platform_for_shard_and_dtensor() -> None:
@@ -133,7 +127,5 @@ def restore_torch_platform_for_ut() -> None:
             "hyper_parallel.core.shard.custom_shard",
             *_FULLY_SHARD_PLATFORM_BIND_MODULES,
             "hyper_parallel.core.context_parallel.async_context_parallel",
-            "hyper_parallel.core.activation_checkpoint",
-            "hyper_parallel.core.activation_checkpoint.activation_checkpoint",
         )
     )

@@ -24,8 +24,8 @@ import torch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-swap_module = importlib.import_module("hyper_parallel.core.activation_checkpoint.swap")
-from hyper_parallel.core.activation_checkpoint.swap import (  # noqa: E402
+swap_module = importlib.import_module("hyper_parallel.core.activation_memory.swap")
+from hyper_parallel.core.activation_memory.swap import (  # noqa: E402
     SwapGroup,
     SwapManager,
     SwapTensor,
@@ -38,8 +38,8 @@ from hyper_parallel.core.activation_checkpoint.swap import (  # noqa: E402
 
 
 def _swap_plat_patch():
-    """Patch the platform in the swap module, avoiding name conflict with swap() function."""
-    return patch.object(swap_module, "platform")
+    """Patch the Torch API module backing the swap module, avoiding name conflict with swap()."""
+    return patch.object(swap_module, "_backend")
 
 
 def _build_mock_platform():

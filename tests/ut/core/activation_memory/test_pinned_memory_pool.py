@@ -20,8 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from hyper_parallel.core.activation_checkpoint import pinned_memory_pool
-from hyper_parallel.core.activation_checkpoint.pinned_memory_pool import PinnedMemoryPool
+from hyper_parallel.core.activation_memory import pinned_memory_pool
+from hyper_parallel.core.activation_memory.pinned_memory_pool import PinnedMemoryPool
 
 
 class _Event:
@@ -78,11 +78,14 @@ class TestPinnedMemoryPool(unittest.TestCase):
 
     def setUp(self) -> None:
         self.mock_platform = MagicMock()
-        self.mock_platform.tensor_dtype.uint8 = torch.uint8
         self.mock_platform.alloc_tensor_buffer.side_effect = (
             lambda numel, dtype, device, pin_memory: torch.empty(numel, dtype=dtype)
         )
-        self.platform_patch = patch.object(pinned_memory_pool, "platform", self.mock_platform)
+        self.platform_patch = patch.object(
+            pinned_memory_pool._backend,
+            "alloc_tensor_buffer",
+            self.mock_platform.alloc_tensor_buffer,
+        )
         self.platform_patch.start()
 
     def tearDown(self) -> None:

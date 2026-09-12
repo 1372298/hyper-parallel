@@ -24,29 +24,30 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
-from hyper_parallel.core.activation_checkpoint import (
+from hyper_parallel.core.activation_memory import (
     CheckpointPolicy,
     SwapManager,
+    clear_recompute_session,
     checkpoint,
     checkpoint_wrapper,
+    recompute_handle,
+    recompute_handle_collector_ctx,
+    recompute_session_ctx,
     swap_wrapper,
 )
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.torch.activation_checkpoint import checkpoint as hyper_checkpoint
 from tests.torch.common_net import SimpleTransformer
-from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, set_seed, train_one_mode
+from tests.torch.activation_memory.utils import prepare_data, seed_memory_time_context, set_seed, train_one_mode
 
 
 MEMORY_COMPARISON_MODES = ("none", "recompute", "save", "swap", "group_swap")
 MEMORY_COMPARISON_VOCAB_SIZE = 8192
-platform = get_platform()
 
 
 def _prefire_recompute(handles: list, session_id: Any) -> None:
     """Run all collected checkpoint frames in one retained session."""
-    with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+    with recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
         for handle in handles:
-            platform.recompute_handle(handle, session_id)
+            recompute_handle(handle, session_id)
 
 
 def _scheduled_dx_dw(
@@ -56,9 +57,9 @@ def _scheduled_dx_dw(
     session_id: Any,
 ) -> tuple:
     """Compute separate input and weight gradients from one prefired session."""
-    with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+    with recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
         input_grad = torch.autograd.grad(output.sum(), input_tensor, retain_graph=True)[0]
-    with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=False):
+    with recompute_session_ctx(session_id=session_id, retain_on_unpack=False):
         weight_grads = torch.autograd.grad(output.sum(), weights)
     return input_grad, weight_grads
 
@@ -101,7 +102,7 @@ def test_hyper_npu_rng_for_closure_only_tensor_matches_native():
         native_output, native_grad = _run_closure_only_npu_rng_case(
             lambda function, argument: torch_checkpoint(function, argument, use_reentrant=False)
         )
-        hyper_output, hyper_grad = _run_closure_only_npu_rng_case(hyper_checkpoint)
+        hyper_output, hyper_grad = _run_closure_only_npu_rng_case(checkpoint)
     finally:
         DefaultDeviceType.set_device_type(previous_device_type)
 
@@ -132,7 +133,7 @@ def test_scheduled_recompute_supports_dx_dw_split() -> None:
         checkpoint_calls += 1
         return torch.nn.functional.gelu(current_input @ current_weight)
 
-    with platform.recompute_handle_collector_ctx() as handles:
+    with recompute_handle_collector_ctx() as handles:
         output = checkpoint(checkpointed_function, input_tensor, weight)
 
     assert len(handles) == 1
@@ -141,7 +142,7 @@ def test_scheduled_recompute_supports_dx_dw_split() -> None:
         _prefire_recompute(handles, session_id)
         actual_dx, actual_dws = _scheduled_dx_dw(output, input_tensor, (weight,), session_id)
     finally:
-        platform.clear_recompute_session(session_id)
+        clear_recompute_session(session_id)
 
     assert checkpoint_calls == 2
     torch.testing.assert_close(output, reference_output)
@@ -169,7 +170,7 @@ def test_scheduled_recompute_npu_preserves_rng_state() -> None:
     )
 
     set_seed(88)
-    with platform.recompute_handle_collector_ctx() as handles:
+    with recompute_handle_collector_ctx() as handles:
         output = checkpoint(
             lambda current_input, current_weight: torch.nn.functional.dropout(
                 torch.nn.functional.gelu(current_input @ current_weight),
@@ -188,7 +189,7 @@ def test_scheduled_recompute_npu_preserves_rng_state() -> None:
         rng_state_after_prefire = torch.npu.get_rng_state()
         actual_dx, actual_dws = _scheduled_dx_dw(output, input_tensor, (weight,), session_id)
     finally:
-        platform.clear_recompute_session(session_id)
+        clear_recompute_session(session_id)
 
     assert torch.equal(rng_state_after_prefire, rng_state_before_prefire)
     torch.testing.assert_close(output, reference_output)
@@ -219,7 +220,7 @@ def test_scheduled_recompute_npu_restores_autocast() -> None:
         return torch.nn.functional.gelu(result)
 
     with torch.autocast(device_type="npu", dtype=torch.bfloat16):
-        with platform.recompute_handle_collector_ctx() as handles:
+        with recompute_handle_collector_ctx() as handles:
             output = checkpoint(checkpointed_function, input_tensor, weight)
 
     session_id = ("npu_autocast", id(output))
@@ -227,7 +228,7 @@ def test_scheduled_recompute_npu_restores_autocast() -> None:
         _prefire_recompute(handles, session_id)
         actual_dx, actual_dws = _scheduled_dx_dw(output.float(), input_tensor, (weight,), session_id)
     finally:
-        platform.clear_recompute_session(session_id)
+        clear_recompute_session(session_id)
 
     assert execution_dtypes == [torch.bfloat16, torch.bfloat16]
     assert output.dtype == torch.bfloat16
