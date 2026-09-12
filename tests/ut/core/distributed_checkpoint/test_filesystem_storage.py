@@ -46,12 +46,21 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
     MetadataIndex,
+    TensorProperties,
+    TensorStorageMetadata,
 )
 from hyper_parallel.core.distributed_checkpoint.planner import (
     BroadcastSource,
+    LoadItemType,
+    LoadPlan,
+    ReadItem,
     SavePlan,
     WriteItem,
     WriteItemType,
+)
+from hyper_parallel.core.distributed_checkpoint.standard_planner import (
+    StandardLoadPlanner,
+    StandardSavePlanner,
 )
 from hyper_parallel.core.distributed_checkpoint.storage import METADATA_FILE_NAME, StorageInfo
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
@@ -71,7 +80,12 @@ class _FakeBatcher:
         self.batched = 0
 
     def add(self, in_flight: Any, state_dict: dict, item: Any) -> None:
-        """Take one shard, as the real batcher does, without reaching a backend."""
+        """Take one shard, as the real batcher does, without reaching a backend.
+
+        ``in_flight`` and ``state_dict`` are what the real batcher sends through; a
+        stand-in that records the call has no use for either.
+        """
+        del in_flight, state_dict
         self.sent += 1
         if self.events is not None:
             self.events.append(f"send {item.dest_index.fqn}")
@@ -81,7 +95,11 @@ class _FakeBatcher:
 
 
 def _pairs(reader: Any, reqs: list, storage_data: dict, keys: Any = None) -> list:
-    """What a read hands back, without a checkpoint file behind it: an item, and nothing read."""
+    """What a read hands back, without a checkpoint file behind it: an item, and nothing read.
+
+    Takes the real fetch signature so it can stand in for it; only ``reqs`` decides the result.
+    """
+    del reader, storage_data, keys
     return [(req, None) for req in reqs]
 
 
@@ -89,6 +107,7 @@ class TestFilesystemStorage(unittest.TestCase):
     """Tests for filesystem checkpoint storage reader/writer."""
 
     def setUp(self) -> None:
+        """Rebuild the storage module against the torch platform before every case."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(planner_mod)
@@ -110,7 +129,6 @@ class TestFilesystemStorage(unittest.TestCase):
         Description: Write one rank's tensor shard then read back via execute_read.
         Expectation: Loaded state_dict tensor matches saved values.
         """
-        from hyper_parallel.core.distributed_checkpoint.standard_planner import StandardLoadPlanner, StandardSavePlanner
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt_dir = Path(tmpdir)
@@ -144,7 +162,8 @@ class TestFilesystemStorage(unittest.TestCase):
 
     def test_writer_assigns_unique_physical_keys_to_same_fqn_chunks(self):
         """Multiple logical chunks with one FQN remain distinct in safetensors."""
-        def make_item(fqn, offset):
+        def make_item(fqn: str, offset: tuple) -> WriteItem:
+            """One tensor write item for ``fqn`` at ``offset``."""
             return WriteItem(
                 index=MetadataIndex(fqn=fqn, offset=offset),
                 type=WriteItemType.TENSOR,
@@ -196,10 +215,6 @@ class TestFilesystemStorage(unittest.TestCase):
             )
             with tempfile.TemporaryDirectory() as tmpdir:
                 ckpt_dir = Path(tmpdir)
-                from hyper_parallel.core.distributed_checkpoint.standard_planner import (
-                    StandardLoadPlanner,
-                    StandardSavePlanner,
-                )
 
                 save_planner = StandardSavePlanner(enable_plan_caching=False)
                 save_planner.configure_planner(
@@ -228,7 +243,7 @@ class TestFilesystemStorage(unittest.TestCase):
                 # The rank lookup happens on the shared ``platform`` object
                 # imported from util; patch the method on it.
                 with patch(
-                    "hyper_parallel.core.distributed_checkpoint.util.platform.get_rank",
+                    "hyper_parallel.core.distributed_checkpoint.utils.dist.get_rank",
                     return_value=0,
                 ):
                     load_plan = load_planner.build_local_plan()
@@ -242,7 +257,6 @@ class TestFilesystemStorage(unittest.TestCase):
         Description: Write pickled metadata to .rank{rank}_metadata filename pattern.
         Expectation: load_metadata(rank=0) returns the same Metadata object.
         """
-        from hyper_parallel.core.distributed_checkpoint.metadata import TensorProperties, TensorStorageMetadata
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt_dir = Path(tmpdir)
@@ -280,7 +294,6 @@ class TestFilesystemStorage(unittest.TestCase):
         Description: Load plan with ReadItems referencing the same safetensors file.
         Expectation: Items are grouped under one absolute file path key.
         """
-        from hyper_parallel.core.distributed_checkpoint.planner import LoadItemType, ReadItem
 
         storage_index = MetadataIndex(fqn="w", offset=(0, 0), index=0)
         storage_info = StorageInfo(relative_path="_rank0_.safetensors", offset=0, length=-1)
@@ -318,10 +331,6 @@ class TestFilesystemStorage(unittest.TestCase):
         Returns:
             tuple: The reader and the load plan to hand it.
         """
-        from hyper_parallel.core.distributed_checkpoint.planner import (
-            LoadItemType, LoadPlan, ReadItem,
-        )
-
         storage_data, items = {}, []
         for index, (fqn, source) in enumerate(shards):
             relative = f"_rank{index % files}_.safetensors"
@@ -359,6 +368,7 @@ class TestFilesystemStorage(unittest.TestCase):
 
         def record_apply(fetched: list, planner: Any) -> None:
             """Note which shards were put in place instead of copying anything."""
+            del planner
             events.extend(f"apply {req.dest_index.fqn}" for req, payload in fetched)
 
         with tempfile.TemporaryDirectory() as tmpdir:

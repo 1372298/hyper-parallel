@@ -17,7 +17,13 @@ from __future__ import annotations
 
 import importlib
 
+from tests.common.mark_utils import arg_mark
 
+
+# level3: the distributed_checkpoint core is PyTorch-only, so the MindSpore offline converter
+# is out of the gate until it is ported.
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level3", card_mark="onecard",
+          essential_mark="unessential")
 def test_offline_convert_checkpoint_roundtrip_suite_mindspore():
     """See impl suite."""
     # pylint: disable=C0415

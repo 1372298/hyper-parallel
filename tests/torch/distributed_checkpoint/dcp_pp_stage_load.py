@@ -47,7 +47,7 @@ import torch
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.distributed_checkpoint import load, save
-from hyper_parallel.core.distributed_checkpoint.util import _MAX_BROADCASTS_IN_FLIGHT
+from hyper_parallel.core.distributed_checkpoint.broadcast import _MAX_BROADCASTS_IN_FLIGHT
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.platform import get_platform

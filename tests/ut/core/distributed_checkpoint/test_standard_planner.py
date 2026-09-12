@@ -32,6 +32,7 @@ import hyper_parallel.core.distributed_checkpoint.standard_planner as planner_mo
 importlib.reload(planner_mod)
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
+    BytesStorageMetadata,
     CHUNK_INFO,
     ChunkInfo,
     ChunkStorageMetadata,
@@ -64,6 +65,7 @@ class TestStandardPlanner(unittest.TestCase):
     """Tests for StandardSavePlanner and StandardLoadPlanner."""
 
     def setUp(self) -> None:
+        """Rebuild the planner module before every case so the plan cache starts empty."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(planner_mod)
@@ -227,7 +229,6 @@ class TestStandardPlanner(unittest.TestCase):
         Description: Load planner configured with BYTE_IO metadata entry.
         Expectation: Local plan has BYTE_IO ReadItem; apply_bytes restores Python object.
         """
-        from hyper_parallel.core.distributed_checkpoint.metadata import BytesStorageMetadata
 
         payload = {"lr": 0.01}
         state = {"opt_state": None}
@@ -265,7 +266,7 @@ class TestStandardPlanner(unittest.TestCase):
         # The rank lookup happens on the shared ``platform`` object imported from
         # util, so patch the method on it rather than a module-level getter.
         with patch(
-                "hyper_parallel.core.distributed_checkpoint.util.platform.get_rank",
+                "hyper_parallel.core.distributed_checkpoint.utils.dist.get_rank",
                 return_value=0,
         ):
             read_items = planner.build_local_plan().items
@@ -539,7 +540,6 @@ class TestStandardPlanner(unittest.TestCase):
             from bytes, not tensor storage a collective could write into, so grouping it
             would hand the others a broadcast that cannot happen.
         """
-        from hyper_parallel.core.distributed_checkpoint.metadata import BytesStorageMetadata
 
         planner = self._configured_load_planner(
             {"opt_state": None},

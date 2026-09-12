@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""UT for :mod:`hyper_parallel.core.distributed_checkpoint.util`."""
+"""UT for :mod:`hyper_parallel.core.distributed_checkpoint.broadcast`."""
 # pylint: disable=wrong-import-position
 import importlib
 import os
-import tempfile
 import unittest
 from collections import deque
-from pathlib import Path
+from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -30,242 +29,30 @@ import hyper_parallel.platform.platform as _platform_mod
 
 _platform_mod.platform = None
 
-import hyper_parallel.core.distributed_checkpoint.util as util_mod
+import hyper_parallel.core.distributed_checkpoint.broadcast as broadcast_mod
+import hyper_parallel.core.distributed_checkpoint.utils as utils_mod
 
-importlib.reload(util_mod)
+importlib.reload(utils_mod)
+importlib.reload(broadcast_mod)
 
-from hyper_parallel.core.distributed_checkpoint.metadata import (
-    CHUNK_INFO,
-    ChunkInfo,
-    ChunkStorageMetadata,
-    MetadataIndex,
-    TensorProperties,
-)
+from hyper_parallel.core.distributed_checkpoint.metadata import MetadataIndex
 from hyper_parallel.core.distributed_checkpoint.planner import (
     BroadcastSource,
     LoadItemType,
     ReadItem,
-    SavePlan,
-    WriteItem,
-    WriteItemType,
 )
-from hyper_parallel.core.distributed_checkpoint.util import (
-    check_path,
-    chunk_to_area,
-    flatten_state_dict,
-    has_valid_filename,
-    narrow_tensor_by_index,
-    plan_ownership_masks,
-    set_element,
-    traverse_state_dict,
-)
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
-class TestUtil(unittest.TestCase):
-    """Tests for distributed checkpoint utility helpers."""
-
-    def setUp(self) -> None:
-        """Rebuild util against the torch platform before every case."""
-        os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-        _platform_mod.platform = None
-        importlib.reload(util_mod)
-
-    def test_has_valid_filename(self):
-        """
-        Feature: has_valid_filename validation rules.
-        Description: Check paths with and without valid stem/suffix letters.
-        Expectation: Returns True for model.safetensors; False for invalid names.
-        """
-        self.assertTrue(has_valid_filename(Path("model.safetensors")))
-        self.assertFalse(has_valid_filename(Path(".safetensors")))
-        self.assertFalse(has_valid_filename(Path("123.456")))
-
-    def test_check_path_creates_parent_for_file(self):
-        """
-        Feature: check_path creates parent directories for file paths.
-        Description: Call check_path with a nested file path that does not exist.
-        Expectation: Parent directory is created on disk.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            nested = Path(tmpdir) / "a" / "b" / "ckpt.bin"
-            check_path(nested)
-            self.assertTrue(nested.parent.is_dir())
-
-    def test_narrow_tensor_by_index(self):
-        """
-        Feature: narrow_tensor_by_index slice extraction.
-        Description: Narrow a 4x4 torch tensor to rows [1, 3) and cols [0, 2).
-        Expectation: Result shape is (2, 2) and values match the source slice.
-        """
-        tensor = torch.arange(16, dtype=torch.float32).reshape(4, 4)
-        sliced = narrow_tensor_by_index(tensor, (1, 0), (2, 2))
-        self.assertEqual(tuple(sliced.shape), (2, 2))
-        torch.testing.assert_close(sliced, tensor[1:3, 0:2])
-
-    def test_chunk_to_area(self):
-        """
-        Feature: chunk_to_area converts offsets/sizes to half-open ranges.
-        Description: Chunk with offsets (2, 0) and sizes (4, 8).
-        Expectation: Area is ((2, 6), (0, 8)).
-        """
-        chunk = ChunkStorageMetadata(offsets=(2, 0), sizes=(4, 8))
-        self.assertEqual(chunk_to_area(chunk), ((2, 6), (0, 8)))
-
-    def test_flatten_state_dict_nested(self):
-        """
-        Feature: flatten_state_dict dotted FQN keys.
-        Description: Flatten a nested dict with model and optimizer subtrees.
-        Expectation: Keys use dot notation; mappings preserve object paths.
-        """
-        nested = {"model": {"weight": torch.zeros(2), "bias": torch.zeros(2)}}
-        flat, mappings = flatten_state_dict(nested)
-        self.assertEqual(set(flat.keys()), {"model.weight", "model.bias"})
-        self.assertEqual(mappings["model.weight"], ("model", "weight"))
-
-    def test_flatten_state_dict_duplicate_fqn_raises(self):
-        """
-        Feature: flatten_state_dict duplicate key detection.
-        Description: Two nested paths that flatten to the same FQN.
-        Expectation: ValueError mentions duplicate flattened FQN.
-        """
-        nested = {"a": {"b.c": 1}, "a.b": {"c": 2}}
-        with self.assertRaises(ValueError) as ctx:
-            flatten_state_dict(nested)
-        self.assertIn("Duplicate flattened FQN", str(ctx.exception))
-
-    def test_set_element_nested_dict_and_list(self):
-        """
-        Feature: set_element rebuilds nested structure along a path.
-        Description: Set values at dict and list paths in an empty root.
-        Expectation: Root contains nested dict/list with assigned values.
-        """
-        root: dict = {}
-        set_element(root, ("model", "layers", 0, "weight"), 1)
-        set_element(root, ("model", "layers", 1, "weight"), 2)
-        self.assertEqual(root["model"]["layers"][0]["weight"], 1)
-        self.assertEqual(root["model"]["layers"][1]["weight"], 2)
-
-    def test_set_element_empty_path_raises(self):
-        """
-        Feature: set_element path validation.
-        Description: Call set_element with an empty path tuple.
-        Expectation: ValueError is raised.
-        """
-        with self.assertRaises(ValueError):
-            set_element({}, (), None)
-
-    def test_traverse_state_dict_visits_tensor_leaves(self):
-        """
-        Feature: traverse_state_dict recursive visitor.
-        Description: Traverse nested mappings and record tensor leaf paths.
-        Expectation: Visitor receives dotted paths for each tensor leaf.
-        """
-        visited = []
-        state = {"a": {"b": torch.zeros(1)}, "c": torch.zeros(1)}
-        traverse_state_dict(state, lambda path, _: visited.append(".".join(path)))
-        self.assertEqual(set(visited), {"a.b", "c"})
-
-    def test_plan_ownership_masks_keeps_one_copy(self):
-        """
-        Feature: plan_ownership_masks deduplication.
-        Description: Two plans both write the same MetadataIndex.
-        Expectation: Exactly one plan is marked as the owner of the WriteItem.
-        """
-        chunk = ChunkStorageMetadata(offsets=(0,), sizes=(4,))
-        props = TensorProperties(dtype="float32")
-        index = MetadataIndex(fqn="w")
-        item = WriteItem(
-            index=index,
-            type=WriteItemType.TENSOR,
-            tensor_data={"chunk": chunk, "properties": props, "size": (4,)},
-        )
-        plans = [SavePlan(items=[item]), SavePlan(items=[item])]
-        masks = plan_ownership_masks(plans)
-        self.assertEqual([len(m) for m in masks], [1, 1])
-        self.assertEqual(sum(sum(m) for m in masks), 1)
-
-    def test_create_chunk_list_for_plain_tensor(self):
-        """
-        Feature: create_chunk_list_for_tensor full-tensor default chunk.
-        Description: Plain torch tensor without CHUNK_INFO annotation.
-        Expectation: Single chunk covers the full tensor from zero offsets.
-        """
-        tensor = torch.zeros(3, 5)
-        chunks = util_mod.create_chunk_list_for_tensor(tensor)
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0].offsets, (0, 0))
-        self.assertEqual(chunks[0].sizes, (3, 5))
-
-    def test_create_chunk_list_for_parameter_with_chunk_info(self):
-        """
-        Feature: create_chunk_list_for_tensor for Parameter with CHUNK_INFO.
-        Description: nn.Parameter annotated with ChunkInfo shard metadata.
-        Expectation: Returns a single ChunkStorageMetadata matching CHUNK_INFO.chunk.
-        """
-        chunk = ChunkStorageMetadata(offsets=(0, 4), sizes=(4, 4))
-        info = ChunkInfo(chunk=chunk, global_shape=(8, 8))
-        param = torch.nn.Parameter(torch.zeros(4, 4))
-        object.__setattr__(param, CHUNK_INFO, info)
-        chunks = util_mod.create_chunk_list_for_tensor(param)
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0].offsets, (0, 4))
-        self.assertEqual(chunks[0].sizes, (4, 4))
-
-    def test_create_chunk_list_for_empty_uneven_shard(self):
-        """DCP geometry should retain the logical offset of an empty trailing shard."""
-        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=3):
-            mesh = DeviceMesh(
-                "cpu",
-                [0, 1, 2, 3],
-                mesh_dim_names=("fsdp",),
-                _init_backend=False,
-            )
-        layout = Layout.from_device_mesh(mesh)
-        layout.set_placements((Shard(0, uneven_shard=True),))
-        layout.placement_to_tensor_map(dim=2)
-        layout.set_tensor_meta((6, 3), (3, 1), torch.float32)
-        tensor = DTensor.from_local_with_layout(torch.empty(0, 3), layout)
-
-        with patch.object(util_mod.platform, "get_rank", return_value=3):
-            chunks = util_mod.create_chunk_list_for_tensor(tensor)
-
-        self.assertEqual(len(chunks), 1)
-        self.assertEqual(chunks[0].offsets, (6, 0))
-        self.assertEqual(chunks[0].sizes, (0, 3))
-
-    def test_create_chunk_list_for_tensor_invalid_chunk_info_raises(self):
-        """
-        Feature: create_chunk_list_for_tensor CHUNK_INFO type check.
-        Description: Parameter with CHUNK_INFO set to a non-ChunkInfo object.
-        Expectation: ValueError is raised.
-        """
-        param = torch.nn.Parameter(torch.zeros(2, 2))
-        object.__setattr__(param, CHUNK_INFO, "not_chunk_info")
-        with self.assertRaises(ValueError) as ctx:
-            util_mod.create_chunk_list_for_tensor(param)
-        self.assertIn("ChunkInfo", str(ctx.exception))
-
-    def test_create_chunk_list_for_tensor_unsupported_type_raises(self):
-        """
-        Feature: create_chunk_list_for_tensor type validation.
-        Description: Pass a plain Python int instead of a tensor.
-        Expectation: ValueError mentions unsupported type.
-        """
-        with self.assertRaises(ValueError) as ctx:
-            util_mod.create_chunk_list_for_tensor(42)
-        self.assertIn("Not support type", str(ctx.exception))
-
-
 class _RecordingHandle:
     """Work handle double, so a test can see when a broadcast was waited on."""
 
-    def __init__(self, fake: "_RecordingPlatform", buffer: Any = None) -> None:
-        """Register with the platform double that issued this broadcast."""
+    def __init__(self, fake: "_RecordingBackend", buffer: Any = None) -> None:
+        """Register with the backend double that issued this broadcast."""
         self.fake = fake
         self.buffer = buffer
         self.waited = False
@@ -279,10 +66,67 @@ class _RecordingHandle:
             self.buffer.fill_(self.fake.fill)
 
 
-class _RecordingPlatform:
-    """Platform double recording the collectives ``util`` issues.
+class _RecordingTorch:
+    """``torch`` with ``empty`` standing in, so a staging buffer is recognizable.
 
-    ``broadcast`` and ``create_group`` are the calls under test; ``all_gather_object``
+    Everything else falls through to the real module: ``broadcast`` reaches for ``torch`` for
+    more than the staging buffer, and a namespace holding only ``empty`` would break the
+    rest of it.
+    """
+
+    def __init__(self, fake: "_RecordingBackend") -> None:
+        """Record the buffers ``fake`` hands out in place of real uninitialized memory."""
+        self._fake = fake
+
+    def empty(self, size: tuple, dtype: Any = None, device: Any = None) -> torch.Tensor:
+        """The staging buffer a batch is gathered into."""
+        return self._fake.new_tensor(size, dtype, device)
+
+    def __getattr__(self, name: str) -> Any:
+        """Anything else is the real torch."""
+        return getattr(torch, name)
+
+
+class _RecordingDist:
+    """``torch.distributed`` recording the collectives ``broadcast`` issues."""
+
+    def __init__(self, fake: "_RecordingBackend") -> None:
+        """Send every recorded call through to ``fake``."""
+        self._fake = fake
+
+    def get_rank(self) -> int:
+        """The rank the timing decorator logs and the batcher sends from."""
+        return self._fake.get_rank()
+
+    def get_world_size(self) -> int:
+        """The world size that sizes the all-gather buffer."""
+        return self._fake.get_world_size()
+
+    def all_gather_object(self, object_list: list, obj: Any, group: Any = None) -> None:
+        """Stand in for the peer ranks reporting what groups they still need."""
+        self._fake.all_gather_object(object_list, obj, group)
+
+    def broadcast(self, tensor: Any, src: int, group: Any, async_op: bool = False) -> Any:
+        """Record one broadcast, which a load must always start without waiting on it."""
+        if not async_op:
+            raise AssertionError(
+                "a load's broadcasts must be started async, or a read never overlaps the send before it"
+            )
+        return self._fake.broadcast_async(tensor, src, group)
+
+    def new_group(self, ranks: Any) -> str:
+        """Record one group creation and return a recognizable handle."""
+        return self._fake.new_group(tuple(ranks))
+
+    def destroy_process_group(self, group: Any = None) -> None:
+        """Record one group being torn down."""
+        self._fake.destroy_process_group(group)
+
+
+class _RecordingBackend:
+    """Backend double recording the collectives ``broadcast`` issues.
+
+    ``broadcast`` and group creation are the calls under test; ``all_gather_object``
     stands in for the peer ranks, each of which reports ``peer_missing_groups`` as the
     groups it still needs.
     """
@@ -329,11 +173,6 @@ class _RecordingPlatform:
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
         return handle
 
-    @staticmethod
-    def detach(tensor: Any) -> Any:
-        """Mirror the active Torch platform's data-only view."""
-        return tensor.detach()
-
     def new_group(self, group_ranks: tuple) -> str:
         """Record one group creation and return a recognizable handle."""
         self.created_groups.append(group_ranks)
@@ -342,13 +181,6 @@ class _RecordingPlatform:
     def synchronize(self) -> None:
         """Record one device drain instead of reaching a backend."""
         self.events.append("synchronize")
-
-    def create_group(self, group_ranks: tuple) -> str:
-        """The cached, template-expanding creator, which a load must not reach for."""
-        raise AssertionError(
-            f"create_group{group_ranks} was called: a load's groups live for one read "
-            f"and must be made with new_group, which neither caches nor expands them"
-        )
 
     def destroy_process_group(self, group: Any = None) -> None:
         """Record one group being torn down."""
@@ -390,14 +222,39 @@ class _RecordingPlatform:
         return int(tensor.numel()) * int(tensor.element_size())
 
 
+@contextmanager
+def _patch_broadcast(fake: _RecordingBackend) -> Any:
+    """Stand ``fake`` in for every backend entry point ``broadcast`` reaches for.
+
+    ``broadcast`` calls ``torch.distributed`` and its own torch-backed helpers by name, so
+    a test swaps each of those names rather than one platform object. ``util`` is swapped
+    alongside it because ``broadcast`` gathers through ``util.all_gather_object``, which
+    reaches for ``torch.distributed`` in its own namespace.
+    """
+    recording_dist = _RecordingDist(fake)
+    with ExitStack() as stack:
+        for name, replacement in (
+                ("dist", recording_dist),
+                ("torch", _RecordingTorch(fake)),
+                ("get_created_group", fake.get_created_group),
+                ("_get_default_group", fake.get_world_group),
+                ("synchronize", fake.synchronize),
+                ("copy_each", fake.copy_each),
+                ("get_tensor_storage_size", fake.get_tensor_storage_size),
+        ):
+            stack.enter_context(patch.object(broadcast_mod, name, replacement))
+        stack.enter_context(patch.object(utils_mod, "dist", recording_dist))
+        yield
+
+
 class TestBroadcastShard(unittest.TestCase):
     """Tests for sending on one shard that a rank read on behalf of a group."""
 
     def setUp(self) -> None:
-        """Rebuild util against the torch platform before every case."""
+        """Rebuild broadcast against the torch platform before every case."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
-        importlib.reload(util_mod)
+        importlib.reload(broadcast_mod)
 
     @staticmethod
     def _dtensor(local: torch.Tensor) -> DTensor:
@@ -431,13 +288,13 @@ class TestBroadcastShard(unittest.TestCase):
             local shard so that the in-place broadcast lands in the state dict entry rather
             than in a copy of it.
         """
-        fake = _RecordingPlatform()
+        fake = _RecordingBackend()
         dtensor = self._dtensor(torch.zeros(2))
         source = BroadcastSource(group_ranks=(0, 1), src_rank=1)
         in_flight = deque()
 
-        with patch.object(util_mod, "platform", fake):
-            util_mod.broadcast_shard(
+        with _patch_broadcast(fake):
+            broadcast_mod.broadcast_shard(
                 in_flight, {"w": dtensor}, self._item("w", source), {(0, 1): "pre_built"}
             )
 
@@ -451,17 +308,17 @@ class TestBroadcastShard(unittest.TestCase):
         """
         Feature: broadcast_shard against groups that do not cover the plan.
         Description: A marked shard reaching the send with its group missing, which is what a
-            caller that skipped ensure_broadcast_groups would produce.
+            caller that skipped the group build would produce.
         Expectation: KeyError. Creating the group here instead would be a collective in the
             middle of a pipeline of them, entered by only the ranks that happened to be
             short one, so failing outright beats hanging the ranks that were not.
         """
-        fake = _RecordingPlatform()
+        fake = _RecordingBackend()
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
+        with _patch_broadcast(fake):
             with self.assertRaises(KeyError):
-                util_mod.broadcast_shard(deque(), {"w": torch.zeros(2)}, self._item("w", source), {})
+                broadcast_mod.broadcast_shard(deque(), {"w": torch.zeros(2)}, self._item("w", source), {})
 
         self.assertEqual(fake.broadcasts, [])
 
@@ -474,15 +331,15 @@ class TestBroadcastShard(unittest.TestCase):
             send before it, but never more than the limit -- every one still going holds
             resources inside the backend.
         """
-        limit = util_mod._MAX_BROADCASTS_IN_FLIGHT
-        fake = _RecordingPlatform()
+        limit = broadcast_mod._MAX_BROADCASTS_IN_FLIGHT
+        fake = _RecordingBackend()
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
         state = {f"w{i:02d}": torch.zeros(2) for i in range(4 * limit)}
         in_flight = deque()
 
-        with patch.object(util_mod, "platform", fake):
+        with _patch_broadcast(fake):
             for name in state:
-                util_mod.broadcast_shard(in_flight, state, self._item(name, source), {(0, 1): "g"})
+                broadcast_mod.broadcast_shard(in_flight, state, self._item(name, source), {(0, 1): "g"})
 
         self.assertEqual(len(fake.broadcasts), 4 * limit)
         self.assertEqual(fake.peak_in_flight, limit)
@@ -495,15 +352,15 @@ class TestBroadcastShard(unittest.TestCase):
             dict tensors themselves, so a load that carried on with one still in flight would
             be reading into memory a collective is still writing.
         """
-        fake = _RecordingPlatform()
+        fake = _RecordingBackend()
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
         state = {name: torch.zeros(2) for name in ("a", "b", "c")}
         in_flight = deque()
 
-        with patch.object(util_mod, "platform", fake):
+        with _patch_broadcast(fake):
             for name in state:
-                util_mod.broadcast_shard(in_flight, state, self._item(name, source), {(0, 1): "g"})
-            util_mod.wait_broadcasts(in_flight)
+                broadcast_mod.broadcast_shard(in_flight, state, self._item(name, source), {(0, 1): "g"})
+            broadcast_mod.wait_broadcasts(in_flight)
 
         self.assertEqual(len(fake.handles), 3)
         self.assertTrue(all(handle.waited for handle in fake.handles))
@@ -514,10 +371,10 @@ class TestEnsureBroadcastGroups(unittest.TestCase):
     """Tests for building the communication groups a broadcasting load sends through."""
 
     def setUp(self) -> None:
-        """Rebuild util against the torch platform before every case."""
+        """Rebuild broadcast against the torch platform before every case."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
-        importlib.reload(util_mod)
+        importlib.reload(broadcast_mod)
 
     @staticmethod
     def _item(fqn: str, source: Any = None) -> ReadItem:
@@ -534,51 +391,52 @@ class TestEnsureBroadcastGroups(unittest.TestCase):
 
     def test_a_group_the_caller_did_not_build_is_created(self):
         """
-        Feature: ensure_broadcast_groups group creation.
+        Feature: _build_broadcast_groups group creation.
         Description: A marked shard whose group the caller did not pre-build, with a peer
             rank reporting a group of its own.
         Expectation: The missing rank tuples are all-gathered and every rank creates the
             whole set, not only the group it needs, since creating one is itself collective.
             Only the one this rank asked for comes back to it.
         """
-        fake = _RecordingPlatform(world_size=4, peer_missing_groups=((2, 3),))
+        fake = _RecordingBackend(world_size=4, peer_missing_groups=((2, 3),))
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            groups = util_mod.ensure_broadcast_groups([self._item("w", source)])
+        with _patch_broadcast(fake):
+            groups, _ = broadcast_mod._build_broadcast_groups([self._item("w", source)], {})
 
         self.assertEqual(fake.created_groups, [(0, 1), (2, 3)])
         self.assertEqual(groups, {(0, 1): "group(0, 1)"})
 
     def test_groups_the_caller_built_are_kept_as_they_are(self):
         """
-        Feature: ensure_broadcast_groups with everything already in hand.
+        Feature: _build_broadcast_groups with everything already in hand.
         Description: Every group the plan needs was supplied by the caller.
         Expectation: They come back untouched and none is created, which is the point of
             pre-building them.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            groups = util_mod.ensure_broadcast_groups([self._item("w", source)], {(0, 1): "pre_built"})
+        with _patch_broadcast(fake):
+            groups, _ = broadcast_mod._build_broadcast_groups(
+                [self._item("w", source)], {(0, 1): "pre_built"})
 
         self.assertEqual(groups, {(0, 1): "pre_built"})
         self.assertEqual(fake.created_groups, [])
 
     def test_a_rank_with_nothing_to_send_still_joins_the_all_gather(self):
         """
-        Feature: ensure_broadcast_groups collective discipline.
+        Feature: _build_broadcast_groups collective discipline.
         Description: A rank whose plan marked nothing, so it needs no group of its own, while
             a peer reports one it is short of.
         Expectation: It all-gathers and creates all the same. Whether a rank holds a shared
             shard is its own business, and a rank that stayed out on those grounds would hang
             the ranks that did not -- both calls in here are collective.
         """
-        fake = _RecordingPlatform(world_size=4, peer_missing_groups=((2, 3),))
+        fake = _RecordingBackend(world_size=4, peer_missing_groups=((2, 3),))
 
-        with patch.object(util_mod, "platform", fake):
-            groups = util_mod.ensure_broadcast_groups([self._item("w")])
+        with _patch_broadcast(fake):
+            groups, _ = broadcast_mod._build_broadcast_groups([self._item("w")], {})
 
         self.assertEqual(fake.gathered, [((), ())])
         self.assertEqual(fake.created_groups, [(2, 3)])
@@ -609,11 +467,11 @@ class TestBroadcastGroupScope(unittest.TestCase):
             to carry this one load, and a communicator kept past that holds device memory for
             the rest of the job.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
                 self.assertEqual(groups, {(0, 1): "group(0, 1)"})
                 self.assertEqual(fake.destroyed_groups, [])
 
@@ -628,11 +486,11 @@ class TestBroadcastGroupScope(unittest.TestCase):
             was to receive the shard silently keeps whatever its buffer held.
         Expectation: The drain is issued, and it precedes every release.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]):
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]):
                 pass
 
         self.assertEqual(fake.events, ["synchronize", "destroy group(0, 1)"])
@@ -645,12 +503,12 @@ class TestBroadcastGroupScope(unittest.TestCase):
             then, so a group that will not go away is a leak worth a warning rather than a
             reason to fail a load that already has its data.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         fake.destroy_process_group = Mock(side_effect=RuntimeError("backend is grumpy"))
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
                 self.assertEqual(groups, {(0, 1): "group(0, 1)"})
 
         fake.destroy_process_group.assert_called_once_with("group(0, 1)")
@@ -663,11 +521,11 @@ class TestBroadcastGroupScope(unittest.TestCase):
             passed in and may well use it again; tearing it down here would take a group out
             from under whoever built it.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load(
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load(
                     [self._item("w", source)], {(0, 1): "pre_built"}) as groups:
                 self.assertEqual(groups, {(0, 1): "pre_built"})
 
@@ -681,12 +539,12 @@ class TestBroadcastGroupScope(unittest.TestCase):
         Expectation: The group is destroyed and the error propagates. A load that fails
             partway is exactly when a leaked communicator would go unnoticed.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
+        with _patch_broadcast(fake):
             with self.assertRaises(RuntimeError):
-                with util_mod.broadcast_groups_for_load([self._item("w", source)]):
+                with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]):
                     raise RuntimeError("read failed")
 
         self.assertEqual(fake.destroyed_groups, ["group(0, 1)"])
@@ -702,11 +560,11 @@ class TestBroadcastGroupScope(unittest.TestCase):
             device memory for nothing, and destroying this one would take it away from the
             mesh that is still using it.
         """
-        fake = _RecordingPlatform(world_size=4, cached_groups={(0, 1): "mesh_group"})
+        fake = _RecordingBackend(world_size=4, cached_groups={(0, 1): "mesh_group"})
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
                 self.assertEqual(groups, {(0, 1): "mesh_group"})
 
         self.assertEqual(fake.created_groups, [])
@@ -723,13 +581,13 @@ class TestBroadcastGroupScope(unittest.TestCase):
             both -- which is why the choice is taken from what was gathered rather than
             from what is in hand.
         """
-        fake = _RecordingPlatform(
+        fake = _RecordingBackend(
             world_size=4, peer_missing_groups=((0, 1),), cached_groups={(0, 1): "stale_group"}
         )
         source = BroadcastSource(group_ranks=(0, 1), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
                 self.assertEqual(groups, {(0, 1): "group(0, 1)"})
 
         self.assertEqual(fake.created_groups, [(0, 1)])
@@ -744,10 +602,10 @@ class TestBroadcastGroupScope(unittest.TestCase):
             is collective over the world, so a rank that sat this out because the group does
             not contain it would leave the ranks it does contain waiting.
         """
-        fake = _RecordingPlatform(world_size=4, peer_missing_groups=((2, 3),))
+        fake = _RecordingBackend(world_size=4, peer_missing_groups=((2, 3),))
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w")]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w")]) as groups:
                 self.assertEqual(groups, {})
 
         self.assertEqual(fake.created_groups, [(2, 3)])
@@ -763,11 +621,11 @@ class TestBroadcastGroupScope(unittest.TestCase):
             nothing is destroyed. Building a second communicator over every rank for one
             read is pure cost, and destroying this one would take the job's own group away.
         """
-        fake = _RecordingPlatform(world_size=4)
+        fake = _RecordingBackend(world_size=4)
         source = BroadcastSource(group_ranks=(0, 1, 2, 3), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
                 self.assertEqual(groups, {(0, 1, 2, 3): "world_group"})
 
         self.assertEqual(fake.created_groups, [])
@@ -784,13 +642,13 @@ class TestBroadcastGroupScope(unittest.TestCase):
             work, but staying on the communicator the rest of training is using beats
             reaching past it, and either way nothing is created and nothing destroyed.
         """
-        fake = _RecordingPlatform(
+        fake = _RecordingBackend(
             world_size=4, cached_groups={(0, 1, 2, 3): "mesh_world_group"}
         )
         source = BroadcastSource(group_ranks=(0, 1, 2, 3), src_rank=0)
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load([self._item("w", source)]) as groups:
                 self.assertEqual(groups, {(0, 1, 2, 3): "mesh_world_group"})
 
         self.assertEqual(fake.created_groups, [])
@@ -804,15 +662,15 @@ class TestBroadcastGroupScope(unittest.TestCase):
             its members, and two ranks that shared two groups but tore them down in opposite
             orders would be waiting on each other.
         """
-        fake = _RecordingPlatform(world_size=6)
+        fake = _RecordingBackend(world_size=6)
         items = [
             self._item("c", BroadcastSource(group_ranks=(4, 5), src_rank=4)),
             self._item("a", BroadcastSource(group_ranks=(0, 1), src_rank=0)),
             self._item("b", BroadcastSource(group_ranks=(2, 3), src_rank=2)),
         ]
 
-        with patch.object(util_mod, "platform", fake):
-            with util_mod.broadcast_groups_for_load(items):
+        with _patch_broadcast(fake):
+            with broadcast_mod.broadcast_groups_for_load(items):
                 pass
 
         self.assertEqual(
@@ -827,10 +685,10 @@ class TestBroadcastBatcher(unittest.TestCase):
     _BATCH_BYTES = 4096
 
     def setUp(self) -> None:
-        """Rebuild util against the torch platform before every case."""
+        """Rebuild broadcast against the torch platform before every case."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
-        importlib.reload(util_mod)
+        importlib.reload(broadcast_mod)
 
     @staticmethod
     def _item(fqn: str, src_rank: int = 0, group: tuple = (0, 1)) -> ReadItem:
@@ -847,15 +705,15 @@ class TestBroadcastBatcher(unittest.TestCase):
 
     def _run(self, state: dict, items: list, fake: Any, batch_bytes: int = None) -> Any:
         """Hand every item to a batcher, flush it, and wait on what it started."""
-        batcher = util_mod.BroadcastBatcher(
+        batcher = broadcast_mod.BroadcastBatcher(
             self._BATCH_BYTES if batch_bytes is None else batch_bytes, {self._GROUP: "g", (2, 3): "h"}
         )
         in_flight = deque()
-        with patch.object(util_mod, "platform", fake):
+        with _patch_broadcast(fake):
             for item in items:
                 batcher.add(in_flight, state, item)
             batcher.flush(in_flight)
-            util_mod.wait_broadcasts(in_flight)
+            broadcast_mod.wait_broadcasts(in_flight)
         return batcher
 
     def test_small_shards_of_one_group_go_in_a_single_broadcast(self):
@@ -867,7 +725,7 @@ class TestBroadcastBatcher(unittest.TestCase):
             A broadcast costs about the same whatever it carries until the shards are some
             megabytes, so four small ones cost four times what they need to.
         """
-        fake = _RecordingPlatform(rank=1)
+        fake = _RecordingBackend(rank=1)
         state = {f"w{i}": torch.zeros(4) for i in range(4)}
         batcher = self._run(state, [self._item(name) for name in state], fake)
 
@@ -882,7 +740,7 @@ class TestBroadcastBatcher(unittest.TestCase):
             that size the cost of starting a broadcast is already small against what it
             carries, and gathering it would only buy a copy in and a copy out.
         """
-        fake = _RecordingPlatform(rank=1)
+        fake = _RecordingBackend(rank=1)
         state = {"big": torch.zeros(self._BATCH_BYTES // 4, dtype=torch.float32),
                  "small_a": torch.zeros(4), "small_b": torch.zeros(4)}
         batcher = self._run(state, [self._item(name) for name in state], fake)
@@ -897,7 +755,7 @@ class TestBroadcastBatcher(unittest.TestCase):
         Expectation: One broadcast each. A broadcast reaches one group from one rank and
             carries one buffer, so shards disagreeing on any of the three cannot share it.
         """
-        fake = _RecordingPlatform(rank=1)
+        fake = _RecordingBackend(rank=1)
         state = {"a": torch.zeros(4), "b": torch.zeros(4),
                  "c": torch.zeros(4), "d": torch.zeros(4, dtype=torch.float64)}
         items = [
@@ -918,7 +776,7 @@ class TestBroadcastBatcher(unittest.TestCase):
         Expectation: Every batch is sent before it would pass the size it was given, so the
             buffer set aside for it is bounded by that size rather than by the checkpoint.
         """
-        fake = _RecordingPlatform(rank=1)
+        fake = _RecordingBackend(rank=1)
         per_shard = 4 * 4  # four float32
         state = {f"w{i:02d}": torch.zeros(4) for i in range(3 * (self._BATCH_BYTES // per_shard))}
         batcher = self._run(state, [self._item(name) for name in state], fake)
@@ -940,17 +798,17 @@ class TestBroadcastBatcher(unittest.TestCase):
             dict entries, so a load that never dealt it out, or dealt it out early, would
             leave them as they were.
         """
-        fake = _RecordingPlatform(rank=1, fill=7.0)
+        fake = _RecordingBackend(rank=1, fill=7.0)
         state = {f"w{i}": torch.zeros(4) for i in range(3)}
-        batcher = util_mod.BroadcastBatcher(self._BATCH_BYTES, {self._GROUP: "g"})
+        batcher = broadcast_mod.BroadcastBatcher(self._BATCH_BYTES, {self._GROUP: "g"})
         in_flight = deque()
 
-        with patch.object(util_mod, "platform", fake):
+        with _patch_broadcast(fake):
             for name in state:
                 batcher.add(in_flight, state, self._item(name))
             batcher.flush(in_flight)
             still_waiting = [float(state[name].sum()) for name in state]
-            util_mod.wait_broadcasts(in_flight)
+            broadcast_mod.wait_broadcasts(in_flight)
 
         self.assertEqual(still_waiting, [0.0, 0.0, 0.0])
         for name in state:
@@ -965,7 +823,7 @@ class TestBroadcastBatcher(unittest.TestCase):
             afterwards. The sender has nothing to receive, so dealing the batch back out to
             it would only copy what is already there.
         """
-        fake = _RecordingPlatform(rank=0, fill=7.0)
+        fake = _RecordingBackend(rank=0, fill=7.0)
         state = {f"w{i}": torch.full((4,), float(i + 1)) for i in range(3)}
         self._run(state, [self._item(name) for name in state], fake)
 
@@ -983,12 +841,16 @@ class TestBroadcastBatcher(unittest.TestCase):
             that cannot gather them is given.
         Expectation: One broadcast each, exactly as before there was any batching.
         """
-        fake = _RecordingPlatform(rank=1)
+        fake = _RecordingBackend(rank=1)
         state = {f"w{i}": torch.zeros(4) for i in range(3)}
         batcher = self._run(state, [self._item(name) for name in state], fake, batch_bytes=0)
 
         self.assertEqual(len(fake.broadcasts), 3)
         self.assertEqual(batcher.batched, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":
