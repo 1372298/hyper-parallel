@@ -21,8 +21,10 @@ registry, so the core ``scheduler`` module carries no MPipe-specific code.
 import logging
 from typing import Callable, Optional, TYPE_CHECKING
 
-from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import PlatformType
+from torch.nn import Module
+
+from hyper_parallel.core.pipeline_parallel.mpipe.executor import MPipeTransposeExecutor
+
 from hyper_parallel.core.pipeline_parallel.scheduler import (
     MetaStep,
     MetaStepType,
@@ -34,8 +36,6 @@ from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
 if TYPE_CHECKING:
     from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 
-platform = get_platform()
-Module = platform.Module
 logger = logging.getLogger(__name__)
 
 
@@ -96,8 +96,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
 
     Note:
         This class builds the schedule ordering and registers the ``MPIPE_*``
-        execution handlers; the handlers themselves live in the platform
-        executors (see :class:`MPipeTransposeExecutorBase`).
+        execution handlers implemented by :class:`MPipeTransposeExecutor`.
     """
 
     # Each rank runs one transposed preprocess forward, so every rank needs its
@@ -147,7 +146,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
                 owner runs the tower backward in its cooldown (instead of the
                 centralized stage-0 backward); tower grads are SUM all-reduced
                 across the pp replicas. Ignored (stage-0 backward kept) for a frozen / param-free
-                preprocess and on MindSpore.
+                preprocess.
             overflow_mode (str): How to distribute the ``M > NT`` overflow micros.
                 ``"full"`` (default) — round-robin: each owner takes ``M/NT``
                 micros, ViT phase balanced. ``"min"`` — rank 0 absorbs the
@@ -179,19 +178,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         # Trainable preprocess -> broadcast + stage-0 backward; frozen or
         # param-free -> ship the output only (no broadcast, no recompute).
         self._has_trainable_preprocess = self._module_has_trainable_params(preprocess_module)
-        # Owner-does-backward needs a trainable preprocess AND torch (MindSpore's
-        # grad_fn is body-scoped); otherwise fall back to the stage-0 backward.
-        self._owner_backward = (
-            bool(owner_backward)
-            and self._has_trainable_preprocess
-            and platform.platform_type == PlatformType.PYTORCH
-        )
-        if owner_backward and self._has_trainable_preprocess and not self._owner_backward:
-            logger.warning(
-                "[mpipe] pp_mpipe_owner_backward requested but unsupported on "
-                "platform %s; falling back to the stage-0 backward.",
-                platform.platform_type,
-            )
+        self._owner_backward = bool(owner_backward) and self._has_trainable_preprocess
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
@@ -209,13 +196,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         """Whether ``module`` has any trainable (grad-requiring) parameter."""
         if module is None:
             return False
-        if platform.platform_type == PlatformType.PYTORCH:
-            return any(p.requires_grad for p in module.parameters())
-        if platform.platform_type == PlatformType.MINDSPORE:
-            return any(p.requires_grad for p in module.get_parameters())
-        raise NotImplementedError(
-            f"MPipe Transpose is not implemented for platform {platform.platform_type}."
-        )
+        return any(p.requires_grad for p in module.parameters())
 
     @property
     def preprocess_module(self) -> "Optional[Module]":
@@ -260,21 +241,7 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         return micro % nt
 
     def _setup_mpipe_execution(self) -> None:
-        """Build the platform execution backend and register the MPIPE_* handlers."""
-        # Lazy import: the backend executor pulls in torch/mindspore and is
-        # resolved only when a schedule is actually constructed.
-        if platform.platform_type == PlatformType.PYTORCH:
-            from hyper_parallel.platform.torch.pipeline_parallel.mpipe_transpose import (  # pylint: disable=C0415
-                MPipeTransposeExecutor,
-            )
-        elif platform.platform_type == PlatformType.MINDSPORE:
-            from hyper_parallel.platform.mindspore.pipeline_parallel.mpipe_transpose import (  # pylint: disable=C0415
-                MPipeTransposeExecutor,
-            )
-        else:
-            raise NotImplementedError(
-                f"MPipe Transpose execution is not implemented for platform {platform.platform_type}."
-            )
+        """Build the Torch executor and register the MPIPE_* handlers."""
         self._executor = MPipeTransposeExecutor(self)
         self._apply_backward_retain_flag()
         handlers = {

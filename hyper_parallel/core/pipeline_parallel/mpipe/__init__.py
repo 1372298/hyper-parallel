@@ -23,7 +23,7 @@ carries no MPipe-specific code.
 """
 
 from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
-from hyper_parallel.core.pipeline_parallel.mpipe.executor_base import MPipeTransposeExecutorBase
+from hyper_parallel.core.pipeline_parallel.mpipe.executor import MPipeTransposeExecutor
 from hyper_parallel.core.pipeline_parallel.mpipe.schedule import ScheduleMPipeTranspose
 from hyper_parallel.core.pipeline_parallel.mpipe.sampler import (
     PPRankOwnedSampler,
@@ -32,7 +32,7 @@ from hyper_parallel.core.pipeline_parallel.mpipe.sampler import (
 
 __all__ = [
     "MpipeStepType",
-    "MPipeTransposeExecutorBase",
+    "MPipeTransposeExecutor",
     "ScheduleMPipeTranspose",
     "PPRankOwnedSampler",
     "mpipe_owned_micros",

@@ -52,6 +52,8 @@ Use these rules as the default coding style and convention set for HyperParallel
   initialization may still be deferred until an operation needs the activated payload.
 - **Torch-only DFunction** (`hyper_parallel/core/shard/dfunction.py`): import Torch at module scope
   and inherit directly from `torch.autograd.Function`; do not add Platform dispatch or MindSpore support.
+- **Torch-only Pipeline** (`hyper_parallel/core/pipeline_parallel/**`): import Torch APIs
+  directly at module scope; keep stage execution, micro-batches, and P2P inside the core component.
 - **Other exceptions** (outside platform backends; each should include a brief comment explaining why):
   - Import-time circular dependency that cannot be fixed by restructuring.
   - Optional dependencies that may be missing at runtime.

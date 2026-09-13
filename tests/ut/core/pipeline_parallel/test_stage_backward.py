@@ -14,15 +14,12 @@
 # ============================================================================
 """Unit tests for Torch pipeline-stage split backward."""
 
-import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
 import torch
 
-from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageBase
+from hyper_parallel.core.pipeline_parallel._stage import PipelineStageBase
 
 
 class _MixedInputModule(torch.nn.Module):

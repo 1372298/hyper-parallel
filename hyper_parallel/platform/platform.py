@@ -132,28 +132,6 @@ def get_platform():
 EXISTING_COMM_GROUPS = {}
 
 
-def _build_p2p_edge_rank_lists(pp_rank_list: list[int], include_wrap: bool = False) -> list[tuple[int, int]]:
-    """Build normalized two-rank groups for adjacent pipeline ranks."""
-    if not isinstance(pp_rank_list, (list, tuple)):
-        raise ValueError(
-            f"pp_rank_list must be a list or tuple of integer ranks, but got {type(pp_rank_list)}."
-        )
-    if any(not isinstance(rank, int) or isinstance(rank, bool) for rank in pp_rank_list):
-        raise ValueError(f"pp_rank_list must contain only integer ranks, but got {pp_rank_list}.")
-    if len(set(pp_rank_list)) != len(pp_rank_list):
-        raise ValueError(f"pp_rank_list must not contain duplicate ranks, but got {pp_rank_list}.")
-    if len(pp_rank_list) < 2:
-        return []
-
-    edge_rank_lists = {
-        tuple(sorted((src_rank, dst_rank)))
-        for src_rank, dst_rank in zip(pp_rank_list, pp_rank_list[1:])
-    }
-    if include_wrap and len(pp_rank_list) > 2:
-        edge_rank_lists.add(tuple(sorted((pp_rank_list[-1], pp_rank_list[0]))))
-    return sorted(edge_rank_lists)
-
-
 class Platform:
     """Platform api"""
     current_grad_handle = None
@@ -653,20 +631,6 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement batch_isend_irecv")
 
     @staticmethod
-    def prepare_batch_p2p_group(group: Any = None) -> None:
-        """Prepare a process group before its first batched P2P operation.
-
-        Backends that require full-group participation before subset batched
-        P2P should synchronize the group here. Other backends may implement
-        this as a no-op.
-
-        Args:
-            group: The process group used by the batched P2P operations.
-                ``None`` uses the default group.
-        """
-        raise NotImplementedError("Platform subclasses must implement prepare_batch_p2p_group")
-
-    @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):
         """Differentiable symmetric P2P exchange (send local tensor, receive peer's tensor).
 
@@ -861,30 +825,6 @@ class Platform:
             NotImplementedError: Must be implemented by platform subclasses.
         """
         raise NotImplementedError("Platform subclasses must implement differentiable_async_a2a_wait")
-
-    @staticmethod
-    def differentiable_sync_hook(x, hook_name: str, coordinator):
-        """Identity operation that intercepts both forward and backward to call
-        coordinator rendezvous, enabling deterministic comm/compute overlap.
-
-        This is the differentiable building block for dual-pipe schedules.
-        In the forward pass the coordinator is invoked with the forward-side
-        roles for ``hook_name``; in the backward pass it is invoked with the
-        backward-side roles.  The tensor value and gradient flow through
-        unchanged.
-
-        Args:
-            x:           Input tensor.  Returned as-is; gradients flow through.
-            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"`` identifying
-                         the position relative to MoE dispatch/combine.
-            coordinator: A :class:`HookCoordinator` instance shared between the
-                         forward and backward threads.
-
-        Returns:
-            The same tensor *x*, attached to the autograd graph so that the
-            backward hook will fire.
-        """
-        raise NotImplementedError("Platform subclasses must implement differentiable_sync_hook")
 
     @staticmethod
     def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
@@ -1169,20 +1109,6 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement construct_strided_slice")
 
     @staticmethod
-    def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
-        """Split inputs into micro-batches for pipeline parallelism.
-
-        Args:
-            micro_batch_num (int): The number of micro-batches to create.
-            args_batch_dim (list, optional): Batch dimension for each positional arg.
-            kwargs_batch_dim (dict, optional): Batch dimension for each keyword arg.
-
-        Returns:
-            A decorator that splits function inputs into micro-batches.
-        """
-        raise NotImplementedError("Platform subclasses must implement micro_batch")
-
-    @staticmethod
     def load_into_param(param, data):
         """Load data into a parameter, handling framework-specific semantics."""
         raise NotImplementedError("Platform subclasses must implement load_into_param")
@@ -1226,29 +1152,6 @@ class Platform:
         group = self._create_group(rank_list)
         EXISTING_COMM_GROUPS[group_key] = group
         return group
-
-    @staticmethod
-    def create_p2p_multi_stream_groups(
-            pp_rank_list: list[int],
-            include_wrap: bool = False,
-    ) -> dict[int, Any]:
-        """Create P2P groups that enable independent communication streams.
-
-        Backends may use different process-group initialization protocols, but
-        must return the same logical mapping from peer global rank to the raw
-        process group shared by that two-rank pipeline edge.
-
-        Args:
-            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
-            include_wrap: Whether the last and first ranks also communicate,
-                as required by interleaved virtual pipeline chunks.
-
-        Returns:
-            A mapping from adjacent peer global rank to its two-rank process
-            group. A rank at a linear pipeline boundary has one entry; a
-            middle rank normally has two.
-        """
-        raise NotImplementedError("Platform subclasses must implement create_p2p_multi_stream_groups")
 
     @staticmethod
     def _process_current_handle():

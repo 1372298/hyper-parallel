@@ -22,10 +22,8 @@ import itertools
 from typing import Any, ContextManager, FrozenSet, Iterable, List
 
 from hyper_parallel.core.activation_checkpoint.swap import SwapManager
-from hyper_parallel.platform import get_platform
 
 MIN_SWAP_GAP = 4
-platform = get_platform()
 
 
 class _BeforeActionPriority(IntEnum):
@@ -56,7 +54,7 @@ def unregister_layer_swap_hooks(stages: Iterable[Any]) -> int:
     visited_modules = set()
     manager = SwapManager()
     for stage in stages:
-        for _, module in platform.get_cells_and_names(stage.submodule):
+        for _, module in stage.submodule.named_modules():
             module_id = id(module)
             if module_id in visited_modules:
                 continue
@@ -390,8 +388,8 @@ def _protect_pipeline_owned_tensors(step, schedule, arg_mbs, kwarg_mbs, group_na
     # Saved-tensor hooks may receive a plain Tensor view of a Parameter. Some
     # backends do not preserve parameter metadata on that view, so protect by
     # storage ownership before any group member can be resized.
-    parameters = tuple(param for _, param in platform.parameters_dict(stage.submodule))
-    buffers = tuple(buffer for _, buffer in platform.buffers_dict(stage.submodule))
+    parameters = tuple(stage.submodule.parameters())
+    buffers = tuple(stage.submodule.buffers())
     if stage.is_first_stage:
         # First-stage inputs come from split_microbatches(), outside the
         # wrapped stage.  They are not stage outputs, but they can alias

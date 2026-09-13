@@ -17,7 +17,6 @@ from datetime import timedelta
 from typing import Any, Callable, Optional, Sequence, Union
 import dataclasses
 from collections import OrderedDict
-import time
 
 import numpy as np
 from safetensors.torch import save_file, load_file
@@ -35,20 +34,16 @@ from torch.utils.checkpoint import noop_context_fn
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
-from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import (
     Platform,
     PlatformType,
     EXISTING_COMM_GROUPS,
-    _build_p2p_edge_rank_lists,
 )
 from hyper_parallel.platform.torch.function_override import override_functions
 from hyper_parallel.platform.torch.init_weights import init_on_device as _init_on_device
 
 override_functions()
-
-_P2P_MULTI_STREAM_GROUPS = {}
 
 
 # ---------------------------------------------------------------------------
@@ -244,148 +239,6 @@ class _AsyncA2ALazyBwd(torch.autograd.Function):
         return grad_input, None, None, None
 
 
-class _TorchSyncHookFunction(torch.autograd.Function):
-    """Autograd identity that fires HookCoordinator rendezvous on fwd/bwd.
-
-    Uses a **4-hook** design (``A``, ``B``, ``C``, ``D``) with pure
-    COMM / COMPUTE roles — no NONE role.  Every rendezvous is a strict
-    COMM + COMPUTE pair, guaranteeing NCCL-first dispatch ordering at
-    **all** points including layer boundaries.
-
-    Hook placement per MoE layer::
-
-        [A] → dispatch → [B] → module → [C] → combine → [D] → (Attention) → [A_next]
-
-    At layer boundaries (D / A hooks), the Attention that runs between
-    layers is treated as COMPUTE, and the combine / combine.bwd is treated
-    as COMM, so the coordinator enforces comm-first ordering even across
-    layer transitions.
-    """
-
-    # 4-hook role tables: (prev_role_idx, next_role_idx).
-    # Index encoding: 1 = COMM, 2 = COMPUTE.
-    #
-    # Torch only uses the four core hooks A/B/C/D + D_LAST sentinel.
-    # The MS backend adds ``CHUNK_START`` / ``CHUNK_END`` because of
-    # MS-specific issues (stream binding follows the calling thread;
-    # autograd cannot have FWD-record + BWD-replay concurrently).
-    # Torch has neither problem — CUDA streams are process-wide and
-    # Torch autograd is thread-safe — so we keep the original
-    # 4-hook design here.  Do not add CHUNK_START / CHUNK_END to
-    # the Torch tables; if a future test does need them, copy the
-    # MS implementation and add the matching skip rules in
-    # ``forward`` / ``backward``.
-    _FWD_ROLES = {
-        #         (prev, next)      prev op          next op
-        "A": (2, 1),   # COMPUTE, COMM     Attention   | dispatch
-        "B": (1, 2),   # COMM, COMPUTE     dispatch    | module
-        "C": (2, 1),   # COMPUTE, COMM     module      | combine
-        "D": (1, 2),   # COMM, COMPUTE     combine     | Attention
-    }
-    _BWD_ROLES = {
-        "D": (2, 1),   # COMPUTE, COMM     Attn.bwd    | combine.bwd
-        "C": (1, 2),   # COMM, COMPUTE     combine.bwd | module.bwd
-        "B": (2, 1),   # COMPUTE, COMM     module.bwd  | dispatch.bwd
-        "A": (1, 2),   # COMM, COMPUTE     dispatch.bwd| Attn.bwd
-    }
-
-    _ROLE_CACHE = None
-
-    @staticmethod
-    def _role_enum(idx: int):
-        if _TorchSyncHookFunction._ROLE_CACHE is None:
-            from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookRole  # pylint: disable=C0415
-            _TorchSyncHookFunction._ROLE_CACHE = (None, HookRole.COMM, HookRole.COMPUTE)
-        return _TorchSyncHookFunction._ROLE_CACHE[idx]
-
-    @staticmethod
-    def forward(ctx, x, hook_name, coordinator):  # pylint: disable=arguments-differ
-        """Identity forward that fires a HookCoordinator rendezvous.
-
-        Notifies the previous op's role and rendezvouses for the next op's
-        role per the ``_FWD_ROLES`` table.  ``"D_LAST"`` is a sentinel
-        meaning "skip this rendezvous" (last layer's closing D — no
-        Attention follows).
-
-        Args:
-            ctx:         Autograd context, stores ``hook_name`` and
-                         ``coordinator`` for the backward pass.
-            x:           Input tensor, returned unchanged.
-            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"``,
-                         ``"D_LAST"``.
-            coordinator: The :class:`HookCoordinator` driving the rendezvous.
-
-        Returns:
-            ``x`` unchanged.
-        """
-        ctx.hook_name = hook_name
-        ctx.coordinator = coordinator
-
-        if not coordinator.is_enabled():
-            return x
-
-        if hook_name == "D_LAST":
-            # ``D_LAST`` marks the last layer's closing D hook — no
-            # Attention follows in this chunk, so the rendezvous is
-            # meaningless and is skipped.  We still
-            # ``notify_dispatched(COMM)`` so the COMPUTE side of the
-            # preceding ``C`` rendezvous unblocks early, letting
-            # BWD's Attn.bwd_last overlap with FWD's post-combine
-            # work — Torch autograd is thread-safe so this concurrent
-            # FWD-record + BWD-replay is fine.
-            prev_idx, _ = _TorchSyncHookFunction._FWD_ROLES["D"]
-            role_of = _TorchSyncHookFunction._role_enum
-            coordinator.notify_dispatched(role_of(prev_idx))
-            return x
-
-        prev_idx, next_idx = _TorchSyncHookFunction._FWD_ROLES[hook_name]
-        role_of = _TorchSyncHookFunction._role_enum
-        coordinator.notify_dispatched(role_of(prev_idx))
-        coordinator.rendezvous(role_of(next_idx))
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Identity backward that fires a HookCoordinator rendezvous.
-
-        Mirror of :meth:`forward` using the ``_BWD_ROLES`` table.
-        ``"D_LAST"`` skips the rendezvous because this is the first BWD
-        hook to fire and ``combine.bwd`` has already dispatched freely
-        before any rendezvous can happen.
-
-        Args:
-            ctx:         Autograd context with ``hook_name`` and
-                         ``coordinator`` saved during forward.
-            grad_output: Gradient w.r.t. the forward output, returned
-                         unchanged.
-
-        Returns:
-            ``(grad_output, None, None)`` — gradients only flow back to
-            the tensor input, ``hook_name`` and ``coordinator`` are
-            non-tensor inputs.
-        """
-        hook_name = ctx.hook_name
-        coordinator = ctx.coordinator
-
-        if not coordinator.is_enabled():
-            return grad_output, None, None
-
-        if hook_name == "D_LAST":
-            # First BWD hook to fire; combine.bwd has already
-            # dispatched freely before any rendezvous can happen.
-            # Skipping here is safe on Torch because CUDA streams
-            # are process-wide and the NCCL FIFO order is consistent
-            # across ranks regardless of which thread launched
-            # combine.bwd.
-            return grad_output, None, None
-
-        prev_idx, next_idx = _TorchSyncHookFunction._BWD_ROLES[hook_name]
-        role_of = _TorchSyncHookFunction._role_enum
-        coordinator.notify_dispatched(role_of(prev_idx))
-        coordinator.rendezvous(role_of(next_idx))
-        return grad_output, None, None
-
-
 class _TorchP2PExchangeFunction(torch.autograd.Function):
     """Symmetric bidirectional P2P: send local tensor to peer, receive peer's tensor."""
 
@@ -554,7 +407,6 @@ class TorchPlatform(Platform):
     Parameter = Parameter
     Module = Module
     DTensorBase = DTensorBase
-    PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
     dtype = torch.dtype
@@ -1151,52 +1003,6 @@ class TorchPlatform(Platform):
         return group_dict[normalized_rank_list]
 
     @staticmethod
-    def create_p2p_multi_stream_groups(
-            pp_rank_list: list[int],
-            include_wrap: bool = False,
-    ) -> dict[int, ProcessGroup]:
-        """Create adjacent two-rank PP groups for independent communication streams.
-
-        Args:
-            pp_rank_list: Ordered global ranks in one pipeline-parallel group.
-            include_wrap: Whether to include the last-to-first interleaved edge.
-
-        Returns:
-            A mapping from adjacent peer rank to its process-group handle.
-        """
-        current_rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        gathered_pp_rank_lists = [None] * world_size
-        dist.all_gather_object(gathered_pp_rank_lists, list(pp_rank_list))
-        edge_rank_lists = sorted({
-            edge_ranks
-            for ranks in gathered_pp_rank_lists
-            for edge_ranks in _build_p2p_edge_rank_lists(ranks, include_wrap)
-        })
-
-        # Overlapping groups can deadlock with local synchronization when
-        # neighboring ranks enter different edge creations first. Every rank
-        # therefore creates the global edge set in the same order.
-        local_groups = {}
-        world_rank_list = tuple(range(world_size))
-        for edge_ranks in edge_rank_lists:
-            group_key = str(edge_ranks)
-            group = _P2P_MULTI_STREAM_GROUPS.get(group_key)
-            if group is None:
-                group = (
-                    _get_default_group()
-                    if edge_ranks == world_rank_list
-                    else dist.new_group(ranks=list(edge_ranks))
-                )
-                _P2P_MULTI_STREAM_GROUPS[group_key] = group
-                EXISTING_COMM_GROUPS[group_key] = group
-            if current_rank not in edge_ranks:
-                continue
-            peer_rank = edge_ranks[0] if edge_ranks[1] == current_rank else edge_ranks[1]
-            local_groups[peer_rank] = group
-        return local_groups
-
-    @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
         output_shape = list(data.shape)
         output_shape[0] = output_shape[0] * group_info.rank_size
@@ -1276,54 +1082,6 @@ class TorchPlatform(Platform):
             return None
         works = dist.batch_isend_irecv(p2p_ops)
         return _TorchBatchP2PWork(works) if works else None
-
-    @staticmethod
-    def prepare_batch_p2p_group(group: Any = None) -> None:
-        """Synchronize a group before its first subset batched P2P call.
-
-        PyTorch requires every rank in a process group to participate when
-        ``batch_isend_irecv`` is the first collective on that group. A barrier
-        at the common pipeline run boundary initializes the communicator
-        before ranks reach peer operations at different times. Group members
-        first rendezvous through the CPU store, then group roots serialize the
-        one-time HCCL initialization through a job-local store lock. This
-        avoids host-port collisions when independent pipeline domains prepare
-        different communicators concurrently.
-
-        Args:
-            group: The process group used by the batched P2P operations.
-                ``None`` uses the default group.
-        """
-        group = group or _get_default_group()
-        group_store = group.get_group_store()
-        group_size = dist.get_world_size(group=group)
-        group_name = group.group_name
-        ready_key = f"hyper_parallel_p2p_group_init_ready:{group_name}"
-        ready_count = group_store.add(ready_key, 1)
-        ready_done_key = f"{ready_key}_done"
-        if ready_count == group_size:
-            group_store.set(ready_done_key, "1")
-        group_store.wait([ready_done_key])
-
-        root_ready_key = f"hyper_parallel_p2p_group_init_root_ready:{group_name}"
-        if dist.get_rank(group=group) != 0:
-            group_store.wait([root_ready_key])
-            dist.barrier(group=group)
-            return
-
-        default_store = _get_default_group().get_group_store()
-        lock_key = "hyper_parallel_p2p_group_init_lock"
-        lock_token = group_name
-        deadline = time.monotonic() + 300
-        while default_store.compare_set(lock_key, "", lock_token).decode() != lock_token:
-            if time.monotonic() >= deadline:
-                raise RuntimeError("Timed out waiting to initialize a batched P2P process group.")
-            time.sleep(0.01)
-        try:
-            group_store.set(root_ready_key, "1")
-            dist.barrier(group=group)
-        finally:
-            default_store.compare_set(lock_key, lock_token, "")
 
     @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):
@@ -1468,46 +1226,12 @@ class TorchPlatform(Platform):
         )
 
     @staticmethod
-    def differentiable_sync_hook(x, hook_name: str, coordinator):
-        """Identity op that fires coordinator rendezvous on forward and backward.
-
-        Always goes through ``_TorchSyncHookFunction.apply`` so that the
-        autograd graph **records a SyncHook node regardless of whether the
-        coordinator is currently enabled**.  Skipping ``apply`` when
-        disabled would leave warmup-forwarded graphs without the hook
-        nodes, and a later ``overlap.run`` — whose BWD thread back-props
-        such a graph — would then traverse zero hooks while the paired FWD
-        thread (whose current forward DOES record hooks) waits at a
-        barrier for a partner that never arrives.
-
-        Args:
-            x:           Input tensor.
-            hook_name:   One of:
-                         * ``"A"`` / ``"B"`` / ``"C"`` / ``"D"`` —
-                           full rendezvous on both directions.
-                         * ``"D_LAST"`` — closing D of the last MoE
-                           layer in a chunk.  Forward: ``notify_dispatched``
-                           only (no Attention follows so rendezvous is
-                           skipped).  Backward: pure skip (first BWD
-                           hook to fire; combine.bwd has already
-                           dispatched freely).
-            coordinator: A :class:`HookCoordinator` instance.
-        """
-        return _TorchSyncHookFunction.apply(x, hook_name, coordinator)
-
-    @staticmethod
     def get_tensor_transform():
         raise NotImplementedError("Unsupported get_tensor_transform for torch platform")
 
     @staticmethod
     def construct_strided_slice(x, begin, end, stride):
         raise NotImplementedError("Unsupported construct_strided_slice for torch platform")
-
-    @staticmethod
-    def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
-        # pylint: disable=C0415
-        from hyper_parallel.platform.torch.pipeline_parallel._utils import _MicroBatch
-        return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     def new_stream(self):
         device = self.get_device_handle()

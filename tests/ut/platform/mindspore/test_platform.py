@@ -37,14 +37,6 @@ def _tensor(rows: int = 3, width: int = 4):
     return ms.Tensor(np.arange(rows * width, dtype=np.float32).reshape(rows, width))
 
 
-def test_prepare_batch_p2p_group_does_not_synchronize():
-    """MindSpore batch P2P preparation must not introduce a group barrier."""
-    with mock.patch("hyper_parallel.platform.mindspore.platform.dist.barrier") as barrier:
-        result = MindSporePlatform.prepare_batch_p2p_group(mock.sentinel.pp_group)
-
-    barrier.assert_not_called()
-    assert result is None
-
 
 def test_detach_preserves_mindspore_tensor_identity():
     """MindSpore DCP detach compatibility hook preserves the input object."""
