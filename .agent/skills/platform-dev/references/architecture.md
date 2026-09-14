@@ -35,14 +35,15 @@ Platform (abstract base)
 │   ├── Tensor = torch.Tensor
 │   ├── Parameter = nn.Parameter
 │   ├── Module = nn.Module
-│   ├── DTensorBase = TorchDTensorBase
 │   └── PipelineStageBase = TorchPipelineStageBase
 └── MindSporePlatform
     ├── Tensor = ms.Tensor
     ├── Parameter = ms.Parameter
     ├── Module = nn.Cell
-    ├── DTensorBase = MsDTensorBase
     └── PipelineStageBase = MsPipelineStageBase
+
+core/dtensor/dtensor_base.py::DTensorBase  (Torch-only, not a Platform API)
+└── DTensor  (core/dtensor/dtensor.py)
 ```
 
 ---

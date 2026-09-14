@@ -33,7 +33,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
-from hyper_parallel.platform.torch.dtensor import DTensorBase
+from hyper_parallel.core.dtensor.dtensor_base import DTensorBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import (
     Platform,
@@ -406,7 +406,6 @@ class TorchPlatform(Platform):
     tensor = torch.tensor
     Parameter = Parameter
     Module = Module
-    DTensorBase = DTensorBase
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
     dtype = torch.dtype

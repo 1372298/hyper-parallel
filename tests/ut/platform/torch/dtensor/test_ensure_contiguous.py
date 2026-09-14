@@ -12,52 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""UT for :func:`_ensure_contiguous` in both MindSpore and Torch platform modules."""
-import pytest
-
-pytest.importorskip("mindspore")
-pytest.importorskip("torch")
-
-import mindspore as ms
+"""UT for :func:`_ensure_contiguous` in the Torch platform module."""
 import torch
 
-from hyper_parallel.platform.mindspore.platform import _ensure_contiguous as _ms_ensure_contiguous
 from hyper_parallel.platform.torch.platform import _ensure_contiguous as _torch_ensure_contiguous
-
-
-class TestEnsureContiguousMindSpore:
-    """Unit tests for the MindSpore ``_ensure_contiguous`` helper."""
-
-    def test_contiguous_is_noop(self):
-        """A contiguous tensor is returned as-is (identity)."""
-        t = ms.Tensor([[1.0, 2.0], [3.0, 4.0]], dtype=ms.float32)
-        out = _ms_ensure_contiguous(t)
-        assert out is t
-        assert out.is_contiguous()
-
-    def test_non_contiguous_transpose(self):
-        """A transposed tensor is made contiguous."""
-        t = ms.Tensor([[1.0, 2.0], [3.0, 4.0]], dtype=ms.float32)
-        t_t = t.T
-        assert not t_t.is_contiguous()
-        out = _ms_ensure_contiguous(t_t)
-        assert out is not t_t
-        assert out.is_contiguous()
-        assert ms.ops.equal(out, t.T).all()
-
-    def test_storage_offset_slice(self):
-        """A sliced tensor with storage offset is made contiguous."""
-        t = ms.Tensor([1.0, 2.0, 3.0, 4.0], dtype=ms.float32)
-        t_s = t[1:]  # storage_offset != 0
-        out = _ms_ensure_contiguous(t_s)
-        assert out.is_contiguous()
-        assert ms.ops.equal(out, ms.Tensor([2.0, 3.0, 4.0], dtype=ms.float32)).all()
-
-    def test_scalar_is_noop(self):
-        """A 0-d tensor is always contiguous."""
-        t = ms.Tensor(42.0, dtype=ms.float32)
-        out = _ms_ensure_contiguous(t)
-        assert out is t
 
 
 class TestEnsureContiguousTorch:

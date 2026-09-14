@@ -55,7 +55,6 @@ from hyper_parallel.platform.platform import (
     PlatformType,
     EXISTING_COMM_GROUPS,
 )
-from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 from hyper_parallel.platform.mindspore.init_weights import (
     init_on_device as _init_on_device,
@@ -671,7 +670,6 @@ class MindSporePlatform(Platform):
     tensor = Tensor
     Parameter = Parameter
     Module = Cell
-    DTensorBase = DTensorBase
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
     dtype = ms.Type
@@ -988,19 +986,13 @@ class MindSporePlatform(Platform):
     @staticmethod
     def update_param_data(param, data):
         """update param data"""
-        if isinstance(param, DTensorBase):
-            param.set_data(data)
-        else:
-            param._update_data(data)
+        param._update_data(data)
 
     @staticmethod
     def load_into_param(param, data):
         copy_tensor = MindSporePlatform.empty_like(data)
         copy_tensor.copy_(data)
-        if isinstance(param, DTensorBase):
-            param.set_data(copy_tensor)
-        else:
-            param._update(copy_tensor)
+        param._update(copy_tensor)
 
     @staticmethod
     def get_cell_construct(cell):
@@ -1100,15 +1092,11 @@ class MindSporePlatform(Platform):
     @staticmethod
     def get_param_local_shape(param):
         """get param local shape"""
-        if isinstance(param, DTensorBase):
-            return param.local_shape
         return param.shape
 
     @staticmethod
     def get_param_local_data(param):
         """get param local shape"""
-        if isinstance(param, DTensorBase):
-            return param.to_local()
         return param
 
     @staticmethod

@@ -7,8 +7,7 @@
 | Platform base class | `hyper_parallel/platform/platform.py` | All abstract methods defined here |
 | PyTorch platform | `hyper_parallel/platform/torch/platform.py` | `TorchPlatform(Platform)` |
 | MindSpore platform | `hyper_parallel/platform/mindspore/platform.py` | `MindSporePlatform(Platform)` |
-| Torch DTensorBase | `hyper_parallel/platform/torch/dtensor.py` | Subclass of `torch.Tensor` |
-| MindSpore DTensorBase | `hyper_parallel/platform/mindspore/dtensor.py` | Subclass of `ms.Tensor` |
+| DTensorBase | `hyper_parallel/core/dtensor/dtensor_base.py` | Torch-only: subclass of `torch.Tensor` |
 | Torch FSDP / HSDP | `hyper_parallel/platform/torch/fully_shard/` | state, param, scheduler, hooks (HSDP shares this tree; core logic in `core/fully_shard/hsdp_*.py`) |
 | MindSpore FSDP / HSDP | `hyper_parallel/platform/mindspore/fully_shard/` | state, param, scheduler, hooks (same layout as Torch) |
 | Torch Pipeline | `hyper_parallel/platform/torch/pipeline_parallel/` | stage, micro-batch utils |
@@ -34,7 +33,7 @@
 | `Platform.Tensor` | `torch.Tensor` | `ms.Tensor` |
 | `Platform.Parameter` | `nn.Parameter` | `ms.Parameter` |
 | `Platform.Module` | `nn.Module` | `nn.Cell` |
-| `Platform.DTensorBase` | Custom `torch.Tensor` subclass | Custom `ms.Tensor` subclass |
+| `DTensorBase` (not a Platform API) | `hyper_parallel/core/dtensor/dtensor_base.py` | not applicable |
 | `Platform.tensor_dtype` | `torch` (dtype module) | `mstype` |
 | `Platform.dtype` | `torch.dtype` | `ms.Type` |
 

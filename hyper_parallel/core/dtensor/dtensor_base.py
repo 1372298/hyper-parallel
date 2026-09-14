@@ -12,14 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""torch dtensor base"""
+"""Torch ``DTensorBase``: the platform-agnostic base of :class:`DTensor`."""
+# pylint: disable=C9006,C9007
 from typing import Tuple, Dict, Any, Optional
 import torch
 from torch import Tensor
 
 
 class DTensorBase(Tensor):
-    """torch dtensor base"""
+    """Base class of :class:`DTensor`: a ``torch.Tensor`` subclass that owns a local shard.
+
+    Holds the local shard plus the ``DeviceMesh``/``Placements`` describing how that shard
+    maps onto the global tensor, and routes every op through the distributed dispatcher.
+    """
 
     def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None, shape=None):
         """
