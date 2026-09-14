@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """pipeline parallel utils"""
+from typing import Optional
+
+import torch
 from torch import nn
 
 import hyper_parallel
@@ -37,13 +40,15 @@ class _MicroBatch(nn.Module):
         - **kwargs_after_split** (list) - Input kwargs after split into micro_batches.
     """
 
-    def __init__(self, micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
+    def __init__(self, micro_batch_num: int, args_batch_dim: Optional[tuple] = None,
+                 kwargs_batch_dim: Optional[dict] = None) -> None:
+        """Store the number of micro-batches and their batch dimensions."""
         super().__init__()
         self.micro_batch_num = micro_batch_num
         self.args_batch_dim = args_batch_dim
         self.kwargs_batch_dim = kwargs_batch_dim
 
-    def forward(self, args, kwargs):
+    def forward(self, args: tuple, kwargs: dict) -> tuple[list, list]:
         """forward of _MicroBatch"""
         args_after_split = []
         kwargs_after_split = []
@@ -73,7 +78,9 @@ class _MicroBatch(nn.Module):
             kwargs_after_split.append(micro_kwargs)
         return args_after_split, kwargs_after_split
 
-    def split_inputs_with_custom_shard(self, input_tensor, cur_arg_batch_dim, micro_idx):
+    def split_inputs_with_custom_shard(
+            self, input_tensor: hyper_parallel.DTensor,
+            cur_arg_batch_dim: int, micro_idx: int) -> hyper_parallel.DTensor:
         """Split a DTensor input along the batch dimension while preserving its distributed layout."""
         input_layout = input_tensor.layout
         func_wrap = hyper_parallel.custom_shard(self.split_inputs,
@@ -83,7 +90,7 @@ class _MicroBatch(nn.Module):
                                  )
         return func_wrap(input_tensor, cur_arg_batch_dim, micro_idx)
 
-    def split_inputs(self, input_tensor, cur_arg_batch_dim, micro_idx):
+    def split_inputs(self, input_tensor: torch.Tensor, cur_arg_batch_dim: int, micro_idx: int) -> torch.Tensor:
         """
         Split the input along the specified batch_dim and micro_idx
         """
@@ -102,4 +109,4 @@ class _MicroBatch(nn.Module):
         # Create slicing tuple
         slices = [slice(None)] * input_tensor.ndim
         slices[cur_arg_batch_dim] = slice(start, end)
-        return input_tensor[slices]
+        return input_tensor[tuple(slices)]

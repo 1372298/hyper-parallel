@@ -39,6 +39,8 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 - **Core default:** platform-agnostic `core/` code uses `get_platform()` during the staged Platform retirement.
 - **Multicore exception:** `core/multicore/` is an explicit Torch-only component. Use direct, module-level
   Torch imports there; do not add Platform dispatch or MindSpore implementations.
+- **Pipeline exception:** `core/pipeline_parallel/` is Torch-only. Import native Torch APIs
+  directly; do not add Platform dispatch or MindSpore implementations.
 - **DFunction exception:** `core/shard/dfunction.py` is Torch-only and inherits directly from
   `torch.autograd.Function`; do not reintroduce Platform dispatch or MindSpore support.
 - **Never** invent Jenkins build numbers or force-push shared branches in agent workflows.
@@ -55,7 +57,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 | **Shard** | `core/shard/` | `custom_shard` / YAML ops + `parallel_*.py` |
 | **Tensor parallel** | `core/tensor_parallel/` | `parallelize_module()`, `ParallelStyle`, mesh context |
 | **FSDP / HSDP** | `core/fully_shard/`, `platform/*/fully_shard/` | Param shard/unshard; HSDP under same trees (`hsdp_*.py`) |
-| **Pipeline** | `core/pipeline_parallel/`, `platform/*/pipeline_parallel/` | Stage schedule, micro-batch, P2P |
+| **Pipeline** | `core/pipeline_parallel/` | Torch-only stage schedule, micro-batch, P2P |
 | **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
 | **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |

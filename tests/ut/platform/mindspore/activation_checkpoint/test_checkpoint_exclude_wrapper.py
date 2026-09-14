@@ -44,9 +44,6 @@ checkpoint_wrapper = activation_checkpoint.checkpoint_wrapper
 checkpoint_exclude_wrapper = activation_checkpoint.checkpoint_exclude_wrapper
 is_recomputing = activation_checkpoint.is_recomputing
 get_platform = importlib.import_module("hyper_parallel.platform").get_platform
-forward_and_gradfn = importlib.import_module(
-    "hyper_parallel.platform.mindspore.pipeline_parallel.backward"
-).forward_and_gradfn
 checkpoint_exclude_wrapper_module = importlib.import_module(
     "hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper"
 )
@@ -214,38 +211,6 @@ def _run_precision_sequence(net):
             parameter.grad = None
     return results
 
-
-def _run_split_backward(net, x: Tensor, prefire_recompute: bool):
-    """Run the PP recompute-session sequence and return value, dx, and dw."""
-    platform = get_platform()
-    weights = tuple(net.trainable_params())
-    with platform.recompute_handle_collector_ctx() as handles:
-        value, grad_fn = forward_and_gradfn(net, x, weights=weights, grad_position=0)
-
-    session_id = ("checkpoint_exclude_dxdw", id(net))
-    if prefire_recompute:
-        if not handles:
-            raise AssertionError("PP dx/dw validation requires at least one recompute handle")
-        with platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
-            for handle in handles:
-                platform.recompute_handle(handle, session_id)
-
-    session_context = (
-        platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=True)
-        if handles else contextlib.nullcontext()
-    )
-    with session_context:
-        input_grad = grad_fn.compute_input_grad()
-
-    session_context = (
-        platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=False)
-        if handles else contextlib.nullcontext()
-    )
-    with session_context:
-        weight_grads = grad_fn.compute_weight_grad()
-    if handles:
-        platform.clear_recompute_session(session_id)
-    return value, input_grad, weight_grads
 
 
 class TestCheckpointExcludeWrapper(unittest.TestCase):
@@ -676,31 +641,6 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
                     actual_grad.asnumpy(), reference_grad.asnumpy(), atol=1e-6, rtol=1e-6,
                     err_msg=f"parameter gradient {param_index} mismatch at step {step}",
                 )
-
-    def test_prefired_recompute_supports_dxdw_split(self):
-        """PP pre-recompute, dx, and dw should share one excluded-region result."""
-        reference_calls = {"middle": 0}
-        skip_calls = {"middle": 0}
-        reference_net = _PrecisionBlock(reference_calls, skip_middle=False)
-        skip_net = checkpoint_wrapper(_PrecisionBlock(skip_calls, skip_middle=True))
-        input_data = np.linspace(-1.5, 1.25, 24, dtype=np.float32).reshape(6, 4)
-
-        reference = _run_split_backward(reference_net, Tensor(input_data), prefire_recompute=False)
-        actual = _run_split_backward(skip_net, Tensor(input_data), prefire_recompute=True)
-
-        self.assertEqual(reference_calls["middle"], 1)
-        self.assertEqual(skip_calls["middle"], 1)
-        for name, reference_value, actual_value in zip(("value", "dx"), reference[:2], actual[:2]):
-            np.testing.assert_allclose(
-                actual_value.asnumpy(), reference_value.asnumpy(), atol=1e-6, rtol=1e-6,
-                err_msg=f"{name} mismatch for PP dx/dw split",
-            )
-        self.assertEqual(len(actual[2]), len(reference[2]))
-        for index, (reference_grad, actual_grad) in enumerate(zip(reference[2], actual[2])):
-            np.testing.assert_allclose(
-                actual_grad.asnumpy(), reference_grad.asnumpy(), atol=1e-6, rtol=1e-6,
-                err_msg=f"dw {index} mismatch for PP dx/dw split",
-            )
 
 
 if __name__ == "__main__":

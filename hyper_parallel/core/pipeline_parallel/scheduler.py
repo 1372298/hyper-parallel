@@ -23,8 +23,10 @@ import logging
 import re
 from typing import Any, Iterator
 
+import torch
+import torch.distributed as dist
+
 import hyper_parallel
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     PipelineSwapSession,
@@ -36,7 +38,12 @@ from hyper_parallel.core.pipeline_parallel.pipeline_swap import (
     unregister_layer_swap_hooks,
 )
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
-platform = get_platform()
+from hyper_parallel.core.pipeline_parallel._microbatch import _MicroBatch
+from hyper_parallel.core.pipeline_parallel._p2p import (
+    create_p2p_multi_stream_groups,
+    prepare_batch_p2p_group,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -242,14 +249,14 @@ class PipelineContext:
 
 def _exec_fsdp_unshard(stage):
     """Unshard every HSDPModule in the stage's submodule tree."""
-    for _, module in platform.get_cells_and_names(stage.submodule):
+    for _, module in stage.submodule.named_modules():
         if isinstance(module, HSDPModule):
             module.unshard()
 
 
 def _exec_fsdp_reshard(stage):
     """Reshard every HSDPModule in the stage's submodule tree."""
-    for _, module in platform.get_cells_and_names(stage.submodule):
+    for _, module in stage.submodule.named_modules():
         if isinstance(module, HSDPModule):
             module.reshard()
 
@@ -315,9 +322,8 @@ class PipelineScheduleRuntime(ABC):
             once at their first run boundary.
             ``"multi_stream"`` — EXPERIMENTAL: the same gap-time duplex
             batching as ``"batch"``, but each adjacent PP peer pair uses its
-            own two-rank communication group. MindSpore's default per-group
-            communication-stream policy then lets the previous and next PP
-            edges progress on separate streams.
+            own two-rank communication group so the previous and next PP edges
+            can progress on separate communication streams.
     """
 
     _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary", "multi_stream")
@@ -344,8 +350,8 @@ class PipelineScheduleRuntime(ABC):
         # overrides this in ``construct_exec_order``.
         self._DATA_KEYS = tuple(self._kwargs_batch_dim or ())  # pylint: disable=invalid-name
         self._output_concat_dim = output_concat_dim
-        self.split_micro_batch = platform.micro_batch(self.micro_batch_num,
-                                                      self._args_batch_dim, self._kwargs_batch_dim)
+        self.split_micro_batch = _MicroBatch(
+            self.micro_batch_num, self._args_batch_dim, self._kwargs_batch_dim)
         self.n_local_stages = len(self.stages)
         self._stage_dict = self.convert_stages_dict()
         self.real_stage_num = self.stages[0].stage_num // self.n_local_stages
@@ -374,10 +380,8 @@ class PipelineScheduleRuntime(ABC):
         #  * ``"batch"`` (the ``"auto"`` default on overlap_b_f schedules) —
         #    gap-time duplex via ``coalesce_p2p``: same-peer send+recv as one
         #    ``batch_isend_irecv`` (TX||RX on the full-duplex link).
-        #    Hardware-validated and MEASURED a net win on real workloads — the
-        #    duplex saving outweighs its known cost (MS's single handle couples
-        #    the riding send into the compute-gating recv wait, which can
-        #    shave EP a2a overlap).
+        #    Waiting the whole batch before consuming its recv also waits for
+        #    the riding send, which can reduce EP all-to-all overlap.
         #  * ``"plain"`` (the ``"auto"`` default elsewhere) — per-op
         #    ``isend``/``irecv``, the upstream-original path.
         #  * ``"boundary"`` (EXPERIMENTAL, explicit opt-in only) — fwd-boundary
@@ -398,9 +402,8 @@ class PipelineScheduleRuntime(ABC):
         #    a hardware accuracy pass and a perf win over "batch".
         #  * ``"multi_stream"`` (EXPERIMENTAL, explicit opt-in only) — keeps the
         #    ``"batch"`` schedule and same-peer duplex fusion, but routes each
-        #    physical PP edge through a fixed two-rank group. With MindSpore's
-        #    ``multi_stream:group`` runtime policy, the previous and next
-        #    edges then use separate communication streams. Group count is
+        #    physical PP edge through a fixed two-rank group so neighboring
+        #    edges can use separate communication streams. Group count is
         #    bounded by physical PP degree (at most two per rank), not by the
         #    number of micro-batches.
         #
@@ -467,7 +470,7 @@ class PipelineScheduleRuntime(ABC):
             return [stage.submodule]
         modules = []
         seen = set()
-        for _, module in platform.get_cells_and_names(stage.submodule):
+        for _, module in stage.submodule.named_modules():
             if not isinstance(module, HSDPModule) or id(module) in seen:
                 continue
             seen.add(id(module))
@@ -623,9 +626,9 @@ class PipelineScheduleRuntime(ABC):
         pp_rank_list = (
             list(mesh.rank_list)
             if mesh is not None
-            else platform.get_process_group_ranks(first_stage.pp_group)
+            else dist.get_process_group_ranks(first_stage.pp_group)
         )
-        self._p2p_multi_stream_groups = platform.create_p2p_multi_stream_groups(
+        self._p2p_multi_stream_groups = create_p2p_multi_stream_groups(
             pp_rank_list,
             include_wrap=self.n_local_stages > 1,
         )
@@ -640,7 +643,10 @@ class PipelineScheduleRuntime(ABC):
                     f"No P2P multi-stream group was created for peer global rank {peer}. "
                     f"Available peers are {sorted(self._p2p_multi_stream_groups)}."
                 )
-        return platform.p2p_op(op_type, tensor, peer, group=group)
+        if op_type not in ("isend", "irecv"):
+            raise ValueError(f"Unsupported pipeline P2P operation: {op_type!r}.")
+        op = dist.isend if op_type == "isend" else dist.irecv
+        return dist.P2POp(op, tensor, peer, group=group)
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -725,8 +731,14 @@ class PipelineScheduleRuntime(ABC):
 
     def _init_stages(self):
         """init stages."""
+        pp_group = None
         for stage in self.stages:
+            # Virtual chunks on one rank must share the automatically created
+            # communicator; native new_group does not cache equivalent groups.
+            if stage.pp_group is None and stage.mesh is None:
+                stage.pp_group = pp_group
             stage.init(self.n_local_stages)
+            pp_group = stage.pp_group
             # After-forward hook: lets the schedule issue fwd-boundary P2P the
             # moment a forward chunk completes (no-op unless an OVERLAP step
             # with boundary_p2p was armed for that (stage, micro)).
@@ -833,7 +845,7 @@ class PipelineScheduleRuntime(ABC):
         if (not self._batch_p2p or self._batch_p2p_group_initialized
                 or self.real_stage_num <= 1):
             return
-        platform.prepare_batch_p2p_group(self._batch_p2p_group)
+        prepare_batch_p2p_group(self._batch_p2p_group)
         self._batch_p2p_group_initialized = True
 
     def _ensure_p2p_multi_stream_groups_initialized(self) -> None:
@@ -842,7 +854,7 @@ class PipelineScheduleRuntime(ABC):
                 or getattr(self, "_p2p_multi_stream_groups_initialized", False)):
             return
         for group in self._p2p_multi_stream_groups.values():
-            platform.prepare_batch_p2p_group(group)
+            prepare_batch_p2p_group(group)
         self._p2p_multi_stream_groups_initialized = True
 
     def _drain_inflight_p2p(self):
@@ -870,15 +882,14 @@ class PipelineScheduleRuntime(ABC):
 
         ``specs`` are ``(op_type, tensor, peer_global_rank)`` from the stage's
         ``*_specs`` builders (which carry the meta/bookkeeping side effects).
-        Returns ``[handle]`` (the single batch handle) or ``[]`` — shaped like
+        Returns the native list of work handles or ``[]`` — shaped like
         the per-op ``exec_*_ops`` return so the cache / drain paths are
         unchanged.  Only the launch is coalesced; matching stays per-peer FIFO.
         """
         if not specs:
             return []
         ops = [self._p2p_op(op_type, tensor, peer) for op_type, tensor, peer in specs]
-        handle = platform.batch_isend_irecv(ops)
-        return [handle] if handle is not None else []
+        return dist.batch_isend_irecv(ops)
 
     # --- P2P step primitives ------------------------------------------------
     # One method per cross-rank comm action, used both by the runtime loop
@@ -1041,19 +1052,19 @@ class PipelineScheduleRuntime(ABC):
 
         for items in by_peer.values():
             ops = [self._p2p_op(op_type, tensor, peer) for op_type, tensor, peer, _ in items]
-            handle = platform.batch_isend_irecv(ops)
-            if handle is None:
+            handles = dist.batch_isend_irecv(ops)
+            if not handles:
                 continue
             if not self._overlap_p2p:
-                self._wait_p2p([handle])
+                self._wait_p2p(handles)
                 continue
             recv_routes = [route for *_, route in items if route is not None]
             if recv_routes:
                 for kind, si, mi in recv_routes:
                     cache = self.fwd_handle_cache if kind == "fwd" else self.bwd_handle_cache
-                    cache[(si, mi)] = [handle]
+                    cache[(si, mi)] = handles
             else:
-                self._send_handles.append([handle])
+                self._send_handles.append(handles)
 
     def _assert_in_unshard_if_needed(self, stage, check_step):
         if not isinstance(stage.submodule, HSDPModule):
@@ -1178,20 +1189,20 @@ class PipelineScheduleRuntime(ABC):
                 }
                 input_ids = micro_batch["input_ids"]
                 labels = micro_batch["labels"]
-                # Next-token shift built from platform ops (backend-agnostic).
-                pad_col = platform.full_like(labels[..., :1], -100)
-                targets = platform.cat([labels[..., 1:], pad_col], dim=-1).contiguous()
+                # Ignore the final token after shifting next-token targets.
+                pad_col = torch.full_like(labels[..., :1], -100)
+                targets = torch.cat([labels[..., 1:], pad_col], dim=-1).contiguous()
                 n_valid = max(int((targets != -100).sum().item()), 1)
                 if getattr(self, "_pp_fsdp_composed", False):
-                    nt = platform.full((1,), n_valid).to(device)
-                    platform.all_reduce(nt, self._dp_group_info)
+                    nt = torch.full((1,), n_valid).to(device)
+                    dist.all_reduce(nt, group=self._dp_group_info.group)
                     n_valid = max(int(nt.item()), 1)
                 self.last_local_tokens += n_valid
 
                 micro_batch["targets"] = targets
                 for key in self.kwargs_batch_dim:
                     if key in kwarg_mbs[micro_index].keys():
-                        kwarg_mbs[micro_index][key] = platform.cat(
+                        kwarg_mbs[micro_index][key] = torch.cat(
                             [kwarg_mbs[micro_index][key], micro_batch[key]], dim=0)
                     else:
                         kwarg_mbs[micro_index][key] = micro_batch[key]
@@ -1212,8 +1223,8 @@ class PipelineScheduleRuntime(ABC):
                             else kwarg_mbs[micro_index][key])
                 metas.append([tuple(tensor.shape), tensor.dtype])
                 tensors.append(tensor)
-            platform.send_object_list(metas, dst)
-            handles = [platform.isend(t, dst) for t in tensors]
+            dist.send_object_list(metas, dst)
+            handles = [dist.isend(t, dst) for t in tensors]
             self._wait_p2p(handles)
 
         elif step_type == MetaStepType.DATA_RECV:
@@ -1226,12 +1237,12 @@ class PipelineScheduleRuntime(ABC):
             # One recv_object_list unpacks every key's (shape, dtype) at
             # once, matching the packed DATA_SEND above.
             metas: list = [None] * len(self._DATA_KEYS)
-            platform.recv_object_list(metas, src)
+            dist.recv_object_list(metas, src)
             handles = []
             for key, meta in zip(self._DATA_KEYS, metas):
                 shape, dtype = meta
-                buffer = platform.empty(shape, dtype=dtype, device=device)
-                handles.append(platform.irecv(buffer, src))
+                buffer = torch.empty(shape, dtype=dtype, device=device)
+                handles.append(dist.irecv(buffer, src))
                 if key == "input_ids":
                     arg_mbs[micro_index] = [buffer]
                 else:

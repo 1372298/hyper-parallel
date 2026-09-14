@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """pipeline stage"""
+from typing import Any, Optional
+
 import torch
 import torch.distributed as dist
 from torch.distributed.pipelining._backward import (
@@ -41,11 +43,14 @@ class PipelineStageBase:
         recv_info(P2PInfo, optional): Specify Receive information. Default ``None``.
         send_info(P2PInfo, optional): Specify Send information. Default ``None``.
     """
-    def __init__(self, submodule, stage_index, stage_num, group=None, dyn_shape=False, has_backward=True):
+    def __init__(self, submodule: torch.nn.Module, stage_index: int, stage_num: int,
+                 group: Optional[dist.ProcessGroup] = None, dyn_shape: bool = False,
+                 has_backward: bool = True) -> None:
+        """Initialize stage autograd state and validate the communication group."""
         self.submodule = submodule
         self.fwd_cache = {}
         self.bwd_cache = {}
-        self.meta_cache = []
+        self._meta_cache = []
         self._dyn_shape = dyn_shape
         self._has_backward = has_backward
         self.group = self._check_pp_group(group)
@@ -56,7 +61,7 @@ class PipelineStageBase:
         self._trainable_params = None
         self._dw_cache = {}
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         """clear cache."""
         self.fwd_outputs_cache.clear()
         self.bwd_cache.clear()
@@ -81,16 +86,17 @@ class PipelineStageBase:
         return group
 
     @property
-    def is_first_stage(self):
+    def is_first_stage(self) -> bool:
         """return if is first stage."""
         return self.stage_index == 0
 
     @property
-    def is_last_stage(self):
+    def is_last_stage(self) -> bool:
         """return if is last stage."""
         return self.stage_index == self.stage_num - 1
 
-    def forward_one_chunk(self, micro_index, args=None, kwargs=None):
+    def forward_one_chunk(self, micro_index: int, args: Optional[tuple] = None,
+                          kwargs: Optional[dict] = None) -> Any:
         """Execution a forward function."""
         if self.is_first_stage:
             composite_args = args
@@ -128,10 +134,10 @@ class PipelineStageBase:
                         if isinstance(self.last_stage_outputs, (list, tuple))
                         else [self.last_stage_outputs])
         sens = []
-        for s, o in zip(sens_all, outputs_iter):
-            o_local = o.to_local() if isinstance(o, hyper_parallel.DTensor) else o
-            if o_local.requires_grad:
-                sens.append(s)
+        for sensitivity, output in zip(sens_all, outputs_iter):
+            local_output = output.to_local() if isinstance(output, hyper_parallel.DTensor) else output
+            if local_output.requires_grad:
+                sens.append(sensitivity)
         return sens
 
     def _populate_bwd_cache(self, micro_index):
@@ -149,7 +155,7 @@ class PipelineStageBase:
             )
         return self._trainable_params
 
-    def backward_one_chunk(self, micro_index):
+    def backward_one_chunk(self, micro_index: int) -> None:
         """Execution a backward function.
 
         ``grad_recv_info`` is filtered to rg=True forward outputs (see
@@ -187,7 +193,7 @@ class PipelineStageBase:
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
 
-    def backward_input_one_chunk(self, micro_index):
+    def backward_input_one_chunk(self, micro_index: int) -> None:
         """Compute input gradients and retain only the graph state needed by dw."""
         if not self._has_backward or self.is_first_stage:
             return
@@ -215,7 +221,7 @@ class PipelineStageBase:
         self._dw_cache[micro_index] = param_groups
         self._populate_bwd_cache(micro_index)
 
-    def backward_weight_one_chunk(self, micro_index):
+    def backward_weight_one_chunk(self, micro_index: int) -> None:
         """Compute parameter gradients from state captured by input backward."""
         if not self._has_backward:
             return
@@ -231,3 +237,24 @@ class PipelineStageBase:
         self._clear_recv_buffer(self.args_recv_info, micro_index)
         if self.is_last_stage:
             self.fwd_outputs_cache.pop(micro_index, None)
+
+    def get_last_stage_sens(self, last_stage_outputs: Any) -> Any:
+        """Get last stage sens"""
+        p_sens = None
+        if isinstance(last_stage_outputs, (list, tuple)):
+            p_sens = []
+            for _, out_i in enumerate(last_stage_outputs):
+                if isinstance(out_i, hyper_parallel.DTensor):
+                    repeat_num = out_i.layout.repeat_num()
+                    sens_i = torch.full_like(out_i.to_local(), 1.0 / repeat_num)
+                else:
+                    sens_i = torch.full_like(out_i, 1.0)
+                p_sens.append(sens_i)
+        else:
+            if isinstance(last_stage_outputs, hyper_parallel.DTensor):
+                repeat_num = last_stage_outputs.layout.repeat_num()
+                p_sens = torch.full_like(last_stage_outputs.to_local(), 1.0 / repeat_num)
+            else:
+                p_sens = torch.full_like(last_stage_outputs, 1.0)
+
+        return p_sens

@@ -931,11 +931,6 @@ def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_d
     )
 
 
-def differentiable_sync_hook(x, hook_name: str, coordinator):
-    """Insert a HookCoordinator rendezvous into the autograd graph."""
-    return _TorchSyncHookFunction.apply(x, hook_name, coordinator)
-
-
 def p2p_exchange(tensor, peer_rank: int, group=None):
     """Symmetric bidirectional P2P exchange with *peer_rank*."""
     if peer_rank == dist.get_rank(group):

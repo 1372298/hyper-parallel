@@ -12,26 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Platform-agnostic base for MPipe Transpose execution.
-
-The parameter broadcast, P2P transport, and step orchestration are identical
-across backends (they go through the ``platform`` abstraction), so they live
-here.  Each backend subclass implements only the autograd-specific hooks:
-running the preprocess forward (detached vs graph-connected), marking a tensor
-as a grad-requiring leaf, and the stage-0 backward.
-"""
+"""Torch execution and P2P transport for MPipe Transpose."""
+import logging
 import os
-from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-from hyper_parallel.platform import get_platform
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+import torch
+import torch.distributed as dist
 
 if TYPE_CHECKING:
     from hyper_parallel.core.pipeline_parallel.scheduler import MetaStep, PipelineContext
     from hyper_parallel.core.pipeline_parallel.mpipe.schedule import ScheduleMPipeTranspose
 
-platform = get_platform()
+logger = logging.getLogger(__name__)
 
 # Stage 0's transposed-feature recvs are batched (all posted non-blocking, then
 # waited once) by default, so the NT-1 transfers pipeline and overlap stage 0's
@@ -40,8 +33,8 @@ platform = get_platform()
 _RECV_BATCH = os.environ.get("HYPER_PARALLEL_MPIPE_RECV_BATCH", "1").lower() not in ("", "0", "false", "no")
 
 
-class MPipeTransposeExecutorBase(ABC):
-    """Backend-agnostic runtime for the ``MPIPE_*`` steps of MPipe Transpose.
+class MPipeTransposeExecutor:
+    """Torch runtime for the ``MPIPE_*`` steps of MPipe Transpose.
 
     Args:
         schedule (ScheduleMPipeTranspose): The schedule instance, providing the
@@ -55,10 +48,7 @@ class MPipeTransposeExecutorBase(ABC):
         self._preprocess = schedule.preprocess_module
         first_stage = schedule.stages[0]
         self._device = first_stage.device
-        # Named wrapper over the body pp_group (same ranks), so the mpipe wire
-        # can later move to a dedicated communicator without touching callers.
-        self._mpipe_group_info = GroupInfo("mpipe_pp", first_stage.pp_group, schedule.real_stage_num)
-        self._mpipe_group = self._mpipe_group_info.group
+        self._mpipe_group = first_stage.pp_group
         self._this_rank = first_stage.stage_index % schedule.real_stage_num
         self._output_arity_for_comm = None
         self._input_arity_for_comm = None
@@ -107,12 +97,12 @@ class MPipeTransposeExecutorBase(ABC):
         shape would be wrong; the meta is tiny so the per-step cost is negligible
         (``T = 0`` step time ~= 1F1B).
         """
-        platform.send_object_list([tuple(tensor.shape), tensor.dtype], dst, self._mpipe_group)
+        dist.send_object_list([tuple(tensor.shape), tensor.dtype], dst, self._mpipe_group)
 
     def _recv_meta(self, src):
         """Receive a tensor's ``(shape, dtype)`` from ``src`` (exchanged every step)."""
         meta: list = [None, None]
-        platform.recv_object_list(meta, src, self._mpipe_group)
+        dist.recv_object_list(meta, src, self._mpipe_group)
         return meta[0], meta[1]
 
     def _output_arity(self):
@@ -141,7 +131,7 @@ class MPipeTransposeExecutorBase(ABC):
 
     def _global_rank(self, group_rank: int) -> int:
         """Global rank of group pipeline rank ``group_rank``."""
-        return platform.get_global_rank(self._mpipe_group, group_rank)
+        return dist.get_global_rank(self._mpipe_group, group_rank)
 
     @staticmethod
     def _as_tuple(args):
@@ -167,7 +157,7 @@ class MPipeTransposeExecutorBase(ABC):
         """
         src = self._global_rank(0)
         for tensor in self._broadcast_tensors():
-            platform.broadcast(tensor, src, self._mpipe_group)
+            dist.broadcast(tensor, src, self._mpipe_group)
 
     def transpose_forward(self, step: "MetaStep", ctx: "PipelineContext") -> None:
         """Run the preprocess forward for ``step.micro_index``.
@@ -262,7 +252,7 @@ class MPipeTransposeExecutorBase(ABC):
         for tensor in self._outputs_for_stage0[micro]:
             wire = self._detach_for_wire(tensor) if self._owner_backward else self._contiguous(tensor)
             self._send_meta(wire, dst)
-            ctx.schedule._send_handles.append([platform.isend(wire, dst, self._mpipe_group)])  # pylint: disable=protected-access
+            ctx.schedule._send_handles.append([dist.isend(wire, dst, self._mpipe_group)])  # pylint: disable=protected-access
         # What is in flight is the wire copy, not this cache entry, so the
         # source can go now; the handles are drained by ``run_microbatches``.
         del self._outputs_for_stage0[micro]
@@ -328,10 +318,10 @@ class MPipeTransposeExecutorBase(ABC):
         handles = []
         for _ in range(arity):
             shape, dtype = self._recv_meta(src)
-            buffer = platform.empty(shape, dtype=dtype, device=self._recv_device())
+            buffer = torch.empty(shape, dtype=dtype, device=self._recv_device())
             if self._has_trainable:
                 self._mark_requires_grad(buffer)
-            handles.append(platform.irecv(buffer, src, self._mpipe_group))
+            handles.append(dist.irecv(buffer, src, self._mpipe_group))
             buffers.append(buffer)
         return buffers, handles
 
@@ -372,7 +362,7 @@ class MPipeTransposeExecutorBase(ABC):
         for tensor in self._inputs_for_explicit_forward[micro]:
             contiguous = self._contiguous(tensor)
             self._send_meta(contiguous, dst)
-            ctx.schedule._send_handles.append([platform.isend(contiguous, dst, self._mpipe_group)])  # pylint: disable=protected-access
+            ctx.schedule._send_handles.append([dist.isend(contiguous, dst, self._mpipe_group)])  # pylint: disable=protected-access
         # What is in flight is the wire copy, not this cache entry, so the
         # source can go now; the handles are drained by ``run_microbatches``.
         del self._inputs_for_explicit_forward[micro]
@@ -392,8 +382,8 @@ class MPipeTransposeExecutorBase(ABC):
         tensors = []
         for _ in range(arity):
             shape, dtype = self._recv_meta(src)
-            buffer = platform.empty(shape, dtype=dtype, device=self._recv_device())
-            platform.irecv(buffer, src, self._mpipe_group).wait()
+            buffer = torch.empty(shape, dtype=dtype, device=self._recv_device())
+            dist.irecv(buffer, src, self._mpipe_group).wait()
             tensors.append(buffer)
         self._inputs_for_explicit_forward[micro] = tuple(tensors)
 
@@ -421,7 +411,7 @@ class MPipeTransposeExecutorBase(ABC):
             grad = getattr(tensor, "grad", None)
             wire = self._detach_for_wire(grad) if grad is not None else self._zeros_like(tensor)
             self._send_meta(wire, dst)
-            ctx.schedule._send_handles.append([platform.isend(wire, dst, self._mpipe_group)])  # pylint: disable=protected-access
+            ctx.schedule._send_handles.append([dist.isend(wire, dst, self._mpipe_group)])  # pylint: disable=protected-access
         # What is in flight is the wire copy, not this cache entry, so the
         # source can go now; the handles are drained by ``run_microbatches``.
         del self._keep_grad[micro]
@@ -446,8 +436,8 @@ class MPipeTransposeExecutorBase(ABC):
         # (same per-peer posting order as the sends, so matching is unchanged).
         for _ in range(len(retained)):
             shape, dtype = self._recv_meta(src)
-            buffer = platform.empty(shape, dtype=dtype, device=device)
-            handles.append(platform.irecv(buffer, src, self._mpipe_group))
+            buffer = torch.empty(shape, dtype=dtype, device=device)
+            handles.append(dist.irecv(buffer, src, self._mpipe_group))
             grads.append(buffer)
         for handle in handles:
             handle.wait()
@@ -466,7 +456,7 @@ class MPipeTransposeExecutorBase(ABC):
             step (MetaStep): The ``MPIPE_GRAD_REDUCE`` step (unused).
             ctx (PipelineContext): The pipeline run context (unused).
         """
-        self._reduce_grads(self._mpipe_group_info, self._grad_snapshot)
+        self._reduce_grads(self._mpipe_group, self._grad_snapshot)
 
     def transpose_backward(self, step: "MetaStep", ctx: "PipelineContext") -> None:
         """Recompute the preprocess forward on stage 0 and backprop dL/dfeatures.
@@ -496,58 +486,101 @@ class MPipeTransposeExecutorBase(ABC):
         del self._keep_grad[micro]
 
     @staticmethod
-    def _contiguous(tensor):
-        """Return a contiguous tensor suitable for P2P (overridden where needed)."""
-        return tensor
+    def _local(tensor):
+        # An FSDP-sharded tower param/grad is a DTensor; operate on its local
+        # shard so pp collectives skip the DTensor dispatcher. Plain: pass through.
+        to_local = getattr(tensor, "to_local", None)
+        return to_local() if callable(to_local) else tensor
 
-    @abstractmethod
     def _broadcast_tensors(self):
-        """Yield the preprocess tensors (params/buffers) to broadcast from stage 0."""
+        """Yield each trainable tower param's local shard, resharded first.
 
-    @abstractmethod
-    def _detached_forward(self, args, kwargs):
-        """Run the preprocess forward and return a detached output value.
-
-        The base marks it grad-requiring via :meth:`_mark_requires_grad` only for
-        a trainable preprocess; for a frozen / param-free one (frozen visual
-        tower, T=0 identity) the value is shipped as-is.
+        Frozen params and buffers stay identical from init, so only the
+        trainable ones need re-syncing after the optimizer step.
         """
+        # Reshard first: under owner-backward stage 0 holds the tower unsharded
+        # while the replicas are sharded, so the sizes would disagree and hang.
+        for module in self._preprocess.modules():
+            reshard = getattr(module, "reshard", None)
+            if callable(reshard):
+                reshard()
+        for param in self._preprocess.parameters():
+            if param.requires_grad:
+                yield self._local(param.data)
 
-    @abstractmethod
+    def _detached_forward(self, args, kwargs):
+        with torch.no_grad():
+            out = self._preprocess(*args, **kwargs)
+        # The preprocess output may be a single tensor (text body input) or a
+        # tuple (e.g. a VL visual payload: image_embeds + DeepStack levels).
+        if isinstance(out, (tuple, list)):
+            return tuple(t.detach() for t in out)
+        return out.detach()
+
     def _connected_forward(self, args, kwargs):
-        """Owner-backward: run the preprocess forward graph-connected (no detach),
-        so the owner rank can later backprop into it from a received gradient."""
+        return self._preprocess(*args, **kwargs)
 
-    @abstractmethod
     def _mark_requires_grad(self, tensor) -> None:
-        """Mark ``tensor`` as a grad-requiring leaf so the body backward deposits a grad on it."""
+        tensor.requires_grad_(True)
 
-    @abstractmethod
     def _explicit_forward_before_backward(self, inputs, kwargs, grads) -> None:
-        """Recompute the preprocess forward, then backprop the per-output ``grads``
-        (one ``dL/dfeature`` per preprocess output, ``None`` where absent) into it,
-        accumulating preprocess grads."""
+        out = self._preprocess(*inputs, **kwargs)
+        out = out if isinstance(out, (tuple, list)) else (out,)
+        # Backprop only the outputs that received a gradient; an absent
+        # dL/dfeature is a zero contribution.
+        pairs = [(out_i, g) for out_i, g in zip(out, grads) if g is not None]
+        if not pairs:
+            return
+        outs, grad_tensors = zip(*pairs)
+        torch.autograd.backward(outs, grad_tensors=grad_tensors)
 
-    @abstractmethod
+    @staticmethod
+    def _contiguous(tensor):
+        return tensor.contiguous()
+
+    # --- owner-does-backward hooks (opt-in, trainable tower) -----------------
+
     def _detach_for_wire(self, tensor):
-        """Return a detached, contiguous wire copy of ``tensor`` (keeps the autograd graph local)."""
+        # Ship a detached, contiguous copy so the owner keeps the autograd graph.
+        return tensor.detach().contiguous()
 
-    @abstractmethod
     def _zeros_like(self, tensor):
-        """Return a contiguous zero tensor matching ``tensor`` (for an absent feature gradient)."""
+        # Contiguous zero grad for a feature tensor that received none.
+        return torch.zeros_like(tensor).contiguous()
 
-    @abstractmethod
     def _owner_transpose_backward(self, retained_out, grads) -> None:
-        """Owner-backward: backprop ``grads`` through the retained preprocess output graph."""
+        # Backprop dL/dfeatures through the retained connected tower graph on this
+        # rank's replica; skip non-grad-requiring outputs (else autograd raises).
+        pairs = [(out_i, g) for out_i, g in zip(retained_out, grads) if out_i.requires_grad]
+        if pairs:
+            outs, grad_tensors = zip(*pairs)
+            torch.autograd.backward(outs, grad_tensors=grad_tensors)
+        else:
+            logger.debug("[mpipe] owner backward skipped: no retained output requires grad.")
 
-    @abstractmethod
     def _snapshot_tower_grads(self):
-        """Owner-backward: clone the trainable preprocess param-grads (``None`` where
-        absent), in parameter order, so :meth:`_reduce_grads` can reduce only the
-        current run's contribution under gradient accumulation."""
+        # Clone each trainable tower grad's LOCAL shard (None where absent) so
+        # _reduce_grads reduces only this run's contribution.
+        return [None if p.grad is None else self._local(p.grad).detach().clone()
+                for p in self._preprocess.parameters() if p.requires_grad]
 
-    @abstractmethod
-    def _reduce_grads(self, group_info, snapshot) -> None:
-        """Owner-backward: SUM-reduce only the *current run's* trainable preprocess
-        param-grad contribution (``grad - snapshot``) over ``group_info`` and add it
-        back to ``snapshot``, so accumulated grads are not re-reduced each run."""
+    def _reduce_grads(self, group, snapshot) -> None:
+        """SUM-reduce each trainable tower param's this-run contribution
+        (grad - snapshot) over the pp replicas on the LOCAL shard, so an
+        FSDP-sharded DTensor grad never meets a raw c10d collective. FSDP owns the
+        orthogonal dp reduce (mean over dp_shard/dp_replicate); this owns only the
+        pp sum. Reducing the delta -- not the total -- keeps prior grad-accumulation
+        passes from being re-reduced; the write-back is in place so the DTensor grad
+        wrapper the optimizer reads is preserved (reassigning param.grad drops it).
+        """
+        params = [p for p in self._preprocess.parameters() if p.requires_grad]
+        if snapshot is None:  # first run (no prior accumulation) -> reduce full grad
+            snapshot = [None] * len(params)
+        for param, snap in zip(params, snapshot):
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            g_local = self._local(param.grad)
+            delta = g_local if snap is None else (g_local - snap)
+            reduced = delta.contiguous()
+            dist.all_reduce(reduced, group=group)
+            g_local.copy_(reduced if snap is None else (snap + reduced))

@@ -48,59 +48,6 @@ class TestTorchPlatformCore(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.platform = TorchPlatform()
 
-    @mock.patch("hyper_parallel.platform.torch.platform._get_default_group")
-    @mock.patch("torch.distributed.barrier")
-    @mock.patch("torch.distributed.get_rank", return_value=0)
-    @mock.patch("torch.distributed.get_world_size", return_value=2)
-    def test_prepare_batch_p2p_group_serializes_group_root(
-            self, mock_world_size, mock_rank, mock_barrier, mock_default_group):
-        """A group root serializes HCCL initialization after members rendezvous."""
-        group = MagicMock()
-        group.group_name = "edge-0-2"
-        group_store = group.get_group_store.return_value
-        group_store.add.return_value = 2
-        default_store = mock_default_group.return_value.get_group_store.return_value
-        default_store.compare_set.side_effect = [b"edge-0-2", b""]
-
-        TorchPlatform.prepare_batch_p2p_group(group)
-
-        mock_world_size.assert_called_once_with(group=group)
-        mock_rank.assert_called_once_with(group=group)
-        group_store.add.assert_called_once_with(
-            "hyper_parallel_p2p_group_init_ready:edge-0-2", 1)
-        group_store.set.assert_has_calls([
-            mock.call("hyper_parallel_p2p_group_init_ready:edge-0-2_done", "1"),
-            mock.call("hyper_parallel_p2p_group_init_root_ready:edge-0-2", "1"),
-        ])
-        default_store.compare_set.assert_has_calls([
-            mock.call("hyper_parallel_p2p_group_init_lock", "", "edge-0-2"),
-            mock.call("hyper_parallel_p2p_group_init_lock", "edge-0-2", ""),
-        ])
-        mock_barrier.assert_called_once_with(group=group)
-
-    @mock.patch("hyper_parallel.platform.torch.platform._get_default_group")
-    @mock.patch("torch.distributed.barrier")
-    @mock.patch("torch.distributed.get_rank", return_value=1)
-    @mock.patch("torch.distributed.get_world_size", return_value=2)
-    def test_prepare_batch_p2p_group_waits_for_group_root(
-            self, mock_world_size, mock_rank, mock_barrier, mock_default_group):
-        """A non-root member waits until its group root owns the initialization lock."""
-        group = MagicMock()
-        group.group_name = "edge-0-2"
-        group_store = group.get_group_store.return_value
-        group_store.add.return_value = 1
-
-        TorchPlatform.prepare_batch_p2p_group(group)
-
-        mock_world_size.assert_called_once_with(group=group)
-        mock_rank.assert_called_once_with(group=group)
-        group_store.wait.assert_has_calls([
-            mock.call(["hyper_parallel_p2p_group_init_ready:edge-0-2_done"]),
-            mock.call(["hyper_parallel_p2p_group_init_root_ready:edge-0-2"]),
-        ])
-        mock_default_group.assert_not_called()
-        mock_barrier.assert_called_once_with(group=group)
-
     def test_buffers_dict_includes_all_registered_buffers(self):
         """Torch buffer enumeration includes persistent and non-persistent buffers."""
         module = torch.nn.Module()
@@ -470,55 +417,6 @@ class TestTorchPlatformCore(unittest.TestCase):
         handle.wait()
         work_a.wait.assert_called_once_with()
         work_b.wait.assert_called_once_with()
-
-    def test_create_p2p_multi_stream_groups_creates_local_edges_in_stable_order(self) -> None:
-        """
-        Feature: PyTorch multi-stream pipeline P2P groups.
-        Description: Initialize two interleaved PP rings while the current rank belongs to one.
-        Expectation: Every rank creates the global edge set in one order and retains only local groups.
-        """
-        groups = [MagicMock(name=f"group_{index}") for index in range(8)]
-
-        def _all_gather_pp_rank_lists(output, local_ranks):
-            self.assertEqual(local_ranks, [0, 1, 2, 3])
-            output[:] = [[0, 1, 2, 3]] * 4 + [[4, 5, 6, 7]] * 4
-
-        with mock.patch.dict(
-                "hyper_parallel.platform.torch.platform.EXISTING_COMM_GROUPS",
-                clear=True,
-        ), mock.patch.dict(
-                "hyper_parallel.platform.torch.platform._P2P_MULTI_STREAM_GROUPS",
-                clear=True,
-        ), mock.patch(
-            "hyper_parallel.platform.torch.platform.dist.get_rank",
-            return_value=1,
-        ), mock.patch(
-            "hyper_parallel.platform.torch.platform.dist.get_world_size",
-            return_value=8,
-        ), mock.patch(
-            "hyper_parallel.platform.torch.platform.dist.all_gather_object",
-            side_effect=_all_gather_pp_rank_lists,
-        ), mock.patch(
-            "hyper_parallel.platform.torch.platform.dist.new_group",
-            side_effect=groups,
-        ) as new_group:
-            local_groups = TorchPlatform.create_p2p_multi_stream_groups(
-                [0, 1, 2, 3],
-                include_wrap=True,
-            )
-
-        expected_calls = [
-            mock.call(ranks=[0, 1]),
-            mock.call(ranks=[0, 3]),
-            mock.call(ranks=[1, 2]),
-            mock.call(ranks=[2, 3]),
-            mock.call(ranks=[4, 5]),
-            mock.call(ranks=[4, 7]),
-            mock.call(ranks=[5, 6]),
-            mock.call(ranks=[6, 7]),
-        ]
-        self.assertEqual(new_group.call_args_list, expected_calls)
-        self.assertEqual(local_groups, {0: groups[0], 2: groups[2]})
 
     def test_differentiable_async_allgather_wait_immediate_backward(self):
         """Async all-gather wait should return a real gradient when handle_box is None."""
