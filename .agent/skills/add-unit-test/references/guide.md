@@ -21,9 +21,10 @@ Layout:
 | Component | Description                                                                                                         | Location Pattern                        |
 | --------- |---------------------------------------------------------------------------------------------------------------------|-----------------------------------------|
 | **Unit Tests** | Conducting independent testing of functions and modules using only the CPU                                          | `tests/ut/<module>/<feature>/test_*.py` |
-| **Integration Tests** | Test interactions between components and modules that require actual distributed communication and GPU/NPU hardware | `tests/st/<module>/test_*.py`           |
+| **Integration Tests** | Test interactions between components and modules that require actual distributed communication and GPU/NPU hardware | `tests/torch/<module>/test_*.py`        |
 
 **Key Principles:**
+
 - Unit test should be **hardware-agnostic** (no GPU/NPU dependency)
 - Unit test should **mock distributed communication** (no actual torch.distributed calls)
 - Unit test should follow **Arrange-Act-Assert** pattern
@@ -244,7 +245,7 @@ def test_nested_structure_processing(self):
 - ❌ **Missing error cases**: Always test invalid inputs and error conditions
 - ❌ **Hardcoding values**: Use random values or constants for test data
 - ❌ **Not cleaning up**: Use tearDown if resources need cleanup
-- ❌ **Poor test naming**: Follow test_<what>_<condition>_<expected> pattern
+- ❌ **Poor test naming**: Follow `test_<what>_<condition>_<expected>` pattern
 - ❌ **No docstrings**: Add detailed descriptive Google docstrings to test classes and methods
 - ❌ **Do not avoid bugs in source code**: Fix the bugs in the source code rather than modifying tests to skip them.
 
