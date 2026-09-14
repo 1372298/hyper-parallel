@@ -28,7 +28,7 @@ Optimization Strategies:
 from typing import Any, List
 from torch import fx
 
-from ...parallel_config import PassConfig
+from ...pass_config import PassConfig
 from ..base import GraphPass
 
 

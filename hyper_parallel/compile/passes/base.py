@@ -24,11 +24,11 @@ can rely on ``enable_overlap`` / ``fsdp_enabled`` / ``fsdp_degree``
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
-from ..parallel_config import PassConfig
+from ..pass_config import PassConfig
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..sharding_config import PassPlan
+    from ..pass_plan import PassPlan
 
 
 class GraphPass(ABC):

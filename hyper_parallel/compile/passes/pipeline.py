@@ -37,7 +37,7 @@ add it here when an inductor backend integration lands.
 
 from typing import TYPE_CHECKING, Any, List, Optional
 
-from ..parallel_config import PassConfig
+from ..pass_config import PassConfig
 from .base import GraphPass
 from .overlap.schedule import AutoOverlapPass
 from .parallel.fsdp_pass import FSDPPass
@@ -45,7 +45,7 @@ from .parallel.pp_pass import PpPass
 
 if TYPE_CHECKING:
     from torch import fx
-    from ..sharding_config import PassPlan
+    from ..pass_plan import PassPlan
 
 
 class PassPipeline:

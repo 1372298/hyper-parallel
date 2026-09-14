@@ -26,9 +26,9 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.distributed_c10d import _register_process_group
 
-from .parallel_config import PassConfig
+from .pass_config import PassConfig
 from .passes.pipeline import PassPipeline
-from .sharding_config import PassPlan
+from .pass_plan import PassPlan
 from .tracer.graph_tracer import run_traced_graph, trace_model_graph
 
 
@@ -55,7 +55,8 @@ class GraphTrainer:
             model: Model to train
             train_fn: Training function signature: (model, input, label) -> loss
             pass_config: Parallel configuration
-            pass_plan: Sharding plan (optional, if provided use declarative sharding)
+            pass_plan: PassPlan declaring which modules to shard (optional;
+                enables declarative sharding)
             optimizer_config: Optimizer configuration
             device: Device to place the model and run training on. Defaults to
                 the NPU device when available, otherwise CPU.

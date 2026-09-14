@@ -56,9 +56,9 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import fx, nn
 
-from hyper_parallel.compile.parallel_config import PassConfig
+from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.sharding_config import PassPlan
+from hyper_parallel.compile.pass_plan import PassPlan
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
 _RESOLVE_PG_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass._resolve_process_group"

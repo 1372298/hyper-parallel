@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for ``hyper_parallel.compile.sharding_config``.
+"""Unit tests for ``hyper_parallel.compile.pass_plan``.
 
 Covers:
 
@@ -22,8 +22,8 @@ Covers:
    ``fnmatch`` semantics.
 3. ``get_fsdp_config`` returns the matching config (or ``None``).
 4. ``merge`` returns a *new* plan (does not mutate inputs).
-5. ``create_simple_sharding_plan`` wraps everything via the ``*`` pattern.
-6. ``create_sharding_plan_from_yaml`` happy path + validation.
+5. ``create_simple_pass_plan`` wraps everything via the ``*`` pattern.
+6. ``create_pass_plan_from_yaml`` happy path + validation.
 """
 
 import os
@@ -33,11 +33,11 @@ import unittest
 
 import yaml
 
-from hyper_parallel.compile.sharding_config import (
+from hyper_parallel.compile.pass_plan import (
     FSDPModuleConfig,
     PassPlan,
-    create_sharding_plan_from_yaml,
-    create_simple_sharding_plan,
+    create_pass_plan_from_yaml,
+    create_simple_pass_plan,
 )
 
 
@@ -188,11 +188,11 @@ class TestPassPlanMerge(unittest.TestCase):
 
 
 class TestCreateSimplePassPlan(unittest.TestCase):
-    """``create_simple_sharding_plan`` wraps everything via ``*``."""
+    """``create_simple_pass_plan`` wraps everything via ``*``."""
 
     def test_wraps_all_modules(self):
         """Test the simple plan matches any FQN via ``*`` pattern."""
-        plan = create_simple_sharding_plan()
+        plan = create_simple_pass_plan()
         self.assertTrue(plan.is_fsdp_module("anything"))
         self.assertTrue(plan.is_fsdp_module("layers.0.attention.weight"))
         self.assertIn("*", plan.fsdp_patterns)
@@ -217,7 +217,7 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
             f.write(yaml_text)
             path = f.name
         try:
-            plan = create_sharding_plan_from_yaml(config_path=path)
+            plan = create_pass_plan_from_yaml(config_path=path)
         finally:
             os.unlink(path)
 
@@ -237,7 +237,7 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
             f.write(yaml_text)
             path = f.name
         try:
-            plan = create_sharding_plan_from_yaml(config_path=path)
+            plan = create_pass_plan_from_yaml(config_path=path)
         finally:
             os.unlink(path)
 
@@ -254,7 +254,7 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
             f.write(yaml_text)
             path = f.name
         try:
-            plan = create_sharding_plan_from_yaml(config_path=path)
+            plan = create_pass_plan_from_yaml(config_path=path)
         finally:
             os.unlink(path)
 
@@ -263,12 +263,12 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
     def test_requires_path_or_model_name(self):
         """Test ValueError when neither config_path nor model_name is given."""
         with self.assertRaises(ValueError):
-            create_sharding_plan_from_yaml()
+            create_pass_plan_from_yaml()
 
     def test_missing_file_raises(self):
         """Test FileNotFoundError for a non-existent path."""
         with self.assertRaises(FileNotFoundError):
-            create_sharding_plan_from_yaml(config_path="/no/such/file.yaml")
+            create_pass_plan_from_yaml(config_path="/no/such/file.yaml")
 
     def test_empty_yaml_raises(self):
         """Test an empty YAML file raises ValueError."""
@@ -277,7 +277,7 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
             path = f.name
         try:
             with self.assertRaises(ValueError):
-                create_sharding_plan_from_yaml(config_path=path)
+                create_pass_plan_from_yaml(config_path=path)
         finally:
             os.unlink(path)
 
@@ -288,7 +288,7 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
             path = f.name
         try:
             with self.assertRaises(ValueError):
-                create_sharding_plan_from_yaml(config_path=path)
+                create_pass_plan_from_yaml(config_path=path)
         finally:
             os.unlink(path)
 
@@ -296,7 +296,7 @@ class TestCreatePassPlanFromYaml(unittest.TestCase):
         """Test ``model_name`` with path separators is rejected."""
         for bad in ("../etc", "foo/bar", "foo\\bar"):
             with self.assertRaises(ValueError):
-                create_sharding_plan_from_yaml(model_name=bad)
+                create_pass_plan_from_yaml(model_name=bad)
 
 
 if __name__ == "__main__":

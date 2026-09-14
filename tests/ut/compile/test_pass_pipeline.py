@@ -36,11 +36,11 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import fx
 
-from hyper_parallel.compile.parallel_config import PassConfig
+from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.passes.base import GraphPass
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
 from hyper_parallel.compile.passes.pipeline import PassPipeline
-from hyper_parallel.compile.sharding_config import PassPlan
+from hyper_parallel.compile.pass_plan import PassPlan
 
 
 class _RecordingPass(GraphPass):
@@ -121,7 +121,7 @@ class TestPassPipelineBuild(unittest.TestCase):
         self.assertEqual(names[0], "DeadCodeEliminationPass")
         self.assertEqual(names[1], "CanonicalizeGraphPass")
 
-    def test_sharding_plan_forwarded_to_fsdp_pass(self):
+    def test_pass_plan_forwarded_to_fsdp_pass(self):
         """Test the pipeline's pass_plan is forwarded to FSDPPass at build time."""
         plan = PassPlan().fsdp_wrap("foo")
         pipeline = PassPipeline(PassConfig(), plan).build()

@@ -48,9 +48,9 @@ from torch import fx, nn
 from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.ops import _c10d_functional
 
-from ...parallel_config import PassConfig
+from ...pass_config import PassConfig
 from ..base import GraphPass
-from ...sharding_config import PassPlan
+from ...pass_plan import PassPlan
 
 _LOG = logging.getLogger(__name__)
 
