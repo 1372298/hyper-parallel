@@ -12,7 +12,8 @@ paths:
 - Use `from hyper_parallel.platform import get_platform` to auto-detect backend
 - `HYPER_PARALLEL_PLATFORM` env var can force `"torch"` or `"mindspore"`
 - All collective ops (`all_reduce`, `all_gather`, `reduce_scatter`) go through `platform.*`
-- `DTensorBase` and `Tensor` are platform-specific tensor types
+- `DTensorBase` (`core/dtensor/dtensor_base.py`) is now Torch-only core code, not a platform API;
+  `Platform.DTensorBase` has been removed from both backends
 
 ## Cross-Platform Checklist
 

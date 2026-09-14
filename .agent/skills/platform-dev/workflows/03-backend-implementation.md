@@ -67,17 +67,16 @@ For feature-specific code (FSDP, HSDP, Pipeline, Activation Checkpoint):
 
 ### 3.4 DTensorBase Extension
 
-For changes to DTensorBase:
+DTensorBase is **Torch-only core code**, not a platform API — it lives in
+`core/dtensor/dtensor_base.py` and the backend copies were removed with the
+Platform retirement. Edit it there:
 
-**Torch** (`platform/torch/dtensor.py`):
 - Subclass of `torch.Tensor` via `_make_subclass()`
 - Override `__torch_function__` for op dispatch
 - Properties delegate to `_local_tensor`
 
-**MindSpore** (`platform/mindspore/dtensor.py`):
-- Subclass of `ms.Tensor` via `_make_subclass()`
-- Override `__fallback__()` for op dispatch
-- Support for uninitialized tensors (`has_init`)
+Add no MindSpore counterpart and no Platform dispatch. `DTensor`
+(`core/dtensor/dtensor.py`) is its only subclass.
 
 ### 3.5 Stream Safety Checklist
 
