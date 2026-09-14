@@ -1529,7 +1529,7 @@ class TorchPlatform(Platform):
     @staticmethod
     def ignore_sac_ops(ignore_ops: list[object | None]) -> None:
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.activation_checkpoint.sac import ignore_sac_ops
+        from hyper_parallel.core.activation_memory.sac import ignore_sac_ops
         ignore_sac_ops(ignore_ops)
 
     @staticmethod
@@ -1537,7 +1537,7 @@ class TorchPlatform(Platform):
         policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False, cpu_pool=None
     ):
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
+        from hyper_parallel.core.activation_memory.sac import create_selective_checkpoint_contexts
         return create_selective_checkpoint_contexts(
             policy_fn_or_list, allow_cache_entry_mutation, group_swap, cpu_pool
         )
