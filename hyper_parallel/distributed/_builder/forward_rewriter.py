@@ -267,7 +267,7 @@ def _install_bias_suppression(module, spec):
         owner = module.get_submodule(owner_path) if owner_path else module
         original = owner.forward
 
-        @functools.wraps(original)
+        @functools.wraps(original)  # pylint: disable=cell-var-from-loop
         def bias_free_forward(
             *args: Any,
             __original: Callable[..., Any] = original,
@@ -625,7 +625,7 @@ def _wrap_local_region_forward(module, boundary, spec, mesh, mesh_dim_names,
         compute_fn = original_forward
 
 
-    out_src_placements = None
+    out_src_placements = None  # pylint: disable=unused-variable
     if spec.out_src:
         out_src_named = next(iter(spec.out_src.values()))
         out_src_placements = tuple(resolve_placements(out_src_named, mesh_dim_names))
@@ -954,11 +954,14 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
     # Record the pre-rewrite state for failure rollback: an in-place wrapper
     # writes an instance attribute, so __dict__ holds the full mutation.
     saved_state = {"forward": target.__dict__.get("forward", _MISSING)}
+    committed_secondaries = []
     try:
         primary, secondaries = _classify_rewrite_result(
             apply_fn(), target, name)
         for request in secondaries:
-            _commit_forward_rewrite(request)
+            committed_secondaries.append(
+                (request.target, _commit_forward_rewrite(request))
+            )
         if primary is None:
             # In-place contract (external @inner_wrapper wrappers). Detect
             # "a replacement really happened": attribute access on a bound
@@ -974,7 +977,7 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
             # In-repo discipline: the wrapper returned its replacement, the
             # rewriter commits the companion attributes and installs.
             saved_state.update({
-                attr: getattr(target, attr, _MISSING)
+                attr: target.__dict__.get(attr, _MISSING)
                 for attr in primary.companion_attrs
             })
             for attr, value in primary.companion_attrs.items():
@@ -998,6 +1001,9 @@ def _wrap_inner_attention(module, cp_mesh, *, spec=None, mesh=None,
     except Exception:
         # Failure rollback: restore every attribute written during the
         # rewrite so a half-installed wrapper never survives.
+        for secondary_target, secondary_state in reversed(committed_secondaries):
+            for attr, saved in secondary_state.items():
+                _restore_attr(secondary_target, attr, saved)
         for attr, saved in saved_state.items():
             _restore_attr(target, attr, saved)
         raise
@@ -1105,7 +1111,7 @@ def _commit_forward_rewrite(request):
     target = request.target
     saved = {
         "forward": target.__dict__.get("forward", _MISSING),
-        **{name: getattr(target, name, _MISSING)
+        **{name: target.__dict__.get(name, _MISSING)
            for name in request.companion_attrs},
     }
     try:
@@ -1116,6 +1122,7 @@ def _commit_forward_rewrite(request):
         for attr_name, value in saved.items():
             _restore_attr(target, attr_name, value)
         raise
+    return saved
 
 
 def _classify_rewrite_result(returned, target, wrapper_name):
