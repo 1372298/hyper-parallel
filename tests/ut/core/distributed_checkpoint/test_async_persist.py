@@ -51,6 +51,7 @@ class TestAsyncStaging(unittest.TestCase):
     """Tests for async checkpoint staging helpers."""
 
     def setUp(self) -> None:
+        """Rebuild the staging module against the torch platform before every case."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         _platform_mod.platform = None
         importlib.reload(staging_mod)
@@ -70,27 +71,35 @@ class TestAsyncStaging(unittest.TestCase):
         self.assertFalse(staged_weight.is_cuda)
         torch.testing.assert_close(staged_weight, weight.cpu())
 
-    def test_copy_tensor_to_cpu_uses_platform_detach(self):
+    def test_copy_tensor_to_cpu_detaches_before_the_copy(self):
         """
-        Feature: Cross-backend tensor staging.
-        Description: Stage a tensor whose detached value only exposes the shared ``to`` API.
-        Expectation: The platform detach hook is used and the CPU transfer requests an independent copy.
+        Feature: Tensor staging.
+        Description: Stage a tensor whose ``detach`` hands back a value exposing only ``to``.
+        Expectation: The tensor is detached first and the CPU transfer asks for an independent copy.
         """
-        source = object()
         staged = object()
         to_calls = []
 
         class _DetachedTensor:
-            def to(self, *args, **kwargs):
-                """Record the backend-neutral CPU copy request."""
+            def to(self, *args: Any, **kwargs: Any) -> Any:
+                """Record the CPU copy request."""
                 to_calls.append((args, kwargs))
                 return staged
 
-        detached = _DetachedTensor()
-        with patch.object(staging_mod.platform, "detach", return_value=detached) as detach:
-            result = staging_mod._copy_tensor_to_cpu(source)
+        class _Source:
+            def __init__(self) -> None:
+                """Start with nothing detached yet."""
+                self.detach_calls = 0
 
-        detach.assert_called_once_with(source)
+            def detach(self) -> _DetachedTensor:
+                """Hand back the detached stand-in, counting the call."""
+                self.detach_calls += 1
+                return _DetachedTensor()
+
+        source = _Source()
+        result = staging_mod._copy_tensor_to_cpu(source)
+
+        self.assertEqual(source.detach_calls, 1)
         self.assertEqual(to_calls, [(('cpu',), {'copy': True})])
         self.assertIs(result, staged)
 
@@ -417,7 +426,7 @@ class TestCopyDispatch(unittest.TestCase):
         Expectation: Each one resolves to the handler registered for its own type.
         """
         dispatch = staging_mod.DataCopier.dispatch
-        self.assertIs(dispatch(torch.zeros(2)), staging_mod.DataCopier._registry[staging_mod.platform.Tensor])
+        self.assertIs(dispatch(torch.zeros(2)), staging_mod.DataCopier._registry[torch.Tensor])
         self.assertIs(dispatch({}), staging_mod.DataCopier._registry[dict])
 
     def test_subclass_resolves_to_the_most_derived_registered_type(self):
@@ -425,7 +434,7 @@ class TestCopyDispatch(unittest.TestCase):
         Feature: DataCopier.dispatch subclass lookup.
         Description: Register a base class and then a derived one, and dispatch an instance of
             a further subclass - the shape DTensor has, since it is registered after
-            platform.Tensor and derives from it.
+            torch.Tensor and derives from it.
         Expectation: The derived handler wins. Resolving in registration order instead would
             stage a DTensor subclass as a plain tensor, dropping its mesh and placements.
         """

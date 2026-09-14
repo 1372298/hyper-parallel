@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for RaggedShard distributed checkpoint geometry."""
+# pylint: disable=wrong-import-position
 import os
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ import torch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.distributed_checkpoint.ragged_utils import (
+from hyper_parallel.core.distributed_checkpoint.ragged import (
     _decompose_flat_interval,
     compute_ragged_boxes,
     create_ragged_write_items,
