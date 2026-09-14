@@ -62,9 +62,9 @@ import torch
 import torch.distributed as dist
 from torch import fx, nn
 
-from ...parallel_config import PassConfig
+from ...pass_config import PassConfig
 from ..base import GraphPass
-from ...sharding_config import PassPlan
+from ...pass_plan import PassPlan
 from .pp_schedule import ScheduleGPipe
 
 _LOG = logging.getLogger(__name__)

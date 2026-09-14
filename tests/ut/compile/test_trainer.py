@@ -45,7 +45,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import nn
 
-from hyper_parallel.compile.parallel_config import PassConfig
+from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.trainer import GraphTrainer
 
 

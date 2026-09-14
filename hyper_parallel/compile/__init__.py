@@ -35,7 +35,7 @@ Usage Example:
     # Configure parallelism
     pass_config = PassConfig(enable_overlap=True)
 
-    # Configure sharding plan
+    # Build pass plan
     pass_plan = PassPlan()
     pass_plan.fsdp_wrap_pattern("layers.*")
 
@@ -47,23 +47,23 @@ Usage Example:
     trainer.train(dataloader, max_steps=100, log_interval=10)
 """
 
-from .sharding_config import (
+from .pass_plan import (
     PassPlan,
     FSDPModuleConfig,
-    create_sharding_plan_from_yaml,
-    create_simple_sharding_plan,
+    create_pass_plan_from_yaml,
+    create_simple_pass_plan,
 )
 
-from .parallel_config import PassConfig
+from .pass_config import PassConfig
 
 from .trainer import GraphTrainer
 
 __all__ = [
-    # Sharding
+    # Pass plan
     "PassPlan",
     "FSDPModuleConfig",
-    "create_sharding_plan_from_yaml",
-    "create_simple_sharding_plan",
+    "create_pass_plan_from_yaml",
+    "create_simple_pass_plan",
     # Config
     "PassConfig",
     # Trainer

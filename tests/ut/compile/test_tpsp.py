@@ -36,9 +36,9 @@ os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 import torch
 from torch import nn
 
-from hyper_parallel.compile.parallel_config import PassConfig
+from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.passes.parallel.fsdp_pass import FSDPPass
-from hyper_parallel.compile.sharding_config import PassPlan
+from hyper_parallel.compile.pass_plan import PassPlan
 from hyper_parallel.compile.tracer.graph_tracer import trace_model_graph
 
 

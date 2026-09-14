@@ -48,7 +48,7 @@ from hyper_parallel.compile import (  # pylint: disable=C0413,C0415,E0611
     GraphTrainer,
     PassConfig,
     PassPlan,
-    create_sharding_plan_from_yaml,
+    create_pass_plan_from_yaml,
 )
 
 
@@ -147,7 +147,7 @@ def build_pass_plan(config_path: str) -> PassPlan:
     With ``pp.stages`` declared the plan is manual; without it ``PpPass``
     falls back to the automatic even-by-layers split.
     """
-    return create_sharding_plan_from_yaml(config_path=config_path)
+    return create_pass_plan_from_yaml(config_path=config_path)
 
 
 def main() -> None:

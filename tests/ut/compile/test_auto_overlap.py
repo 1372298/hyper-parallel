@@ -42,7 +42,7 @@ import torch
 from torch import fx
 from torch.ops import _c10d_functional
 
-from hyper_parallel.compile.parallel_config import PassConfig
+from hyper_parallel.compile.pass_config import PassConfig
 from hyper_parallel.compile.passes.overlap.schedule import AutoOverlapPass
 
 

@@ -76,10 +76,10 @@ def build_pass_config(config: dict) -> PassConfig:
 
 
 def build_pass_plan(config: dict) -> PassPlan:
-    """Build sharding plan from YAML config"""
+    """Build PassPlan from YAML config"""
     if "sharding" in config:
         # Use YAML configuration
-        from hyper_parallel.compile import create_sharding_plan_from_yaml  # pylint: disable=C0415
+        from hyper_parallel.compile import create_pass_plan_from_yaml  # pylint: disable=C0415
         import tempfile  # pylint: disable=C0415
 
         # Write sharding config to temp file
@@ -87,7 +87,7 @@ def build_pass_plan(config: dict) -> PassPlan:
             yaml.dump(config["sharding"], f)
             temp_path = f.name
 
-        plan = create_sharding_plan_from_yaml(config_path=temp_path)
+        plan = create_pass_plan_from_yaml(config_path=temp_path)
 
         # Clean up temp file
         import os  # pylint: disable=C0415

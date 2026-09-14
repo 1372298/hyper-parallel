@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-Sharding Configuration - Graph-mode FSDP module configuration.
+Pass Plan - declarative module selection for graph-mode passes.
 
 Declares which modules the graph-mode ``FSDPPass`` should shard. ``FSDPPass``
 itself owns all the actual sharding logic (all_gather on parameter
@@ -42,8 +42,8 @@ DEFAULT_CONFIG_DIR = Path(__file__).parent / "examples"
 __all__ = [
     "PassPlan",
     "FSDPModuleConfig",
-    "create_sharding_plan_from_yaml",
-    "create_simple_sharding_plan",
+    "create_pass_plan_from_yaml",
+    "create_simple_pass_plan",
 ]
 
 
@@ -200,7 +200,7 @@ class PassPlan:
         return self
 
 
-def create_sharding_plan_from_yaml(
+def create_pass_plan_from_yaml(
     config_path: Optional[str] = None,
     model_name: Optional[str] = None,
 ) -> PassPlan:
@@ -219,8 +219,8 @@ def create_sharding_plan_from_yaml(
         FileNotFoundError: When the resolved config file does not exist.
 
     Example:
-        plan = create_sharding_plan_from_yaml(model_name="llama3")
-        plan = create_sharding_plan_from_yaml(config_path="path/to/config.yaml")
+        plan = create_pass_plan_from_yaml(model_name="llama3")
+        plan = create_pass_plan_from_yaml(config_path="path/to/config.yaml")
     """
     if config_path is None and model_name is None:
         raise ValueError("Must provide either config_path or model_name")
@@ -328,7 +328,7 @@ def _process_pp(plan: PassPlan, pp_config: dict) -> None:
         plan.pp_stage(stage_idx, module_fqns)
 
 
-def create_simple_sharding_plan() -> PassPlan:
+def create_simple_pass_plan() -> PassPlan:
     """Create a plan that FSDP-wraps every module (``*`` pattern).
 
     Convenience for tests / quick demos.

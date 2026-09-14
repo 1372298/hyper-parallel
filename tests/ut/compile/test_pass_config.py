@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for ``hyper_parallel.compile.parallel_config.PassConfig``.
+"""Unit tests for ``hyper_parallel.compile.pass_config.PassConfig``.
 
 Covers the rules the dataclass asserts and that have regressed before:
 
@@ -29,7 +29,7 @@ Covers the rules the dataclass asserts and that have regressed before:
 
 import unittest
 
-from hyper_parallel.compile.parallel_config import PassConfig
+from hyper_parallel.compile.pass_config import PassConfig
 
 
 class TestPassConfigDefaults(unittest.TestCase):
@@ -159,8 +159,8 @@ class TestPassConfigTorchFree(unittest.TestCase):
     """
 
     def test_module_does_not_import_torch_at_top(self):
-        """Test no top-level torch import in ``parallel_config`` module."""
-        import hyper_parallel.compile.parallel_config as mod
+        """Test no top-level torch import in ``pass_config`` module."""
+        import hyper_parallel.compile.pass_config as mod
 
         # torch / torch.distributed must not be a side-effect of importing
         # the config module. (It may be imported by *something else* in the
@@ -169,7 +169,7 @@ class TestPassConfigTorchFree(unittest.TestCase):
             "torch",
             mod.__dict__,
             (
-                "parallel_config module should not bind 'torch' in its globals; "
+                "pass_config module should not bind 'torch' in its globals; "
                 "the dist probe belongs in FSDPPass.run, not the config dataclass"
             ),
         )
@@ -177,7 +177,7 @@ class TestPassConfigTorchFree(unittest.TestCase):
             "dist",
             mod.__dict__,
             (
-                "parallel_config module should not bind 'dist' (= torch.distributed) "
+                "pass_config module should not bind 'dist' (= torch.distributed) "
                 "in its globals"
             ),
         )
