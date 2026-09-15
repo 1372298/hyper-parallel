@@ -27,7 +27,8 @@ from hyper_parallel.core.context_parallel import async_context_parallel as async
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_device_mesh  # noqa: E402
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard  # noqa: E402
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType  # noqa: E402
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import PlatformType  # noqa: E402
 
 
 class _FakeTwoDMesh:

@@ -34,7 +34,7 @@ from hyper_parallel.core.dtensor.dtensor import (
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import RaggedShard, Replicate, Shard
 from hyper_parallel.core.shard._op_dispatch import _debug_mode_observer  # pylint: disable=C0413
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class _DispatchObserver:

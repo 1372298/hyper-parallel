@@ -25,7 +25,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.dtensor import _utils
 from hyper_parallel.core.dtensor._mesh_layout import IntTuple, _MeshLayout, _contiguous_strides, _is_int
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 Tensor = torch.Tensor
 

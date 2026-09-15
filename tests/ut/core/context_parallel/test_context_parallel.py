@@ -28,7 +28,8 @@ from hyper_parallel.core.context_parallel.context_parallel import ContextParalle
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP  # noqa: E402
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard  # noqa: E402
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType  # noqa: E402
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import PlatformType  # noqa: E402
 
 
 def _patch_torch_dist_rank(world_size=1):

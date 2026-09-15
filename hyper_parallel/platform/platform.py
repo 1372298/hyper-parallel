@@ -129,9 +129,6 @@ def get_platform():
         return get_torch_platform()
 
 
-EXISTING_COMM_GROUPS = {}
-
-
 class Platform:
     """Platform api"""
     current_grad_handle = None
@@ -1145,6 +1142,10 @@ class Platform:
         Returns:
             The process group for the specified ranks.
         """
+        # Imported locally: this module is loaded before ``core.utils`` finishes
+        # initializing, so a top-level import would close the cycle through ``core.dtensor``.
+        from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0415
+
         group_key = str(tuple(sorted(rank_list)))
         if group_key in EXISTING_COMM_GROUPS:
             return EXISTING_COMM_GROUPS[group_key]
@@ -1803,6 +1804,9 @@ class Platform:
         Returns:
             The process group corresponding to the rank list if it exists, else None.
         """
+        # Local import — see Platform.create_group for the cycle this avoids.
+        from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0415
+
         group_key = str(tuple(sorted(rank_list)))
         if group_key in EXISTING_COMM_GROUPS:
             return EXISTING_COMM_GROUPS[group_key]
@@ -1815,6 +1819,9 @@ class Platform:
         Args:
             process_group (Union[Any, list[Any]]): A process group or a list of process groups.
         """
+        # Local import — see Platform.create_group for the cycle this avoids.
+        from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS  # pylint: disable=C0415
+
         if not isinstance(process_group, list):
             process_group = [process_group]
         for group in process_group:

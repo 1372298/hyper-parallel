@@ -62,7 +62,8 @@ from hyper_parallel.core.fully_shard.hsdp_param import (
     _GROUP_INFO_CACHE,
 )
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, get_torch_platform
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import get_torch_platform
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 
 

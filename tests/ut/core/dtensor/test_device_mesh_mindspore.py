@@ -33,7 +33,7 @@ ensure_mindspore_platform_for_device_mesh()
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh, DeviceMesh, Tensor, _DEVICE_MESH_MAP
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 @pytest.fixture(autouse=True)

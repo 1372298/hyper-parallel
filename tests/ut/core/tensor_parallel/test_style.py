@@ -45,7 +45,8 @@ from hyper_parallel.core.tensor_parallel.style import (
     PrepareModuleInputOutput,
     PrepareModuleOutput,
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import PlatformType
 
 
 class TestTorchTensorHelpers(unittest.TestCase):

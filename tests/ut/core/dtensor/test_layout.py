@@ -26,7 +26,7 @@ import numpy as np
 
 from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial, StridedShard
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 def _setup_mock_platform(platform_mock):

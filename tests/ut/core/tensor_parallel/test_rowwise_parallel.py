@@ -37,7 +37,8 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
 from hyper_parallel.core.tensor_parallel.api import parallelize_module
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle, RowwiseParallel, ColwiseParallel
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import PlatformType
 
 
 def _patch_dist_rank_for_ut(world_size: int = 1):

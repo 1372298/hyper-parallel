@@ -45,7 +45,8 @@ from hyper_parallel.core.context_parallel.dsa_context_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import PlatformType
 
 
 def _patch_torch_dist_rank(world_size=1):

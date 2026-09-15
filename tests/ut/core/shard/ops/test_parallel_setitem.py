@@ -29,7 +29,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP,
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 setitem_op = SetItemDistributedOp("__setitem__")
 getitem_op = GetItemDistributedOp("__getitem__")

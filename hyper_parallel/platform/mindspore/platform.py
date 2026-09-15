@@ -50,10 +50,10 @@ from mindspore.ops.auto_generate.gen_ops_prim import inner_comm_all_to_all_v_op
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 from hyper_parallel.platform.platform import (
     Platform,
     PlatformType,
-    EXISTING_COMM_GROUPS,
 )
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 from hyper_parallel.platform.mindspore.init_weights import (
