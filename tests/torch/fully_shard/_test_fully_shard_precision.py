@@ -23,7 +23,7 @@ import torch
 import torch_npu
 from torch import optim
 from hyper_parallel import DTensor, init_device_mesh, DeviceMesh, SkipDTensorDispatch
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper, CheckpointPolicy, SwapManager
+from hyper_parallel.core.activation_memory import checkpoint_wrapper, swap_wrapper, CheckpointPolicy, SwapManager
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, CPUOffloadPolicy, OffloadPolicy
 from tests.torch.utils import init_dist

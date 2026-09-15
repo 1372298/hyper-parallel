@@ -21,7 +21,7 @@ from enum import IntEnum
 import itertools
 from typing import Any, ContextManager, FrozenSet, Iterable, List
 
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
+from hyper_parallel.core.activation_memory.swap import SwapManager
 
 MIN_SWAP_GAP = 4
 

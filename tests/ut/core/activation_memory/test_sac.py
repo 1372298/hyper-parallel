@@ -22,10 +22,10 @@ import torch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
-from hyper_parallel.core.activation_checkpoint.swap import Storage
-from hyper_parallel.platform.torch.activation_checkpoint import sac
-from hyper_parallel.platform.torch.activation_checkpoint.sac import (
+from hyper_parallel.core.activation_memory import CheckpointPolicy
+from hyper_parallel.core.activation_memory.swap import Storage
+from hyper_parallel.core.activation_memory import sac
+from hyper_parallel.core.activation_memory.sac import (
     SelectiveCheckpointContext,
     _CachedTorchDispatchMode,
     _CachingTorchDispatchMode,

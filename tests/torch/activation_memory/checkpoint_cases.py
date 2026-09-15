@@ -26,7 +26,7 @@ import torch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import (
+from hyper_parallel.core.activation_memory.checkpoint import (
     CheckpointError,
     checkpoint,
     clear_recompute_session,
@@ -34,10 +34,10 @@ from hyper_parallel.platform.torch.activation_checkpoint.checkpoint import (
     recompute_handle_collector_ctx,
     recompute_session_ctx,
 )
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, checkpoint as core_checkpoint
-from tests.torch.activation_checkpoint.utils import set_seed
+from hyper_parallel.core.activation_memory import CheckpointPolicy, checkpoint as core_checkpoint
+from tests.torch.activation_memory.utils import set_seed
 
-checkpoint_module = importlib.import_module("hyper_parallel.platform.torch.activation_checkpoint.checkpoint")
+checkpoint_module = importlib.import_module("hyper_parallel.core.activation_memory.checkpoint")
 
 _NPU_DEVICE = "npu"
 

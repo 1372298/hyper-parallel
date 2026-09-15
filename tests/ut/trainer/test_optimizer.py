@@ -31,7 +31,7 @@ restore_torch_platform_for_ut()
 
 from hyper_parallel.components.optim.builders import AdamW
 from hyper_parallel.components.optim.parameter_groups import get_parameter_names
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
+from hyper_parallel.core.activation_memory import checkpoint_wrapper
 
 
 class _Block(nn.Module):

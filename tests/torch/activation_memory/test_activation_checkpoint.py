@@ -15,8 +15,8 @@
 """test activation checkpoint"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
-from tests.torch.activation_checkpoint import activation_checkpoint as activation_checkpoint_cases
-from tests.torch.activation_checkpoint import checkpoint_cases
+from tests.torch.activation_memory import activation_checkpoint as activation_checkpoint_cases
+from tests.torch.activation_memory import checkpoint_cases
 
 ACTIVATION_CHECKPOINT = "activation_checkpoint.py"
 

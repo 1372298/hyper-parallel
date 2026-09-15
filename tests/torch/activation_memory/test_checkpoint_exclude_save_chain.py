@@ -15,7 +15,7 @@
 """Validate memory optimization for adjacent PyTorch checkpoint SAVE regions."""
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.activation_checkpoint.checkpoint_exclude_matmul import (
+from tests.torch.activation_memory.checkpoint_exclude_matmul import (
     _HIDDEN_SIZE,
     _TOKEN_NUM,
     _run_mode_in_subprocess,
