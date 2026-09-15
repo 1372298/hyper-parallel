@@ -27,7 +27,7 @@ import torch.distributed as dist
 
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo
-from hyper_parallel.platform.torch.fully_shard.param_group import (
+from hyper_parallel.core.fully_shard.param_group import (
     AllGatherMetadata,
     AllGatherResult,
     AllReduceParamGroup,
@@ -305,7 +305,7 @@ class TestAllGatherBuckets(unittest.TestCase):
         self.assertEqual(hsdp_param.sharded_param._local_tensor.shape, torch.Size((2, 2)))
         self.assertEqual(hsdp_param.sharded_param.data.shape, torch.Size((2, 2)))
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_gather_into_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_gather_into_tensor")
     def test_all_gather_result_releases_temporary_references(self, mock_all_gather):
         """Waiting for unshard should release temporary all-gather references."""
         hsdp_param = _fake_param([1.0, 2.0])
@@ -416,8 +416,8 @@ class TestAllGatherBuckets(unittest.TestCase):
 class TestReduceBuckets(unittest.TestCase):
     """Cover mixed dtype RS buckets and delayed all-reduce behavior."""
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.apply_gradient_scaling_factor")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.apply_gradient_scaling_factor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_reduce_scatter_bucket_builder_has_no_execution_side_effects(
         self,
         mock_reduce_scatter,
@@ -440,7 +440,7 @@ class TestReduceBuckets(unittest.TestCase):
         mock_apply_scaling.assert_not_called()
         mock_reduce_scatter.assert_not_called()
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_reduce_scatter_buckets_group_by_process_group_and_dtype(self, mock_reduce_scatter):
         """Reduce-scatter buckets should group by process group and dtype."""
         shard_group_a = _FakeGroup()
@@ -478,7 +478,7 @@ class TestReduceBuckets(unittest.TestCase):
         )
         self.assertIs(param_group.comm_ctx.pre_param_group, param_group)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_requires_all_reduce_accumulates_fresh_reduce_outputs(self, mock_reduce_scatter):
         """Deferred all-reduce should accumulate fresh reduce-scatter outputs."""
         hsdp_param = _fake_param([1.0, 2.0])
@@ -536,7 +536,7 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertIsNone(hsdp_param.all_reduce_comm_ctx.all_reduce_output)
         self.assertEqual(param_group.reduce_partial_outputs, {})
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_gradient_scaling_is_applied_to_packed_reduce_scatter_input(self, mock_reduce_scatter):
         """Gradient scaling should apply to the packed reduce-scatter input."""
         hsdp_param = _fake_param([1.0, 2.0])
@@ -562,8 +562,8 @@ class TestReduceBuckets(unittest.TestCase):
             torch.tensor([2.0, 3.0]),
         )
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_hsdp_all_reduce_saves_per_param_context(
         self,
         mock_reduce_scatter,
@@ -603,8 +603,8 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertIsNone(all_reduce_bucket.all_reduce_output)
         self.assertIsNone(all_reduce_bucket.handle)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_all_reduce_buckets_group_by_process_group_and_dtype(
         self,
         mock_reduce_scatter,
@@ -672,8 +672,8 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertEqual(mock_all_reduce.call_count, 3)
         param_group.wait_all_reduce_and_save_grad()
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_all_reduce_reuses_reduce_scatter_output_when_buckets_align(
         self,
         mock_reduce_scatter,
@@ -716,8 +716,8 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertIsNone(param_a.all_reduce_comm_ctx.all_reduce_output)
         self.assertIsNone(param_b.all_reduce_comm_ctx.all_reduce_output)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_all_reduce_rejects_different_routes_in_one_reduce_scatter_bucket(
         self,
         mock_reduce_scatter,
@@ -763,8 +763,8 @@ class TestReduceBuckets(unittest.TestCase):
         self.assertIsNotNone(param_a.unsharded_param.grad)
         self.assertIsNotNone(param_b.unsharded_param.grad)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_replicate_param_uses_local_reduce_scatter_and_bucketed_all_reduce(
         self,
         mock_reduce_scatter,
@@ -793,8 +793,8 @@ class TestReduceBuckets(unittest.TestCase):
         )
         self.assertIsNone(hsdp_param.reduce_scatter_comm_ctx.reduce_scatter_output)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_replicate_params_share_local_reduce_scatter_and_fused_all_reduce(
         self,
         mock_reduce_scatter,
@@ -830,8 +830,8 @@ class TestReduceBuckets(unittest.TestCase):
         torch.testing.assert_close(param_a.all_reduce_comm_ctx.all_reduce_output, torch.tensor([1.0, 2.0]))
         torch.testing.assert_close(param_b.all_reduce_comm_ctx.all_reduce_output, torch.tensor([3.0, 4.0]))
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_hsdp_and_replicate_params_use_independent_reduce_scatter_buckets(
         self,
         mock_reduce_scatter,
@@ -897,8 +897,8 @@ class TestReduceBuckets(unittest.TestCase):
             torch.tensor([5.0, 6.0]),
         )
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_hsdp_replicate_group_size_one_still_uses_all_reduce_output(
         self,
         mock_reduce_scatter,
@@ -934,8 +934,8 @@ class TestReduceBuckets(unittest.TestCase):
             torch.tensor([4.0, 6.0]),
         )
 
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.all_reduce")
-    @patch("hyper_parallel.platform.torch.fully_shard.param_group.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.all_reduce")
+    @patch("hyper_parallel.core.fully_shard.param_group.dist.reduce_scatter_tensor")
     def test_avg_and_sum_scaling_cover_shard_and_replicate_groups(
         self,
         mock_reduce_scatter,

@@ -25,7 +25,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 from torch import nn
 
-from hyper_parallel.platform.torch.fully_shard import state_dict_utils
+from hyper_parallel.core.fully_shard import state_dict_utils
 
 
 class FakeDTensor:
@@ -56,8 +56,8 @@ class TestTorchStateDictUtils(unittest.TestCase):
     def setUp(self):
         FakeDTensor.from_local_calls.clear()
 
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.dist")
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.dist")
     def test_gather_full_state_dict_every_rank_and_rank0_cpu_offload(self, mock_dist):
         """Full state dict gathering should materialize DTensors and support rank0 offload."""
         mock_dist.is_initialized.return_value = False
@@ -73,8 +73,8 @@ class TestTorchStateDictUtils(unittest.TestCase):
         gathered = state_dict_utils._gather_full_state_dict(state, cpu_offload=True)
         self.assertEqual(gathered["dt"].device.type, "cpu")
 
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.dist")
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.dist")
     def test_gather_full_state_dict_cpu_offload_non_rank0_returns_empty(self, mock_dist):
         """Rank0 CPU offload should return an empty state dict on non-zero ranks."""
         mock_dist.is_initialized.return_value = True
@@ -84,7 +84,7 @@ class TestTorchStateDictUtils(unittest.TestCase):
 
         self.assertEqual(gathered, {})
 
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.DTensor", FakeDTensor)
     def test_offload_sharded_state_dict_moves_plain_and_dtensor_local_shards(self):
         """Sharded state dict offload should move plain and DTensor local shards to CPU."""
         state = {"dt": FakeDTensor(torch.tensor([1.0])), "plain": torch.tensor([2.0])}
@@ -137,8 +137,8 @@ class TestTorchStateDictUtils(unittest.TestCase):
         self.assertIn("weight", result)
         self.assertNotIn("bias", result)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._gather_full_state_dict")
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._offload_sharded_state_dict")
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils._gather_full_state_dict")
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils._offload_sharded_state_dict")
     def test_get_model_state_dict_dispatches_by_options(self, mock_offload, mock_gather):
         """Model state dict retrieval should dispatch to full or sharded offload helpers."""
         model = MagicMock()
@@ -169,8 +169,8 @@ class TestTorchStateDictUtils(unittest.TestCase):
         self.assertEqual(full, mock_gather.return_value)
         self.assertEqual(offloaded, mock_offload.return_value)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.distribute_tensor")
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.distribute_tensor")
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.DTensor", FakeDTensor)
     def test_scatter_model_state_dict_distributes_plain_tensor_to_dtensor_shard(self, mock_distribute):
         """Scatter should slice plain tensors into DTensor shards and pass DTensors through."""
         target_dt = FakeDTensor(torch.tensor([1.0]))
@@ -196,8 +196,8 @@ class TestTorchStateDictUtils(unittest.TestCase):
         # missing key (target is None): skipped.
         self.assertNotIn("missing", result)
 
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.distribute_tensor")
-    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.distribute_tensor")
+    @patch("hyper_parallel.core.fully_shard.state_dict_utils.DTensor", FakeDTensor)
     def test_scatter_model_state_dict_strict_raises_on_unexpected_keys(self, mock_distribute):
         """Scatter with strict=True must raise on keys absent from the model."""
         target_dt = FakeDTensor(torch.tensor([1.0]))
@@ -266,8 +266,8 @@ class TestTorchStateDictUtils(unittest.TestCase):
         model = MagicMock()
         model.state_dict.return_value = {"w": target_dt}
 
-        with patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", _BaseDTensor), \
-             patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.distribute_tensor",
+        with patch("hyper_parallel.core.fully_shard.state_dict_utils.DTensor", _BaseDTensor), \
+             patch("hyper_parallel.core.fully_shard.state_dict_utils.distribute_tensor",
                    return_value=_ScatterDTensor(torch.tensor([1.0]))):
             state_dict_utils._scatter_model_state_dict(
                 model, {"w": torch.tensor([1.0])}, cpu_offload=True, strict=False,
@@ -306,7 +306,7 @@ class TestTorchStateDictUtils(unittest.TestCase):
             )
 
         # full_state_dict=True -> scatter path
-        with patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._scatter_model_state_dict",
+        with patch("hyper_parallel.core.fully_shard.state_dict_utils._scatter_model_state_dict",
                    return_value={"w": torch.tensor([1.0])}) as mock_scatter:
             state_dict_utils.set_model_state_dict(
                 model, {"w": torch.tensor([1.0])},
@@ -324,7 +324,7 @@ class TestTorchStateDictUtils(unittest.TestCase):
 
         # full_state_dict=False -> passthrough (no scatter)
         model.reset_mock()
-        with (patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._scatter_model_state_dict")
+        with (patch("hyper_parallel.core.fully_shard.state_dict_utils._scatter_model_state_dict")
               as mock_scatter):
             state_dict_utils.set_model_state_dict(
                 model, {"w": torch.tensor([1.0])},

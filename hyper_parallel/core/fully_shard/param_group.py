@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -50,7 +50,7 @@ import torch.distributed as dist
 from hyper_parallel.core.fully_shard.hsdp_utils import apply_gradient_scaling_factor
 from hyper_parallel.core.fully_shard.hsdp_scheduler import ParamGroupCommCtx
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
-from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
+from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 
 
 @dataclass
@@ -77,7 +77,7 @@ class AllGatherResult:
 class AllGatherBucket:
     """Own parameters and buffers sharing one all-gather group and dtype."""
 
-    hsdp_params: list[TorchHSDPParamV2]
+    hsdp_params: list[HSDPParamV2]
     shard_group: dist.ProcessGroup
     shard_rank: int
     shard_world_size: int
@@ -246,7 +246,7 @@ class AllGatherBucket:
 class GradientBucketLayout:
     """Describe the shared per-parameter layout of an RS-to-AR bucket chain."""
 
-    hsdp_params: list[TorchHSDPParamV2]
+    hsdp_params: list[HSDPParamV2]
     param_offsets: list[int]
     param_numels: list[int]
     total_numel: int
@@ -276,7 +276,7 @@ class ReduceScatterBucket:
     handle: Optional[dist.Work] = None
 
     @property
-    def hsdp_params(self) -> list[TorchHSDPParamV2]:
+    def hsdp_params(self) -> list[HSDPParamV2]:
         """Return parameters in their fused-buffer order."""
         return self.layout.hsdp_params
 
@@ -324,7 +324,7 @@ class AllReduceBucket:
     handle: Optional[dist.Work] = None
 
     @property
-    def hsdp_params(self) -> list[TorchHSDPParamV2]:
+    def hsdp_params(self) -> list[HSDPParamV2]:
         """Return parameters in their fused-buffer order."""
         return self.layout.hsdp_params
 
@@ -344,7 +344,7 @@ class AllReduceBucket:
         return self.replicate_world_size > 1
 
 
-def get_all_gather_metadata(hsdp_params: list[TorchHSDPParamV2]) -> AllGatherMetadata:
+def get_all_gather_metadata(hsdp_params: list[HSDPParamV2]) -> AllGatherMetadata:
     """Build metadata for parameters with one all-gather communication dtype."""
     param_input_dtypes = []
     param_input_numels = []
@@ -395,7 +395,7 @@ def all_gather_copy_in(
 
 
 def reduce_scatter_copy_in(
-    hsdp_params: list[TorchHSDPParamV2],
+    hsdp_params: list[HSDPParamV2],
     unsharded_grads: list[torch.Tensor],
     reduce_scatter_input: torch.Tensor,
     world_size: int,
@@ -469,7 +469,7 @@ class HSDPParamGroup:
 
     def __init__(
         self,
-        hsdp_params: list[TorchHSDPParamV2],
+        hsdp_params: list[HSDPParamV2],
         device: Optional[torch.device] = None,
         enable_zero_copy: bool = True,
         comm_ctx: Optional[ParamGroupCommCtx] = None,
@@ -967,7 +967,7 @@ class AllReduceParamGroup:
     def __init__(
         self,
         replicate_group: dist.ProcessGroup,
-        hsdp_params: List[TorchHSDPParamV2],
+        hsdp_params: List[HSDPParamV2],
         reduce_op: dist.ReduceOp,
     ) -> None:
         self.replicate_group = replicate_group

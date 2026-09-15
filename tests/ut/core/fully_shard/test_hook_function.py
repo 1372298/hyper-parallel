@@ -24,7 +24,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 # pylint: disable=wrong-import-position
 import torch
 
-from hyper_parallel.platform.torch.fully_shard.hook_function import PostBackwardFunction
+from hyper_parallel.core.fully_shard.hook_function import PostBackwardFunction
 
 
 class TestPostBackwardFunction(unittest.TestCase):

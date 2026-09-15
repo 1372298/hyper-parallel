@@ -14,7 +14,7 @@
 # ============================================================================
 """Unit tests for fully_shard state helpers (no NPU required).
 
-Covers _to_dtype_if_needed from hyper_parallel.platform.torch.fully_shard.state:
+Covers _to_dtype_if_needed from hyper_parallel.core.fully_shard.hsdp_state:
 dtype no-op vs cast, and invalid input handling. All tests run on CPU.
 """
 import os
@@ -28,15 +28,13 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 # pylint: disable=C0413
 import torch
 
-from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, DDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.core.fully_shard.api import HSDPModule, _extend_module_with_hsdp_interface
-from hyper_parallel.platform.torch.fully_shard import state as state_mod
-from hyper_parallel.platform.torch.fully_shard.param_group import AllReduceParamGroup
-from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
-from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2, _to_dtype_if_needed
+from hyper_parallel.core.fully_shard import hsdp_state as state_mod
+from hyper_parallel.core.fully_shard.param_group import AllReduceParamGroup
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPStateV2, _to_dtype_if_needed
 
 
 class _FakeGroup:
@@ -148,8 +146,8 @@ class _FakeHSDPParam:
 
 
 def _new_state(hsdp_params=None, replicate_params=None, *, comm_fusion=False, offload_policy=None):
-    """Create an uninitialized TorchHSDPStateV2 with direct state fields set."""
-    state = object.__new__(TorchHSDPStateV2)
+    """Create an uninitialized HSDPStateV2 with direct state fields set."""
+    state = object.__new__(HSDPStateV2)
     state.modules = ()
     state.hsdp_params = list(hsdp_params or [])
     state.replicate_params = list(replicate_params or [])
@@ -176,7 +174,7 @@ def _new_state(hsdp_params=None, replicate_params=None, *, comm_fusion=False, of
 
 def _new_root_scheduler(state):
     """Create a root scheduler double that finalizes one state."""
-    scheduler = object.__new__(TorchHSDPSchedulerV2)
+    scheduler = object.__new__(HSDPSchedulerV2)
     scheduler.hsdp_state = state
     scheduler.scheduler_ctx = state.scheduler_ctx
     scheduler.scheduler_ctx.all_hsdp_schedulers = [scheduler]
@@ -246,7 +244,7 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
 
     def test_prefetch_unshards_all_managed_params(self):
         """Prefetch should launch unshard for every parameter in hsdp_params."""
-        state = object.__new__(HSDPState)
+        state = object.__new__(HSDPStateV2)
         state.is_shard = True
         state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=False)
         state.param_group = None
@@ -259,7 +257,7 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
 
     def test_reshard_and_unshard_use_one_state_for_all_managed_params(self):
         """All managed parameters should transition through the same state."""
-        state = object.__new__(HSDPState)
+        state = object.__new__(HSDPStateV2)
         state.is_shard = False
         state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=False)
         state.param_group = None
@@ -276,7 +274,7 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
 
     def test_comm_fusion_without_param_group_falls_back_to_per_param_path(self):
         """States without a fused group should not dereference param_group under comm_fusion."""
-        state = object.__new__(HSDPState)
+        state = object.__new__(HSDPStateV2)
         state.is_shard = True
         state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=True)
         state.param_group = None
@@ -290,7 +288,7 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
 
     def test_comm_fusion_transitions_all_params_through_param_group(self):
         """The parameter group owns sharded and replicate-only parameter transitions."""
-        state = object.__new__(HSDPState)
+        state = object.__new__(HSDPStateV2)
         state.is_shard = True
         state.comm_fusion_policy = SimpleNamespace(enable_comm_fusion=True)
         state.param_group = MagicMock()
@@ -310,7 +308,7 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
 
     def test_comm_fusion_scaling_is_owned_by_param_group(self):
         """The parameter group applies scaling for every parameter it owns."""
-        state = object.__new__(HSDPState)
+        state = object.__new__(HSDPStateV2)
         state.param_group = SimpleNamespace(gradient_scaling_factor=None)
         replicate_param = SimpleNamespace(gradient_scaling_factor=None)
         state.hsdp_params = [replicate_param]
@@ -321,20 +319,20 @@ class TestUnifiedParamTransitionState(unittest.TestCase):
         self.assertIsNone(replicate_param.gradient_scaling_factor)
 
 
-class TestTorchHSDPStateV2(unittest.TestCase):
-    """Unit tests for TorchHSDPStateV2 branch helpers."""
+class TestHSDPStateV2(unittest.TestCase):
+    """Unit tests for HSDPStateV2 branch helpers."""
 
     def test_init_param_group_skips_when_disabled_and_constructs_when_enabled(self):
         """Param-group init should include sharded and replicate-only parameters."""
         disabled = _new_state([_FakeHSDPParam()], comm_fusion=False)
-        TorchHSDPStateV2._init_param_group(disabled)
+        HSDPStateV2._init_param_group(disabled)
         self.assertIsNone(disabled.param_group)
 
         sharded = _FakeHSDPParam()
         replicated = _FakeHSDPParam(shard_size=1)
         supported = _new_state([sharded, replicated], comm_fusion=True)
         with patch.object(state_mod, "HSDPParamGroup", return_value="group") as param_group:
-            TorchHSDPStateV2._init_param_group(supported)
+            HSDPStateV2._init_param_group(supported)
 
         param_group.assert_called_once()
         self.assertEqual(param_group.call_args.args[0], [sharded, replicated])
@@ -356,7 +354,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         second = _FakeHSDPParam()
         state = _new_state([first, second])
 
-        TorchHSDPStateV2._init_mp_dtypes(state)
+        HSDPStateV2._init_mp_dtypes(state)
 
         first.init_dtype_attrs.assert_called_once_with(None)
         second.init_dtype_attrs.assert_called_once_with(None)
@@ -365,23 +363,23 @@ class TestTorchHSDPStateV2(unittest.TestCase):
 
         second.orig_dtype = torch.float16
         second.reduce_dtype = torch.float16
-        TorchHSDPStateV2._init_mp_dtypes(state)
+        HSDPStateV2._init_mp_dtypes(state)
 
     def test_validation_helpers_cover_meta_and_cpu_offload(self):
         """Validation helpers should reject meta params and invalid CPU offload params."""
         meta_param = _FakeHSDPParam(device=torch.device("meta"))
         state = _new_state([meta_param])
         with self.assertRaisesRegex(RuntimeError, "meta device"):
-            TorchHSDPStateV2._validate_no_meta_params(state)
+            HSDPStateV2._validate_no_meta_params(state)
 
         cpu_offload_state = _new_state([_FakeHSDPParam()], offload_policy=CPUOffloadPolicy())
-        TorchHSDPStateV2._validate_cpu_offload_params(cpu_offload_state)
+        HSDPStateV2._validate_cpu_offload_params(cpu_offload_state)
 
         non_cpu_param = _FakeHSDPParam()
         non_cpu_param.sharded_param.device = torch.device("meta")
         non_cpu_state = _new_state([non_cpu_param], offload_policy=CPUOffloadPolicy())
         with self.assertRaisesRegex(RuntimeError, "CPU offloading"):
-            TorchHSDPStateV2._validate_cpu_offload_params(non_cpu_state)
+            HSDPStateV2._validate_cpu_offload_params(non_cpu_state)
 
     def test_lazy_init_resets_sharded_params_once_and_initializes_dtypes(self):
         """Lazy init should reset sharded params once and initialize dtype state."""
@@ -389,8 +387,8 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         state = _new_state([param])
         state.is_shard = True
 
-        TorchHSDPStateV2.lazy_init(state)
-        TorchHSDPStateV2.lazy_init(state)
+        HSDPStateV2.lazy_init(state)
+        HSDPStateV2.lazy_init(state)
 
         param.reset_sharded_param.assert_called_once()
         self.assertTrue(state._reset_sharded_params)
@@ -500,7 +498,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         state.reduce_grads = False
         state.shard = MagicMock()
 
-        TorchHSDPStateV2.post_backward(state)
+        HSDPStateV2.post_backward(state)
 
         param.accumulate_unsharded_grad_if_needed.assert_called_once()
         param.to_accumulated_grad_if_needed.assert_called_once()
@@ -513,7 +511,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         state = _new_state([sharded, replicated])
         state.shard = MagicMock()
 
-        TorchHSDPStateV2.post_backward(state)
+        HSDPStateV2.post_backward(state)
 
         sharded.reduce_scatter_grad.assert_called_once()
         replicated.reduce_scatter_grad.assert_called_once()
@@ -534,7 +532,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         )
         state.scheduler_ctx.param_group_comm_ctx = comm_ctx
 
-        TorchHSDPStateV2.post_backward_for_comm_fusion(state)
+        HSDPStateV2.post_backward_for_comm_fusion(state)
 
         previous_all_reduce.wait_all_reduce_and_save_grad.assert_called_once()
         previous_reduce_scatter.wait_reduce_scatter_and_issue_all_reduce.assert_called_once()
@@ -724,7 +722,7 @@ class TestTorchHSDPStateV2(unittest.TestCase):
 
     def test_scheduler_reset_clears_pipeline_and_recompute_state(self):
         """Scheduler reset should clear hooks and restore prefetch configuration."""
-        scheduler = object.__new__(TorchHSDPSchedulerV2)
+        scheduler = object.__new__(HSDPSchedulerV2)
         scheduler.scheduler_state = object()
         scheduler._fsdp_group_post_pending = {object()}
         scheduler._backup_forward_fetch = ["prefetch"]
@@ -775,13 +773,13 @@ class TestTorchHSDPStateV2(unittest.TestCase):
         """Reduce-op setter should accept known reductions and reject unknown names."""
         state = _new_state()
 
-        TorchHSDPStateV2.set_requires_grad_sync(state, False)
+        HSDPStateV2.set_requires_grad_sync(state, False)
         self.assertFalse(state.reduce_grads)
-        TorchHSDPStateV2.set_reduce_op_type(state, "sum")
+        HSDPStateV2.set_reduce_op_type(state, "sum")
         self.assertEqual(state.reduce_op_type, torch.distributed.ReduceOp.SUM)
 
         with self.assertRaises(ValueError):
-            TorchHSDPStateV2.set_reduce_op_type(state, "mean")
+            HSDPStateV2.set_reduce_op_type(state, "mean")
 
 
 if __name__ == "__main__":
