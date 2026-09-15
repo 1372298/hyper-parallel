@@ -34,7 +34,7 @@ from hyper_parallel.core.fully_shard.hsdp_param import (
 )
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 class TestHSDPParamCoreHelpers(unittest.TestCase):

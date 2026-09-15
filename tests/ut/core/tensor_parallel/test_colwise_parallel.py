@@ -35,7 +35,8 @@ from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_ME
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.style import ColwiseParallel, ParallelStyle
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import PlatformType
 
 
 class TestColwiseParallelInit(unittest.TestCase):

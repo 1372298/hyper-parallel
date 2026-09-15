@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple, Union
 
 import torch.distributed as dist
 
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 def _validate_intra_step(normalized_template: List[int], template_len: int) -> int:

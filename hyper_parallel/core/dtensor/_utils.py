@@ -30,7 +30,7 @@ from torch.distributed.distributed_c10d import _get_default_group
 
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_func
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 
 
 # ---------------------------------------------------------------------------

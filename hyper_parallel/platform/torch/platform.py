@@ -34,11 +34,11 @@ from torch.utils.checkpoint import noop_context_fn
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from hyper_parallel.core.dtensor.dtensor_base import DTensorBase
+from hyper_parallel.core.utils.communication import EXISTING_COMM_GROUPS
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import (
     Platform,
     PlatformType,
-    EXISTING_COMM_GROUPS,
 )
 from hyper_parallel.platform.torch.function_override import override_functions
 from hyper_parallel.platform.torch.init_weights import init_on_device as _init_on_device
