@@ -2,23 +2,25 @@
 
 ## Goal
 
-Add unit tests (UT) and system/distributed tests (ST) covering the platform changes for both backends.
+Add unit tests (UT) and system/distributed tests (ST) covering the platform changes.
 
 ## Steps
 
 ### 5.1 Unit Tests (UT)
 
 **Location:**
-- PyTorch (unit): `tests/ut/` (e.g. `tests/ut/core/`, `tests/ut/platform/torch/`)
-- MindSpore: `tests/mindspore/ut/`
+
+- `tests/ut/` (e.g. `tests/ut/core/`, `tests/ut/platform/torch/`)
 
 **Conventions:**
+
 - Use pytest with `@arg_mark` markers from `tests/common/mark_utils.py`
 - No distributed setup needed for UT
 - Test both normal and edge cases
 - Use platform abstraction in tests where possible
 
 **Template:**
+
 ```python
 # Copyright 2024 Huawei Technologies Co., Ltd
 # (Apache 2.0 license header)
@@ -43,15 +45,16 @@ def test_new_feature_edge_case():
 ### 5.2 Distributed Tests (ST)
 
 **Location:**
-- PyTorch: `tests/torch/st/`
-- MindSpore: `tests/mindspore/st/`
+
+- `tests/torch/` launchers (e.g. `tests/torch/fully_shard/`)
 
 **Conventions:**
+
 - Use `torchrun_case()` for PyTorch distributed tests (8-card)
-- Use `msrun_case()` for MindSpore distributed tests (8-card)
 - Compare distributed output with single-card reference
 
 **Template (PyTorch):**
+
 ```python
 from tests.common.mark_utils import arg_mark
 from tests.common.torch_utils import torchrun_case
@@ -92,12 +95,11 @@ def _test_feature_impl():
 
 # Or manually
 pytest tests/ut/path/to/test.py -v
-pytest tests/mindspore/ut/path/to/test.py -v
 ```
 
 ## Output
 
-- Test files in `tests/torch/` and/or `tests/mindspore/`
+- Test files in `tests/ut/` and/or `tests/torch/`
 - All tests passing
 
 ## Next Step

@@ -19,8 +19,7 @@
 | Init weights (torch) | `hyper_parallel/platform/torch/init_weights.py` | init_on_device context |
 | Init weights (ms) | `hyper_parallel/platform/mindspore/init_weights.py` | init_on_device context |
 | Parameter init (ms) | `hyper_parallel/platform/mindspore/parameter_init.py` | Slice-based param init |
-| Tests (torch) | `tests/torch/` | `ut/` (unit), `st/` (distributed) |
-| Tests (mindspore) | `tests/mindspore/` | `ut/` (unit), `st/` (distributed) |
+| Tests | `tests/ut/` (unit), `tests/torch/` (distributed ST) | UT needs no distributed setup; ST launchers spawn `torchrun` |
 
 ---
 

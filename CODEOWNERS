@@ -45,13 +45,8 @@
 
 # The maintainers of tests.
 /tests/ @liuchongming74
-/tests/mindspore/ @yangzhenzhang
-/tests/mindspore/st/shard/ @yangzhenzhang
-/tests/mindspore/st/distributed_checkpoint/ @zhangbuxue
-/tests/mindspore/st/fully_shard/ @DavidFFFan
 /tests/ut/core/distributed_checkpoint/ @zhangbuxue
 /tests/ut/platform/mindspore/ @yangzhenzhang
-/tests/ut/platform/mindspore/fully_shard/ @DavidFFFan
 /tests/ut/core/context_parallel/ @yangzhenzhang
 /tests/ut/compile/ @kisnwang @zhenyu10
 

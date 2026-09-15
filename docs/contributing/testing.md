@@ -9,8 +9,7 @@
 | 目录 | 说明 | 是否需要分布式环境 |
 |------|------|-------------------|
 | `tests/ut/` | 单元测试 | 不需要 |
-| `tests/st/torch/` | PyTorch 分布式系统测试 | 需要（torchrun） |
-| `tests/st/mindspore/` | MindSpore 分布式系统测试 | 需要（msrun，8卡） |
+| `tests/torch/` | PyTorch 分布式系统测试 | 需要（torchrun） |
 
 ## 运行测试
 
@@ -23,13 +22,7 @@ pytest tests/ut/
 ### PyTorch 分布式测试
 
 ```bash
-torchrun --nproc_per_node=8 -m pytest tests/st/torch/
-```
-
-### MindSpore 分布式测试
-
-```bash
-msrun_case()  # 项目封装的 msrun 启动函数，默认 8 卡
+torchrun --nproc_per_node=8 -m pytest tests/torch/
 ```
 
 ### 按模块运行
@@ -41,7 +34,6 @@ pytest tests/ut/core/shard/
 # 仅运行 activation_checkpoint UT
 pytest tests/ut/core/activation_checkpoint/
 pytest tests/ut/platform/torch/activation_checkpoint/
-pytest tests/ut/platform/mindspore/activation_checkpoint/
 ```
 
 ## 测试标记

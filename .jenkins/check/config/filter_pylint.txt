@@ -58,8 +58,6 @@
 "hyper-parallel/tests/torch/fully_shard/"                             "unused-variable"
 "hyper-parallel/tests/torch/fully_shard/"                             "ungrouped-imports"
 
-"hyper-parallel/tests/mindspore/st/fully_shard/"                      "wrong-import-position"
-
 # 4. Tests UT: tests/ut/
 "hyper-parallel/tests/ut/"                                              "protected-access"
 "hyper-parallel/tests/ut/"                                              "import-outside-toplevel"
@@ -71,9 +69,6 @@
 "hyper-parallel/tests/ut/"                                              "ungrouped-imports"
 "hyper-parallel/tests/ut/"                                              "line-too-long"
 "hyper-parallel/tests/ut/"                                              "trailing-whitespace"
-
-# 4b. Tests MindSpore UT: tests/mindspore/ut/
-"hyper-parallel/tests/mindspore/ut/"                                    "wrong-import-position"
 
 # 5. Tests Base HSDP: tests/torch/hsdp/
 "hyper-parallel/tests/torch/hsdp/"                                      "missing-final-newline"

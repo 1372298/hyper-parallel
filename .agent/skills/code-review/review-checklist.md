@@ -176,7 +176,8 @@ When a change introduces new API patterns, evaluate broader implications:
 ### Test Existence
 
 - [ ] **Tests exist** — New functionality has corresponding tests
-- [ ] **Right test location** — `tests/ut/core/`, `tests/ut/platform/torch/` for PyTorch-focused UTs; MindSpore under `tests/ut/platform/mindspore/` or `*_mindspore.py`
+- [ ] **Right test location** — UT under `tests/ut/` (PyTorch-focused code in `tests/ut/core/` or `tests/ut/platform/torch/`); distributed ST under `tests/torch/`
+- [ ] **MindSpore-specific UT named** — MindSpore-only cases live in `tests/ut/platform/mindspore/` or a `*_mindspore.py` module
 
 ### Style / Comments (from `code-style.md`)
 

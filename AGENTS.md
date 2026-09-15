@@ -62,7 +62,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
 | **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |
 | **Collectives** | `collectives/cc.py` | Process groups |
-| **Tests** | `tests/ut/`, `tests/torch/`, `tests/mindspore/` | UT + distributed ST |
+| **Tests** | `tests/ut/`, `tests/torch/` | UT + distributed ST |
 
 ---
 
