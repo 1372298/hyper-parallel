@@ -904,7 +904,7 @@ class TorchPlatform(Platform):
         gathering, CPU offloading and frozen-parameter filtering.
         """
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+        from hyper_parallel.core.fully_shard.state_dict_utils import (
             get_model_state_dict as _get_model_state_dict,
         )
         return _get_model_state_dict(model, options=options)
@@ -917,7 +917,7 @@ class TorchPlatform(Platform):
         into DTensor shards and performs an in-place load.
         """
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+        from hyper_parallel.core.fully_shard.state_dict_utils import (
             set_model_state_dict as _set_model_state_dict,
         )
         return _set_model_state_dict(model, model_state_dict, options=options)
@@ -925,7 +925,7 @@ class TorchPlatform(Platform):
     @staticmethod
     def get_optim_state_dict(model, optimizer, *, options=None):
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+        from hyper_parallel.core.fully_shard.state_dict_utils import (
             get_optim_state_dict as _get_optim_state_dict,
         )
         return _get_optim_state_dict(model, optimizer, options=options)
@@ -933,7 +933,7 @@ class TorchPlatform(Platform):
     @staticmethod
     def set_optim_state_dict(model, optimizer, optim_state_dict, *, options=None):
         # pylint: disable=C0415
-        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+        from hyper_parallel.core.fully_shard.state_dict_utils import (
             set_optim_state_dict as _set_optim_state_dict,
         )
         _set_optim_state_dict(model, optimizer, optim_state_dict, options=options)

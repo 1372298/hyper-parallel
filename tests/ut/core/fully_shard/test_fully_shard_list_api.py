@@ -45,7 +45,6 @@ from hyper_parallel.core.fully_shard.api import (
 )
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, SourceShardMetaInfo
 from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.platform.platform import PlatformType
 
 
 def _default_mp_policy():
@@ -173,7 +172,7 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         # Arrange
         mod = SimpleLinear(4, 4)
         # Act & Assert (no raise)
-        _validate_module_for_fully_shard(mod, PlatformType.PYTORCH)
+        _validate_module_for_fully_shard(mod)
 
     def test_list_of_modules_valid(self):
         """List of nn.Module passes validation (Torch platform).
@@ -185,7 +184,7 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         # Arrange
         mods = [SimpleLinear(4, 4), SimpleLinear(4, 4)]
         # Act & Assert (no raise)
-        _validate_module_for_fully_shard(mods, PlatformType.PYTORCH)
+        _validate_module_for_fully_shard(mods)
 
     def test_empty_list_raises(self):
         """Empty list raises ValueError.
@@ -196,7 +195,7 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         """
         # Act & Assert
         with self.assertRaises(ValueError) as ctx:
-            _validate_module_for_fully_shard([], PlatformType.PYTORCH)
+            _validate_module_for_fully_shard([])
         self.assertIn("empty list", str(ctx.exception))
 
     def test_list_with_non_module_raises(self):
@@ -210,7 +209,7 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         mod = SimpleLinear(4, 4)
         # Act & Assert
         with self.assertRaises(ValueError) as ctx:
-            _validate_module_for_fully_shard([mod, 1], PlatformType.PYTORCH)
+            _validate_module_for_fully_shard([mod, 1])
         self.assertIn("index 1", str(ctx.exception))
 
     def test_non_module_raises(self):
@@ -222,7 +221,7 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         """
         # Act & Assert
         with self.assertRaises(ValueError) as ctx:
-            _validate_module_for_fully_shard("not a module", PlatformType.PYTORCH)
+            _validate_module_for_fully_shard("not a module")
         self.assertIn("nn.Module", str(ctx.exception))
 
 
@@ -293,41 +292,41 @@ class TestCoreApiHelpersTorch(unittest.TestCase):
             bucket_size=0,
         )
 
-        _check_hsdp_input_valid(PlatformType.PYTORCH, module, valid_args)
+        _check_hsdp_input_valid(module, valid_args)
         for key, value in [("reduce_dtype", "float32"), ("comm_async", 0), ("comm_fusion", 0), ("bucket_size", -2)]:
             bad_args = valid_args._replace(**{key: value})
             with self.subTest(key=key), self.assertRaises(ValueError):
-                _check_hsdp_input_valid(PlatformType.PYTORCH, module, bad_args)
+                _check_hsdp_input_valid(module, bad_args)
 
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_get_device_from_mesh_uses_torch_device_handle(self, mock_platform):
+    @patch("hyper_parallel.core.fully_shard.api.get_device_handle")
+    def test_get_device_from_mesh_uses_torch_device_handle(self, mock_get_device_handle):
         """Torch mesh devices should resolve through the backend device handle."""
         device_handle = MagicMock()
         device_handle.is_available.return_value = True
         device_handle.current_device.return_value = "cpu"
-        mock_platform.platform_type = PlatformType.PYTORCH
-        mock_platform.get_device_handle.return_value = device_handle
+        mock_get_device_handle.return_value = device_handle
 
         self.assertEqual(_get_device_from_mesh(SimpleNamespace(device_type="npu")), torch.device("cpu"))
-        mock_platform.get_device_handle.assert_called_once_with("npu")
+        mock_get_device_handle.assert_called_once_with("npu")
 
-        mock_platform.get_device_handle.return_value = None
+        mock_get_device_handle.return_value = None
         with self.assertRaisesRegex(ValueError, "can't find device_handle"):
             _get_device_from_mesh(SimpleNamespace(device_type="cuda"))
 
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_state_dict_and_stream_helpers_delegate_to_platform(self, mock_platform):
-        """Public helpers should preserve the platform abstraction boundary."""
+    @patch("hyper_parallel.core.fully_shard.api.get_model_state_dict_impl")
+    @patch("hyper_parallel.core.fully_shard.api.wait_grad_handle")
+    def test_state_dict_and_stream_helpers_delegate_to_impl(self, mock_wait_grad_handle, mock_get_model_state_dict):
+        """Public helpers should delegate to the torch implementation and grad-handle wait."""
         model = SimpleNamespace()
         options = SimpleNamespace(kind="full")
         state_dict = {"weight": torch.ones(1)}
-        mock_platform.get_model_state_dict.return_value = state_dict
+        mock_get_model_state_dict.return_value = state_dict
 
         self.assertIs(get_model_state_dict(model, options=options), state_dict)
-        mock_platform.get_model_state_dict.assert_called_once_with(model, options=options)
+        mock_get_model_state_dict.assert_called_once_with(model, options=options)
 
         hsdp_sync_stream()
-        mock_platform.wait_grad_handle.assert_called_once_with()
+        mock_wait_grad_handle.assert_called_once_with()
 
 class TestFullyShardListAPI(unittest.TestCase):
     """Unit tests for fully_shard list support (mocked to avoid NPU/dist)."""
@@ -373,10 +372,8 @@ class TestFullyShardListAPI(unittest.TestCase):
             _validate_managed_params_source_shard_infos({parameter}, metadata)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_source_shard_infos_is_forwarded_by_fully_shard(self, mock_platform, mock_get_device):
+    def test_source_shard_infos_is_forwarded_by_fully_shard(self, mock_get_device):
         """The validated parameter-identity map reaches the scheduler initialization."""
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_get_device.return_value = self.device
         mesh = self._create_mock_mesh()
         module = SimpleLinear(2, 2)
@@ -392,10 +389,8 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIs(mock_hsdp_init.call_args.kwargs["source_shard_infos"], source_shard_infos)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_source_shard_infos_none_is_forwarded_as_none(self, mock_platform, mock_get_device):
+    def test_source_shard_infos_none_is_forwarded_as_none(self, mock_get_device):
         """A missing TP metadata map should remain None through fully_shard initialization."""
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_get_device.return_value = self.device
         module = SimpleLinear(2, 2)
         mesh = self._create_mock_mesh()
@@ -406,8 +401,7 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIsNone(mock_hsdp_init.call_args.kwargs["source_shard_infos"])
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_single_module_returns_module(self, mock_platform, mock_get_device):
+    def test_fully_shard_single_module_returns_module(self, mock_get_device):
         """fully_shard with single module returns the same module (in-place).
 
         description: fully_shard(mod, mesh=..., ) with hsdp_init mocked; check return.
@@ -415,7 +409,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         feature: fully_shard single-module return contract.
         """
         # Arrange
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_get_device.return_value = self.device
         mesh = self._create_mock_mesh()
         mod = SimpleLinear(4, 4)
@@ -435,8 +428,7 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIsInstance(result, nn.Module)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_list_returns_list(self, mock_platform, mock_get_device):
+    def test_fully_shard_list_returns_list(self, mock_get_device):
         """fully_shard with list returns the same list (in-place).
 
         description: Call fully_shard on a list of modules; result is the same list object.
@@ -444,7 +436,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         feature: fully_shard list API return value contract.
         """
         # Arrange
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_get_device.return_value = self.device
         mesh = self._create_mock_mesh()
         linear1 = SimpleLinear(4, 4)
@@ -470,8 +461,7 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_list_root_filtering(self, mock_platform, mock_get_device):
+    def test_fully_shard_list_root_filtering(self, mock_get_device):
         """fully_shard with parent+child list filters to root only.
 
         description: fully_shard([parent, child]); only parent is root, result still same list.
@@ -479,7 +469,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         feature: fully_shard list API root filtering.
         """
         # Arrange
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_get_device.return_value = self.device
         mesh = self._create_mock_mesh()
         parent = ParentModule()
@@ -500,8 +489,7 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIs(result, modules_list)
         self.assertEqual(len(result), 2)
 
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_empty_list_raises(self, mock_platform):
+    def test_fully_shard_empty_list_raises(self):
         """fully_shard with empty list raises ValueError.
 
         description: fully_shard([], mesh=...) before device/mesh use.
@@ -509,7 +497,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         feature: fully_shard list API empty list validation.
         """
         # Arrange (validation runs before _get_device_from_mesh)
-        mock_platform.platform_type = PlatformType.PYTORCH
         mesh = self._create_mock_mesh()
         # Act & Assert
         with self.assertRaises(ValueError) as ctx:
@@ -522,9 +509,8 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIn("empty list", str(ctx.exception))
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_list_second_root_has_scheduler_and_unshard_prefetch_ok(
-        self, mock_platform, mock_get_device
+        self, mock_get_device
     ):
         """fully_shard([m1, m2]) backfills hsdp_scheduler to m2; m2.unshard() and prefetch work.
 
@@ -532,7 +518,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         expectation: result is modules_list, linear2.hsdp_scheduler is linear1.hsdp_scheduler; no error.
         feature: fully_shard list API scheduler backfill and non-first root usage.
         """
-        mock_platform.platform_type = PlatformType.PYTORCH
         mock_get_device.return_value = self.device
         mesh = self._create_mock_mesh()
         linear1 = SimpleLinear(4, 4)
