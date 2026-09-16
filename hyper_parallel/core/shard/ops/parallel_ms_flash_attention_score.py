@@ -58,6 +58,7 @@ INPUT_LAYOUT_INT_TO_STR = {
     4: "TND",
 }
 
+
 def _resolve_input_layout(input_layout) -> str:
     """Resolve input_layout from either string or integer enum to string."""
     if isinstance(input_layout, str):
