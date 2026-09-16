@@ -54,6 +54,8 @@ FSDP) would instead hand ``FSDPPass`` two subgraphs and a loss-less output
 list, breaking its grad-index contract.
 """
 
+__all__ = ["PpPass", "_auto_stage_split"]
+
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
@@ -220,6 +222,18 @@ class _StageSplit:
     stage_state_fqns: List[str]
 
 
+@dataclass
+class _GraphClassification:
+    """Per-node stage/phase classification produced by ``_classify_graph``."""
+
+    stage_state_indices: List[int]
+    node_stage: Dict[fx.Node, int]
+    node_phase: Dict[fx.Node, str]
+    input_ph: fx.Node
+    label_ph: fx.Node
+    state_phs: List[fx.Node]
+
+
 class PpPass(GraphPass):
     """Pipeline-parallel partitioning pass (graph-level stage split)."""
 
@@ -338,14 +352,7 @@ class PpPass(GraphPass):
         stage_plan = self._resolve_stage_plan(run_ctx.model, run_ctx.pp_degree)
         stage_of_fqn = {fqn: s for s, fqns in enumerate(stage_plan) for fqn in fqns}
 
-        (
-            stage_state_indices,
-            node_stage,
-            node_phase,
-            input_ph,
-            label_ph,
-            state_phs,
-        ) = self._classify_graph(
+        graph_cls = self._classify_graph(
             graph_module,
             stage_of_fqn,
             run_ctx.pp_degree,
@@ -355,25 +362,31 @@ class PpPass(GraphPass):
         )
 
         self._anchor_grad_outputs(
-            graph_module, node_stage, stage_of_fqn, state_fqns, run_ctx.model
+            graph_module,
+            graph_cls.node_stage,
+            stage_of_fqn,
+            state_fqns,
+            run_ctx.model,
         )
-        self._propagate_anchor_stages(graph_module, node_stage, node_phase)
-        self._validate_adjacent_dataflow(graph_module, node_stage)
+        self._propagate_anchor_stages(
+            graph_module, graph_cls.node_stage, graph_cls.node_phase
+        )
+        self._validate_adjacent_dataflow(graph_module, graph_cls.node_stage)
 
         return _StageSplit(
             state_fqns=state_fqns,
             state_is_param=state_is_param,
             stage_plan=stage_plan,
-            node_stage=node_stage,
-            node_phase=node_phase,
-            input_ph=input_ph,
-            label_ph=label_ph,
-            state_phs=state_phs,
-            stage_state_indices=stage_state_indices,
-            stage_state_fqns=[state_fqns[i] for i in stage_state_indices],
+            node_stage=graph_cls.node_stage,
+            node_phase=graph_cls.node_phase,
+            input_ph=graph_cls.input_ph,
+            label_ph=graph_cls.label_ph,
+            state_phs=graph_cls.state_phs,
+            stage_state_indices=graph_cls.stage_state_indices,
+            stage_state_fqns=[state_fqns[i] for i in graph_cls.stage_state_indices],
         )
 
-    def _build_and_install_stage(
+    def _build_and_install_stage(  # pylint: disable=too-many-locals
         self,
         graph_module: fx.GraphModule,
         pass_config: PassConfig,
@@ -458,7 +471,7 @@ class PpPass(GraphPass):
             len(grad_out_list),
         )
 
-    def _build_stage_graphs(
+    def _build_stage_graphs(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         graph_module: fx.GraphModule,
         node_stage: Dict[fx.Node, int],
@@ -674,7 +687,7 @@ class PpPass(GraphPass):
     # Node classification (stage + phase, topo order)
     # ------------------------------------------------------------------
 
-    def _classify_graph(
+    def _classify_graph(  # pylint: disable=too-many-locals
         self,
         graph_module: fx.GraphModule,
         stage_of_fqn: Dict[str, int],
@@ -682,14 +695,7 @@ class PpPass(GraphPass):
         stage_idx: int,
         state_fqns: Sequence[str],
         num_state_inputs: int,
-    ) -> Tuple[
-        List[int],
-        Dict[fx.Node, int],
-        Dict[fx.Node, str],
-        fx.Node,
-        fx.Node,
-        List[fx.Node],
-    ]:
+    ) -> _GraphClassification:
         """Resolve every node's stage and fwd/bwd phase in topological order.
 
         Phase: explicit ``autograd_backward`` tag, else inherited from args
@@ -756,16 +762,16 @@ class PpPass(GraphPass):
             raise ValueError(
                 "Joint graph must expose (state..., input, label) placeholders"
             )
-        return (
-            sorted(stage_state_indices),
-            node_stage,
-            node_phase,
-            input_ph,
-            label_ph,
-            state_phs,
+        return _GraphClassification(
+            stage_state_indices=sorted(stage_state_indices),
+            node_stage=node_stage,
+            node_phase=node_phase,
+            input_ph=input_ph,
+            label_ph=label_ph,
+            state_phs=state_phs,
         )
 
-    def _classify_placeholders(
+    def _classify_placeholders(  # pylint: disable=too-many-locals
         self,
         placeholders: List[fx.Node],
         node_stage: Dict[fx.Node, int],
@@ -837,19 +843,50 @@ class PpPass(GraphPass):
                         break
             node_phase[node] = phase
             if phase == _FWD:
-                stage = self._stage_from_stack(node, stage_of_fqn)
-                if stage is None:
-                    stage = self._stage_from_state_arg(node, node_stage, state_ph_set)
-                if stage is None:
-                    arg_stages = _tensor_arg_stages(node, node_stage)
-                    if arg_stages:
-                        stage = max(arg_stages)
+                stage = self._resolve_fwd_stage(
+                    node, node_stage, state_ph_set, stage_of_fqn
+                )
                 if stage is None:
                     floating.append(node)
                 else:
                     node_stage[node] = stage
 
-        # Leftover fwd glue: consumers first (reverse topo), else last.
+        self._assign_floating_fwd_nodes(
+            graph, floating, num_stages, node_stage, node_phase
+        )
+
+    def _resolve_fwd_stage(
+        self,
+        node: fx.Node,
+        node_stage: Dict[fx.Node, int],
+        state_ph_set: Set[fx.Node],
+        stage_of_fqn: Dict[str, int],
+    ) -> Optional[int]:
+        """Resolve a forward node's stage anchor.
+
+        Priority: module stack, then state-ph args, then max-args over
+        TENSOR args (data flows forward; shape-metadata scalars carry no
+        data dependency). ``None`` means root-level glue to be resolved
+        from its consumers (see ``_assign_floating_fwd_nodes``).
+        """
+        stage = self._stage_from_stack(node, stage_of_fqn)
+        if stage is None:
+            stage = self._stage_from_state_arg(node, node_stage, state_ph_set)
+        if stage is None:
+            arg_stages = _tensor_arg_stages(node, node_stage)
+            if arg_stages:
+                stage = max(arg_stages)
+        return stage
+
+    @staticmethod
+    def _assign_floating_fwd_nodes(
+        graph: fx.Graph,
+        floating: List[fx.Node],
+        num_stages: int,
+        node_stage: Dict[fx.Node, int],
+        node_phase: Dict[fx.Node, str],
+    ) -> None:
+        """Leftover fwd glue: consumers first (reverse topo), else last."""
         for node in reversed(list(graph.nodes)):
             if node not in floating or node_phase[node] != _FWD:
                 continue
@@ -1002,12 +1039,9 @@ class PpPass(GraphPass):
             if stage is None:
                 continue
             for arg in _iter_node_args(node):
-                if (
-                    isinstance(arg, fx.Node)
-                    and node_phase.get(arg) == _BWD
-                    and node_stage.get(arg) is not None
-                    and node_stage[arg] < stage
-                ):
+                if node_phase.get(arg) != _BWD or node_stage.get(arg) is None:
+                    continue
+                if node_stage[arg] < stage:
                     node_stage[arg] = stage
 
     # ------------------------------------------------------------------
@@ -1090,7 +1124,7 @@ class PpPass(GraphPass):
             if pstage is not None:
                 node_stage[grad_node] = pstage
 
-    def _find_boundaries(
+    def _find_boundaries(  # pylint: disable=too-many-locals
         self,
         graph_module: fx.GraphModule,
         node_stage: Dict[fx.Node, int],
@@ -1214,11 +1248,13 @@ class PpPass(GraphPass):
         node: fx.Node,
         env: Dict[fx.Node, fx.Node],
         foreign: Dict[fx.Node, fx.Node],
-    ) -> fx.Node:
+    ) -> None:
         """Copy ``node`` into ``g``, remapping args through env/foreign maps.
 
         ``env`` maps already-copied same-slice nodes; ``foreign`` maps
-        boundary values to their placeholder stand-ins.
+        boundary values to their placeholder stand-ins. The copy is
+        registered under ``env[node]``; nothing is returned — callers
+        consume the copy through ``env`` / ``foreign``.
         """
         if node.op == "get_attr":
             raise ValueError(
@@ -1245,9 +1281,8 @@ class PpPass(GraphPass):
         new_node = g.create_node(node.op, node.target, new_args, new_kwargs)
         new_node.meta = dict(node.meta)
         env[node] = new_node
-        return new_node
 
-    def _build_fwd_graph(
+    def _build_fwd_graph(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         graph_module: fx.GraphModule,
         node_stage: Dict[fx.Node, int],
@@ -1314,7 +1349,7 @@ class PpPass(GraphPass):
         fwd_gm = fx.GraphModule(nn.Module(), g)
         return fwd_gm, out_orig
 
-    def _create_fwd_placeholders(
+    def _create_fwd_placeholders(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         g: fx.Graph,
         used: Set[str],
@@ -1381,7 +1416,7 @@ class PpPass(GraphPass):
             out_orig.append(node)
         return out_orig
 
-    def _build_bwd_graph(
+    def _build_bwd_graph(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         graph_module: fx.GraphModule,
         node_stage: Dict[fx.Node, int],
@@ -1428,13 +1463,12 @@ class PpPass(GraphPass):
 
         # Sets, not lists: membership is probed once per graph node below
         # and real joint graphs carry tens of thousands of nodes.
-        stage_bwd_set = {
-            n
-            for n in graph.nodes
-            if n.op not in ("placeholder", "output")
-            and node_phase[n] == _BWD
-            and node_stage[n] == k
-        }
+        stage_bwd_set = set()
+        for graph_node in graph.nodes:
+            if graph_node.op in ("placeholder", "output"):
+                continue
+            if node_phase[graph_node] == _BWD and node_stage[graph_node] == k:
+                stage_bwd_set.add(graph_node)
 
         # Gradient-output nodes of this stage's trainable params (by state
         # index identity, not module attribution — post-trace inserts like
@@ -1460,7 +1494,7 @@ class PpPass(GraphPass):
         bwd_gm = fx.GraphModule(nn.Module(), g)
         return bwd_gm
 
-    def _create_bwd_placeholders(
+    def _create_bwd_placeholders(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         g: fx.Graph,
         used: Set[str],
@@ -1662,7 +1696,7 @@ class PpPass(GraphPass):
             )
         return spec
 
-    def _build_schedule(
+    def _build_schedule(  # pylint: disable=too-many-arguments
         self,
         fwd_gm: fx.GraphModule,
         bwd_gm: fx.GraphModule,
@@ -1743,6 +1777,3 @@ class PpPass(GraphPass):
         ]
         graph_module.num_state_inputs = len(stage_state_fqns)
         graph_module.recompile()
-
-
-__all__ = ["PpPass", "_auto_stage_split"]
