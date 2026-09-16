@@ -25,13 +25,10 @@ from torch.nn import Module
 
 from hyper_parallel.core.pipeline_parallel.mpipe.executor import MPipeTransposeExecutor
 
-from hyper_parallel.core.pipeline_parallel.scheduler import (
-    MetaStep,
-    MetaStepType,
-    ScheduleInterleaved1F1B,
-)
+from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleInterleaved1F1B
 from hyper_parallel.core.pipeline_parallel.mpipe.sampler import mpipe_owned_micros
 from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
+from hyper_parallel.core.pipeline_parallel.utils import MetaStep, MetaStepType
 
 if TYPE_CHECKING:
     from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
