@@ -40,6 +40,7 @@ from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, MixedPrecisionPo
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.fully_shard.param import (
     MindSporeHSDPParamV2,
+    _NoOpAllGatherHandle,
     make_contiguous_strides_for,
     set_requires_grad_if_needed,
 )
@@ -337,6 +338,53 @@ class TestMindSporeParam(unittest.TestCase):
         output.data.copy_.assert_called_once_with(cast_input)
         self.assertIs(gathered, output)
         self.assertIsNone(handle)
+
+    def test_no_comm_async_unshard_defers_materialization_until_wait(self):
+        """A local prefetch should only record pending work until it is consumed."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.is_sharded = False
+        hsdp_param.sharded_state = ShardedState.SHARDED
+        hsdp_param.prefetch_handle = None
+        hsdp_param.reset_sharded_param = MagicMock()
+        hsdp_param.init_unsharded_param = MagicMock()
+        hsdp_param.to_unsharded = MagicMock()
+        all_gather_input = MagicMock(numel=MagicMock(return_value=8), dtype="float16", device="npu:0")
+        output = MagicMock()
+        hsdp_param.init_all_gather_outputs = MagicMock(
+            side_effect=lambda **kwargs: setattr(hsdp_param, "all_gather_outputs", [output])
+        )
+        hsdp_param.alloc_all_gather_outputs = MagicMock()
+
+        with patch.object(
+            MindSporeHSDPParamV2,
+            "all_gather_inputs",
+            new_callable=PropertyMock,
+            return_value=[all_gather_input],
+        ) as mock_all_gather_inputs:
+            hsdp_param.unshard(async_op=True)
+
+            pending_handle = hsdp_param.prefetch_handle
+            self.assertIsInstance(pending_handle, _NoOpAllGatherHandle)
+            hsdp_param.reset_sharded_param.assert_not_called()
+            hsdp_param.init_all_gather_outputs.assert_not_called()
+            mock_all_gather_inputs.assert_not_called()
+
+            hsdp_param.unshard(async_op=False)
+
+            self.assertIs(hsdp_param.prefetch_handle, pending_handle)
+            hsdp_param.reset_sharded_param.assert_not_called()
+            hsdp_param.wait_for_unshard()
+
+        hsdp_param.reset_sharded_param.assert_called_once_with()
+        hsdp_param.init_all_gather_outputs.assert_called_once()
+        hsdp_param.alloc_all_gather_outputs.assert_called_once_with()
+        output.data.copy_.assert_called_once_with(all_gather_input)
+        hsdp_param.init_unsharded_param.assert_called_once_with()
+        hsdp_param.to_unsharded.assert_called_once_with()
+        self.assertIsNone(hsdp_param.prefetch_handle)
+
+        pending_handle.wait()
+        hsdp_param.reset_sharded_param.assert_called_once_with()
 
     def test_copy_without_bumping_version_prefers_data_alias(self):
         """Shared helper should write through ``dst.data``."""
@@ -638,6 +686,7 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param = _new_hsdp_param_v2()
         handle = MagicMock()
         hsdp_param.prefetch_handle = None
+        hsdp_param._uses_all_gather_collective = MagicMock(return_value=True)
         hsdp_param._get_unsharded_param_data = MagicMock(return_value=("output", handle))
 
         MindSporeHSDPParamV2.unshard(hsdp_param, async_op=True)

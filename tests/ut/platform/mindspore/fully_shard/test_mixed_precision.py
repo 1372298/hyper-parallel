@@ -57,6 +57,7 @@ from hyper_parallel.platform.mindspore.fully_shard.state import (
 )
 from hyper_parallel.platform.mindspore.fully_shard.param import (
     MindSporeHSDPParamV2,
+    _NoOpAllGatherHandle,
     _pack_for_reduce_scatter,
 )
 
@@ -692,6 +693,7 @@ class TestPrefetchStateMachine(unittest.TestCase):
         param.sharded_state = ShardedState.SHARDED
         param.prefetch_handle = None
         param._assert_in_states = MagicMock()
+        param._uses_all_gather_collective = MagicMock(return_value=True)
         param._get_unsharded_param_data = MagicMock()
         param.init_unsharded_param = MagicMock()
         param.to_unsharded = MagicMock()
@@ -752,6 +754,31 @@ class TestPrefetchStateMachine(unittest.TestCase):
         param.init_unsharded_param.assert_called_once_with()
         param.to_unsharded.assert_called_once_with()
         self.assertIsNone(param.prefetch_handle)
+
+    def test_sync_collective_without_backend_handle_records_pending_state(self):
+        """A completed synchronous collective should still have a pending transition."""
+        param = self._make_param()
+        param._get_unsharded_param_data.return_value = (MagicMock(name="output"), None)
+
+        param.unshard(async_op=False)
+
+        self.assertIsInstance(param.prefetch_handle, _NoOpAllGatherHandle)
+        param.wait_for_unshard()
+
+        param._get_unsharded_param_data.assert_called_once_with(async_op=False)
+        param.init_unsharded_param.assert_called_once_with()
+        param.to_unsharded.assert_called_once_with()
+        self.assertIsNone(param.prefetch_handle)
+
+    def test_wait_for_unshard_without_pending_work_is_noop(self):
+        """Waiting without a preceding unshard should not install stale buffers."""
+        param = self._make_param()
+
+        param.wait_for_unshard()
+
+        param.init_unsharded_param.assert_not_called()
+        param.to_unsharded.assert_not_called()
+
 
 class TestAsyncReduceStateMachine(unittest.TestCase):
     """Test per-parameter async reduce/all-reduce pending state."""

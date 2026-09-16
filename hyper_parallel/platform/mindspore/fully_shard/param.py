@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP parameter"""
-from typing import List, Callable, Optional, cast, Tuple
+from typing import Callable, List, Optional, Tuple, Union, cast
 import itertools
 import mindspore as ms
 from mindspore import nn
@@ -69,6 +69,25 @@ def _to_dtype_if_needed(
     if isinstance(dtype, ms.Type) and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
+
+
+class _NoOpAllGatherHandle:
+    """Represent a pending local unshard without collective communication."""
+
+    def __init__(self, on_wait: Optional[Callable[[], None]] = None) -> None:
+        """Initialize the optional deferred local materialization callback."""
+        self._on_wait = on_wait
+
+    def wait(self) -> None:
+        """Finish deferred local materialization exactly once."""
+        callback = self._on_wait
+        if callback is None:
+            return
+        callback()
+        self._on_wait = None
+
+
+_AllGatherHandle = Union[CommHandle, _NoOpAllGatherHandle]
 
 
 def make_contiguous_strides_for(shape, row_major=True):
@@ -183,7 +202,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._unsharded_param: Optional[Parameter] = None
         self._param_fqn: Optional[str] = None
         # Communication attributes for prefetch pattern
-        self.prefetch_handle: Optional[CommHandle] = None
+        self.prefetch_handle: Optional[_AllGatherHandle] = None
         self._reduce_scatter_output = None
         self.reduce_scatter_handle: Optional[CommHandle] = None
         self._all_reduce_output = None
@@ -688,9 +707,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         Returns:
             (unsharded_param, handle): Unsharded parameter data and communication handle.
         """
-        # Optimizer steps may refresh the underlying local tensor storage. Re-sync
-        # the cached flat shard view before reading all_gather_inputs for the next
-        # unshard cycle.
         self.reset_sharded_param()
         all_gather_input = self.all_gather_inputs[0]
 
@@ -733,23 +749,45 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         return self.all_gather_outputs[0], handle
 
+    def _uses_all_gather_collective(self) -> bool:
+        """Return whether unshard requires distributed all-gather communication."""
+        if not self.is_sharded or self.shard_world_size <= 1:
+            return False
+        if not isinstance(self.mesh_info, FSDPMeshInfo):
+            return False
+        return self.mesh_info.shard_process_group is not None
+
+    def _materialize_local_unsharded_param(self) -> None:
+        """Materialize a deferred unshard that does not require communication."""
+        _, handle = self._get_unsharded_param_data(async_op=False)
+        if handle is not None:
+            raise RuntimeError("Expected no communication handle for local unshard")
+
     def unshard(self, async_op: bool = False) -> None:
         if self.prefetch_handle is not None:
-            # Already triggered by HSDPState.prefetch(), so return directly.
-            return  # no-op
+            # A logical unshard has already been issued and is pending consumption.
+            return
+
+        if not self._uses_all_gather_collective():
+            self.prefetch_handle = _NoOpAllGatherHandle(
+                self._materialize_local_unsharded_param
+            )
+            return
 
         _, handle = self._get_unsharded_param_data(async_op=async_op)
-        self.prefetch_handle = handle
+        self.prefetch_handle = handle if handle is not None else _NoOpAllGatherHandle()
 
     def wait_for_unshard(self) -> None:
         self._assert_in_states(ShardedState.SHARDED)
 
-        if self.prefetch_handle is not None:
-            self.prefetch_handle.wait()
-            self.prefetch_handle = None
+        handle = self.prefetch_handle
+        if handle is None:
+            return
+        handle.wait()
 
         self.init_unsharded_param()
         self.to_unsharded()
+        self.prefetch_handle = None
 
     def shard(self) -> None:
         """
