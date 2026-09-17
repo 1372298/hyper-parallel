@@ -1763,7 +1763,9 @@ class MindSporePlatform(Platform):
             The platform-specific checkpoint exclusion wrapper.
         """
         # pylint: disable=C0415
-        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper import checkpoint_exclude_wrapper
+        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper import (
+            checkpoint_exclude_wrapper,
+        )
         return checkpoint_exclude_wrapper(module)
 
     @staticmethod

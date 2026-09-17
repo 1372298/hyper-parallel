@@ -25,6 +25,19 @@ The implementation currently supports PyNative execution with Tensor leaves in
 nested input and output containers. Selective checkpoint policies and activation
 swapping are intentionally not supported yet.
 """
+
+__all__ = [
+    "ReentrantCheckpointExcludeWrapper",
+    "ReentrantCheckpointWrapper",
+    "clear_reentrant_recompute_session",
+    "reentrant_recompute_backward_compat_ctx",
+    "reentrant_checkpoint_exclude_wrapper",
+    "reentrant_checkpoint_wrapper",
+    "reentrant_recompute_handle_collector_ctx",
+    "reentrant_recompute_session_ctx",
+    "is_in_reentrant_top_level_backward",
+]
+
 import contextlib
 import contextvars
 from collections import defaultdict
@@ -813,16 +826,3 @@ def reentrant_checkpoint_exclude_wrapper(
         save_rng_state: Advance default generators as in the original forward.
     """
     return ReentrantCheckpointExcludeWrapper(module, save_rng_state=save_rng_state)
-
-
-__all__ = [
-    "ReentrantCheckpointExcludeWrapper",
-    "ReentrantCheckpointWrapper",
-    "clear_reentrant_recompute_session",
-    "reentrant_recompute_backward_compat_ctx",
-    "reentrant_checkpoint_exclude_wrapper",
-    "reentrant_checkpoint_wrapper",
-    "reentrant_recompute_handle_collector_ctx",
-    "reentrant_recompute_session_ctx",
-    "is_in_reentrant_top_level_backward",
-]
