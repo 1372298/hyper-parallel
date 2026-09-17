@@ -21,8 +21,9 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
-    from hyper_parallel.core.pipeline_parallel.scheduler import MetaStep, PipelineContext
+    from hyper_parallel.core.pipeline_parallel.scheduler import PipelineContext
     from hyper_parallel.core.pipeline_parallel.mpipe.schedule import ScheduleMPipeTranspose
+    from hyper_parallel.core.pipeline_parallel.utils import MetaStep
 
 logger = logging.getLogger(__name__)
 
