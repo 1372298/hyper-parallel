@@ -36,13 +36,11 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 ## Env Gotchas / Do Not
 
 - **Editable must track this tree.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. Do not rely on `PYTHONPATH` alone.
-- **Core default:** platform-agnostic `core/` code uses `get_platform()` during the staged Platform retirement.
-- **Multicore exception:** `core/multicore/` is an explicit Torch-only component. Use direct, module-level
-  Torch imports there; do not add Platform dispatch or MindSpore implementations.
-- **Pipeline exception:** `core/pipeline_parallel/` is Torch-only. Import native Torch APIs
-  directly; do not add Platform dispatch or MindSpore implementations.
-- **DFunction exception:** `core/shard/dfunction.py` is Torch-only and inherits directly from
-  `torch.autograd.Function`; do not reintroduce Platform dispatch or MindSpore support.
+- **Torch-only.** The `platform/` abstraction layer (and with it the MindSpore backend) has been
+  removed. Every module uses native Torch APIs (`torch.distributed`, `torch.Tensor`, autograd)
+  directly; do not reintroduce Platform dispatch or MindSpore implementations anywhere.
+- **Collectives.** Use `torch.distributed` directly, or the thin wrappers in
+  `hyper_parallel/core/context_parallel/utils.py` and `hyper_parallel/core/dtensor/_utils.py`.
 - **Never** invent Jenkins build numbers or force-push shared branches in agent workflows.
 - Hard distributed rules (canonical): `.agent/rules/project-overview.md` + `.agent/rules/distributed.md` — do not restate long-form elsewhere; link instead.
 
@@ -52,13 +50,12 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 
 | Module | Location | Purpose |
 |--------|----------|---------|
-| **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction — `get_platform()`, never import backends in core |
 | **DTensor** | `core/dtensor/` | Local shard + DeviceMesh + Placements; redistribution cache |
 | **Shard** | `core/shard/` | `custom_shard` / YAML ops + `parallel_*.py` |
 | **Tensor parallel** | `core/tensor_parallel/` | `parallelize_module()`, `ParallelStyle`, mesh context |
-| **FSDP / HSDP** | `core/fully_shard/`, `platform/*/fully_shard/` | Param shard/unshard; HSDP under same trees (`hsdp_*.py`) |
+| **FSDP / HSDP** | `core/fully_shard/` | Param shard/unshard; HSDP under same tree (`hsdp_*.py`) |
 | **Pipeline** | `core/pipeline_parallel/` | Torch-only stage schedule, micro-batch, P2P |
-| **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | SAC + activation swap |
+| **Activation** | `core/activation_checkpoint/`, `core/activation_memory/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
 | **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |
 | **Collectives** | `collectives/cc.py` | Process groups |
@@ -71,7 +68,7 @@ Distributed ST helpers: `torchrun_case()` / `msrun_case()` via `tests.common.dis
 > Full details: `.agent/rules/code-style.md` (global hard constraint).
 
 - Apache 2.0 header on `.py` (lines 1–16); PEP 8 / ~120 cols; Google-style docstrings; type hints on public APIs
-- Imports at module top except platform backends: lazy `torch`/`mindspore` inside methods + `# pylint: disable=C0415`
+- Imports at module top; the platform-backend lazy-import exception no longer applies
 - Load `code-style.md` before generate / edit / commit / review; auto-fix before proceeding
 
 ---
@@ -130,10 +127,9 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | Skill | Description | Usage |
 |-------|-------------|-------|
 | **autogit** | GitCode fork: commit, PR, status, squash, lint/test gates | `/commit`, `/create-pr`, `/test`, … |
-| **code-review** | Full distributed review (stream/memory/DTensor/cross-platform) | `/code-review` |
+| **code-review** | Full distributed review (stream/memory/DTensor/collectives) | `/code-review` |
 | **dist-op-analysis** | Operator analysis → plan (human confirm) | called before dist-op-dev |
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
-| **platform-dev** | Platform APIs, FSDP/HSDP/PP, DTensorBase, collectives | `/skill platform-dev` |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **add-unit-test** | How-to for `tests/ut` (procedures) | when adding UT / coverage |
@@ -153,7 +149,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | Agent | Role |
 | ----- | ---- |
 | **planner** | Read-only multi-file implementation plan |
-| **code-verifier** | 5-phase verify: style/lint, tests, cross-platform, report |
+| **code-verifier** | 5-phase verify: style/lint, tests, distributed semantics, report |
 | **simple-code-reviewer** | Fast checklist only — not full `/code-review` |
 | **code-reviewer** | Thin proxy → `skills/code-review` (full review) |
 | **dtensor-dev-expert** | DTensor / layout / redistribute / op dispatch |
@@ -172,8 +168,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **project-overview** | Global — identity + hard-rule shortlist |
 | **code-style** | Global |
 | **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**` |
-| **platform** | `platform/**` |
-| **multi-platform-features** | `core/**`, `platform/**` — multi-backend / list APIs |
+| **multi-platform-features** | `core/**` — list/collection API contracts |
 | **testing** | `tests/**` |
 | **unit-test** | `tests/ut/**` — hard constraints; how-to → skill `add-unit-test` |
 | **distributed-op-dev** / **distributed-op-testing** / **test-assertion-style** | Op impl & tests (scoped) |

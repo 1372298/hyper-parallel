@@ -27,7 +27,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # pylint: disable=C0413
 
@@ -36,7 +35,7 @@ from hyper_parallel.core.utils.moe_utils import (  # pylint: disable=C0413
     sync_and_update_expert_bias,
 )
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo  # pylint: disable=C0413
-from hyper_parallel.platform.torch.common.moe import MoE  # pylint: disable=C0413
+from hyper_parallel.components.modules.moe import MoE  # pylint: disable=C0413
 
 
 class TestSyncAndUpdateExpertBias(unittest.TestCase):

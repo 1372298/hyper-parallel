@@ -31,7 +31,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch
 from torch import nn

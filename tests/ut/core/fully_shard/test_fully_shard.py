@@ -29,7 +29,6 @@ import numpy as np
 import torch
 from torch import nn
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.fully_shard.hsdp_param import (
     HSDPParamV2,

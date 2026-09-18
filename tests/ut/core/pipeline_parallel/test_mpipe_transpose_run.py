@@ -34,7 +34,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 import torch  # noqa: E402  pylint: disable=wrong-import-position
 from torch import nn  # noqa: E402  pylint: disable=wrong-import-position

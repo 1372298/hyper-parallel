@@ -41,7 +41,6 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import nn

@@ -22,7 +22,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 swap_module = importlib.import_module("hyper_parallel.core.activation_memory.swap")
 from hyper_parallel.core.activation_memory.swap import (  # noqa: E402

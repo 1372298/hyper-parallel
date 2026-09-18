@@ -61,7 +61,6 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 from unittest.mock import MagicMock, patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import fx, nn

@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.activation_memory import CheckpointPolicy
 from hyper_parallel.core.activation_memory.swap import Storage
