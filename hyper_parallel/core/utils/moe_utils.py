@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch import nn
 
 if TYPE_CHECKING:
-    from hyper_parallel.platform.torch.common.moe import MoE
+    from hyper_parallel.components.modules.moe import MoE
 
 
 def sync_and_update_expert_bias(

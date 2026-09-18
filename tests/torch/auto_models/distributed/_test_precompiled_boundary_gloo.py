@@ -26,7 +26,6 @@ equivalent, which suffices for wrap/unwrap/identity logic).
 """
 import os
 
-os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
 # pylint: disable=wrong-import-position,redefined-outer-name
 import logging

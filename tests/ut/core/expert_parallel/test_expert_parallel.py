@@ -29,7 +29,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.expert_parallel.expert_parallel import (
     AllToAllTokenDispatcher,

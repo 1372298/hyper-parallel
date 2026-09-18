@@ -7,10 +7,11 @@
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owners for paths without a more specific rule.
-* @yangzhenzhang @suteng @yao_yf @yaoyifanx
+* @yangzhenzhang02 @suteng @yao_yf @yaoyifanx
 
 # The maintainers of hyper_parallel/auto_parallel.
 /hyper_parallel/auto_parallel/ @bj-wang @Hrxwhr
+/hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
 
 # The maintainers of hyper_parallel/collectives.
@@ -18,20 +19,13 @@
 
 
 # The maintainers of hyper_parallel/core.
-/hyper_parallel/core/ @yangzhenzhang
+/hyper_parallel/core/ @yangzhenzhang02
 /hyper_parallel/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing010818
 /hyper_parallel/core/fully_shard/ @Meng107
 /hyper_parallel/core/pipeline_parallel/ @lichen666
-/hyper_parallel/core/shard/ @yangzhenzhang
+/hyper_parallel/core/shard/ @yangzhenzhang02
 /hyper_parallel/core/shard/ops/ @davidhe91
 
-
-# The maintainers of hyper_parallel/platform.
-/hyper_parallel/platform/ @yangzhenzhang
-/hyper_parallel/platform/mindspore/ @yangzhenzhang
-
-/hyper_parallel/platform/torch/ @yangzhenzhang
-/hyper_parallel/platform/torch/activation_checkpoint/ @DavidFFFan
 
 # The maintainers of hyper_parallel/compile.
 /hyper_parallel/compile/ @kisnwang @zhenyu10
@@ -39,24 +33,24 @@
 # The maintainers of tests.
 /tests/ @liuchongming74
 /tests/ut/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing010818
-/tests/ut/platform/mindspore/ @yangzhenzhang
-/tests/ut/core/context_parallel/ @yangzhenzhang
+/hyper_parallel/core/activation_memory/ @DavidFFFan
+/tests/ut/core/context_parallel/ @yangzhenzhang02
 /tests/ut/compile/ @kisnwang @zhenyu10
 
-/tests/torch/ @yangzhenzhang
+/tests/torch/ @yangzhenzhang02
 /tests/torch/activation_memory/ @DavidFFFan
 /tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing010818
 /tests/torch/fully_shard/ @Meng107
 /tests/torch/pipeline_parallel/ @lichen666
 /tests/torch/process_group/ @changzherui1 @changzherui
-/tests/torch/shard/ @yangzhenzhang
+/tests/torch/shard/ @yangzhenzhang02
 
 
 # The maintainers of other code directories.
-/.jenkins/ @yangzhenzhang
-/docs/ @yangzhenzhang @gemini524
-/requirements.txt  @yangzhenzhang
-/setup.py  @yangzhenzhang
+/.jenkins/ @yangzhenzhang02
+/docs/ @yangzhenzhang02 @gemini524
+/requirements.txt  @yangzhenzhang02
+/setup.py  @yangzhenzhang02
 
 /hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
 /tests/ut/core/multicore/ @davidhe91 @Probiotics5333

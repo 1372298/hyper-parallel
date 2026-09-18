@@ -26,10 +26,8 @@ from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.shard.utils import get_rank
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-from hyper_parallel.platform import get_platform
 
-platform = get_platform()
-Tensor = platform.Tensor
+from torch import Tensor
 
 
 def _normalize_sdpa_args(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
