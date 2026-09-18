@@ -29,6 +29,7 @@ from hyper_parallel.core.optimizer.dtensor_compat import (
     StridedShard,
 )
 
+
 @dataclass(frozen=True)
 class ParamLayoutSpec:
     """Shape-free but ndim-aware parameter layout.
