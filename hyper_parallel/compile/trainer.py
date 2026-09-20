@@ -109,6 +109,10 @@ class GraphTrainer:
         """
         Execute one training step
 
+        Compiles lazily on the first step. ``compile`` also initializes the
+        optimizer: the compiler's own lazy path in ``forward_backward`` cannot
+        do that, because the optimizer belongs to the trainer.
+
         Args:
             input_batch: Input batch
             label_batch: Label batch
@@ -116,6 +120,9 @@ class GraphTrainer:
         Returns:
             loss: Loss value
         """
+        if self._compiler.is_compiled is False:
+            self.compile(input_batch, label_batch)
+
         return self._compiler.forward_backward(input_batch, label_batch)
 
     def to(self, device: torch.device) -> "GraphTrainer":
