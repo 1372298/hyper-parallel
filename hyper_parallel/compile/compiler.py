@@ -95,6 +95,11 @@ class GraphCompiler:
 
         self._joint_graph = None
 
+    @property
+    def is_compiled(self) -> bool:
+        """Whether a joint graph has already been compiled."""
+        return self._joint_graph is not None
+
     def compile(self, input_batch: torch.Tensor, label_batch: torch.Tensor) -> None:
         """
         Compile model into parallel graph
