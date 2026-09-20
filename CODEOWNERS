@@ -7,7 +7,7 @@
 # https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owners for paths without a more specific rule.
-* @yangzhenzhang02 @suteng @yao_yf @yaoyifanx
+* @yangzhenzhang02 @suteng @yaoyifanx
 
 # The maintainers of hyper_parallel/auto_parallel.
 /hyper_parallel/auto_parallel/ @bj-wang @Hrxwhr
@@ -55,3 +55,17 @@
 /hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
 /tests/ut/core/multicore/ @davidhe91 @Probiotics5333
 /tests/torch/multicore/ @davidhe91 @Probiotics5333
+
+# Hyper-RL code and Qwen3 adapters.
+/hyper_parallel/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+/hyper_parallel/models/qwen3/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+
+# Hyper-RL tests.
+/tests/ut/rl/ @liuchongming74 @bj-wang
+/hyper_parallel/rl/tests/ @yangzhenzhang02 @bj-wang
+/tests/common/rl_st_cases.py @liuchongming74 @bj-wang
+
+# Hyper-RL documentation and development rules.
+/docs/rl-*.md @yangzhenzhang02 @gemini524 @bj-wang
+/.agent/rules/hyper-rl.md @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
+/.agent/rules/rl/ @yangzhenzhang02 @suteng @yaoyifanx @bj-wang
