@@ -20,7 +20,7 @@
 
 # The maintainers of hyper_parallel/core.
 /hyper_parallel/core/ @yangzhenzhang02
-/hyper_parallel/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing010818
+/hyper_parallel/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
 /hyper_parallel/core/fully_shard/ @Meng107
 /hyper_parallel/core/pipeline_parallel/ @lichen666
 /hyper_parallel/core/shard/ @yangzhenzhang02
@@ -32,14 +32,14 @@
 
 # The maintainers of tests.
 /tests/ @liuchongming74
-/tests/ut/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing010818
+/tests/ut/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
 /hyper_parallel/core/activation_memory/ @DavidFFFan
 /tests/ut/core/context_parallel/ @yangzhenzhang02
 /tests/ut/compile/ @kisnwang @zhenyu10
 
 /tests/torch/ @yangzhenzhang02
 /tests/torch/activation_memory/ @DavidFFFan
-/tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing010818
+/tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
 /tests/torch/fully_shard/ @Meng107
 /tests/torch/pipeline_parallel/ @lichen666
 /tests/torch/process_group/ @changzherui1 @changzherui
