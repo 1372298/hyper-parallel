@@ -212,6 +212,8 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             group_name = swap_manager.get_current_group_name()
             if not group_name:
                 return tensor.detach()
+            if swap_manager.is_last_group(group_name):
+                return tensor.detach()
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True
