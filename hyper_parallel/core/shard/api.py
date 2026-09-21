@@ -327,10 +327,13 @@ def _register_hook(model: nn.Module, sharding_plan: Dict):
                              f"but got type {suffix}")
 
         set_inputs_layout = suffix == "input"
-        register_cell = cell_dict[prefix]
+        set_outputs_layout = not set_inputs_layout
+        register_cell = cell_dict.get(prefix)
+        if register_cell is None:
+            raise ValueError(f"Cannot find target cell {prefix!r} in sharding_plan")
 
-        _set_layouts(register_cell, value, set_inputs_layout, not set_inputs_layout)
-        _register_cell_hook(register_cell, set_inputs_layout, not set_inputs_layout)
+        _set_layouts(register_cell, value, set_inputs_layout, set_outputs_layout)
+        _register_cell_hook(register_cell, set_inputs_layout, set_outputs_layout)
 
 
 def _register_local_tensor_hook(cell: nn.Module, return_local_tensor_list: List[str]):
