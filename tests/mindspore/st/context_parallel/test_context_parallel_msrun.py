@@ -57,9 +57,11 @@ def test_context_parallel_group2_msrun():
         Launch the remaining 2-card and 4-card workers together:
         1. async Ulysses repeated backward stability
         2. async hybrid forward parity
+        3. p2p_exchange forward/backward (the head-tail load-balance primitive)
     Expectation: Run success.
     """
     _run_group(
         ("test_async_context_parallel_ulysses_backward_repeat", 13420, 2, 2),
         ("test_async_context_parallel_hybrid_forward", 13440, 4, 4),
+        ("test_p2p_exchange_forward_backward", 13460, 2, 2),
     )

@@ -92,7 +92,12 @@ def ensure_mindspore_platform_for_device_mesh() -> None:
 def ensure_mindspore_platform_for_context_parallel() -> None:
     """Rebind async context parallel platform aliases."""
     _reset_platform_singleton()
-    _bind_platform_globals(("hyper_parallel.core.context_parallel.async_context_parallel",))
+    _bind_platform_globals((
+        "hyper_parallel.core.context_parallel.async_context_parallel",
+        # dsa_cp_fold does ``platform = get_platform()`` at import time; without rebinding it
+        # keeps whichever backend imported it first.
+        "hyper_parallel.core.shard.ops.dsa_cp_fold",
+    ))
 
 
 def ensure_mindspore_platform_default() -> None:
