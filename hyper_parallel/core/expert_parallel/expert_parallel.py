@@ -1405,9 +1405,6 @@ class ExpertParallel(BaseExpertParallel):
             handle = self._token_dispatcher.combine_start(
                 routed_output, device_mesh, ctx
             )
-            # Store on module for external inspection / advanced use cases.
-            # pylint: disable=W0212
-            module._ep_combine_handle = handle
             # Return the async tensor.  The first non-view access by the
             # downstream consumer (e.g. MoE unpermutation) will trigger the
             # implicit wait, overlapping with shared_expert computation.
@@ -1628,8 +1625,6 @@ class ExpertTensorParallel(ExpertParallel):
             handle = self._token_dispatcher.combine_start(
                 routed_output, dispatch_mesh, ctx
             )
-            # pylint: disable=W0212
-            module._ep_combine_handle = handle
             return handle.wait()
 
         return self._token_dispatcher.combine(
