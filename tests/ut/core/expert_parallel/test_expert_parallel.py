@@ -456,7 +456,7 @@ class TestExpertParallelDispatcherSelection(unittest.TestCase):
     def test_async_token_combine_delegates_to_configured_dispatcher(self):
         """async _token_combine calls the configured dispatcher's combine_start."""
         ep = ExpertParallel(token_dispatcher="deredundency", async_combine=True)
-        module = MagicMock()
+        module = _make_mock_module()
         ctx = DeredundencyDispatchContext(
             input_splits=[], output_splits=[], input_shape=(), permuted_indices=MagicMock()
         )
@@ -473,7 +473,7 @@ class TestExpertParallelDispatcherSelection(unittest.TestCase):
             )
 
         mock_start.assert_called_once()
-        self.assertIs(module._ep_combine_handle, handle)
+        self.assertFalse(hasattr(module, "_ep_combine_handle"))
         self.assertIs(result, expected)
 
 
@@ -1555,6 +1555,28 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         # Verify ["ep"] was accessed on the 2-D mesh for combine too
         full_mesh.__getitem__.assert_called_once_with("ep")
 
+    def test_etp_async_combine_does_not_store_handle_on_module(self):
+        """ETP async combine waits on a local handle without retaining it."""
+        etp = ExpertTensorParallel(async_combine=True)
+        module = _make_mock_module()
+        ctx = MagicMock()
+        module._ep_dispatch_ctx = ctx
+        routed_output = MagicMock()
+        expected = MagicMock()
+        handle = MagicMock()
+        handle.wait.return_value = expected
+        ep_submesh = _make_mock_device_mesh(ep_size=2)
+        full_mesh = MagicMock()
+        full_mesh.__getitem__ = MagicMock(return_value=ep_submesh)
+
+        with patch.object(AllToAllTokenDispatcher, "combine_start", return_value=handle) as mock_start:
+            result = etp._token_combine(module, routed_output, full_mesh)
+
+        mock_start.assert_called_once_with(routed_output, ep_submesh, ctx)
+        handle.wait.assert_called_once_with()
+        self.assertIs(result, expected)
+        self.assertFalse(hasattr(module, "_ep_combine_handle"))
+
     def test_etp_deredundency_dispatcher_not_supported_yet(self):
         """ETP fails fast for deredundency until [oep, iep, tp] mesh support exists."""
         etp = ExpertTensorParallel(token_dispatcher="deredundency")
@@ -1792,12 +1814,14 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
     @patch("torch.distributed._functional_collectives.all_to_all_single")
     @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist_func")
     @patch("hyper_parallel.core.expert_parallel.expert_parallel.dist")
-    def test_async_combine_stores_handle_on_module(self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait):
+    def test_async_combine_does_not_store_handle_on_module(
+        self, mock_dist, mock_dist_func, mock_async_a2a, mock_wait
+    ):
         """
-        Feature: async_combine=True stores handle on module
-        Description: After _token_combine with async_combine, the module has
-            _ep_combine_handle attribute.
-        Expectation: attribute exists and has correct type.
+        Feature: async_combine=True keeps its handle local
+        Description: After _token_combine with async_combine, the module does
+            not retain the completed handle.
+        Expectation: _ep_combine_handle is absent.
         """
         self._configure_collectives(mock_dist, mock_dist_func, mock_async_a2a, mock_wait)
         ep_async = ExpertParallel(async_combine=True)
@@ -1812,8 +1836,7 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
             expert_output = torch.randn(self.total_tokens, self.dim)
             ep_async._token_combine(self.module, expert_output, self.mock_mesh)
 
-        self.assertTrue(hasattr(self.module, "_ep_combine_handle"))
-        self.assertIsInstance(self.module._ep_combine_handle, AsyncHandle)
+        self.assertFalse(hasattr(self.module, "_ep_combine_handle"))
 
     @patch("torch.distributed._functional_collectives.wait_tensor")
     @patch("torch.distributed._functional_collectives.all_to_all_single")
