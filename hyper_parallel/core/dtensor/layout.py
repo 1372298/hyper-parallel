@@ -219,7 +219,6 @@ class Layout:
         ``Ascend``
 
     Examples:
-        >>> from mindspore.parallel import Layout
         >>> layout = Layout((2, 2, 2), ("dp", "sp", "mp"))
         >>> layout0 = layout("dp", "mp")
         >>> print(layout0.to_dict())

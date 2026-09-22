@@ -28,8 +28,8 @@ from hyper_parallel.core.optimizer.swap_optimizer import (
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Torch-only optimizer implementations import torch at module load. Keep them
-# off the eager path so MindSpore-only environments can import SwapOptimizer.
+# Optimizer implementations import torch at module load. Keep them off the
+# eager path so importing the package does not pull in torch.
 _LAZY_EXPORTS = {
     "AdamW": ".adamw",
     "Muon": ".muon",
