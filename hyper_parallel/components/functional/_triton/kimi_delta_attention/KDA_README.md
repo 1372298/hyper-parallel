@@ -11,7 +11,7 @@ The public KDA backend names are `eager` and `triton`.
 The validated upstream revision is:
 
 ```text
-fla-org/flash-linear-attention@35dceaee5408e69a555fec34cb215c93c375dabe
+fla-org/flash-linear-attention@6b6f546f9bd10a97be1e8cf2f0120de70cfca482
 ```
 
 The upstream project is distributed under the MIT License:
@@ -23,7 +23,7 @@ Hyper-Parallel environment:
 
 ```bash
 FLA_REPOSITORY="https://github.com/fla-org/flash-linear-attention"
-FLA_REVISION="35dceaee5408e69a555fec34cb215c93c375dabe"
+FLA_REVISION="6b6f546f9bd10a97be1e8cf2f0120de70cfca482"
 pip install --no-deps "git+${FLA_REPOSITORY}@${FLA_REVISION}"
 ```
 
@@ -34,4 +34,8 @@ fallback.
 
 The `_triton/kimi_delta_attention/state_summary.py` file is Hyper-Parallel's
 own fixed-shape affine summary implementation. It is retained because FLA's
-public KDA API does not expose the P2P boundary required by Hyper-Parallel.
+public KDA API does not expose the state exchange required by Hyper-Parallel.
+S/G follow the Ascend local h/dhu kernels; M uses explicit FP32 chunk
+transfers. Backward reuses the cached local M transpose. See the
+[KDA CP guide](../../../../../docs/guide/kda_context_parallel.md) for the
+numerical scope and the distinction from FLA's generic CP path.
