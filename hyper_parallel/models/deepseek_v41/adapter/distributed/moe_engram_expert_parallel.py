@@ -82,16 +82,44 @@ def _deepseek_v41_grouped_expert_forward(
     )
 
 
+def _local_router_metadata(tensor: torch.Tensor | None, states: torch.Tensor, tp_mesh: Any) -> torch.Tensor | None:
+    """Slice CP-local metadata when an EP router keeps the TP sequence shard."""
+    if tensor is None or tensor.shape == states.shape[:-1]:
+        return tensor
+    local_length = states.shape[-2]
+    if tp_mesh is None or tensor.shape[-1] != local_length * tp_mesh.size():
+        raise ValueError("router metadata must match the local or TP-gathered token dimensions")
+    return tensor.narrow(-1, tp_mesh.get_local_rank() * local_length, local_length)
+
+
+def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any) -> tuple[Any, ...]:
+    """Configure bias-update groups and return the router's token-partition groups."""
+    sequence_groups = tuple(
+        axis.get_group() for axis in (cp_mesh, tp_mesh)
+        if axis is not None and axis.size() > 1
+    )
+    dp_groups = tuple(
+        mesh[name].get_group() for name in (mesh.mesh_dim_names if mesh is not None else ())
+        if name in ("dp", "dp_replicate", "dp_shard") and mesh[name].size() > 1
+    )
+    gate.expert_bias_update_groups = dp_groups + sequence_groups
+    return sequence_groups
+
+
 def _router(
         module: Any,
         hidden_states: torch.Tensor,
         image_mask: torch.Tensor | None = None,
+        router_token_mask: torch.Tensor | None = None,
+        router_sequence_ids: torch.Tensor | None = None,
+        router_num_sequences: int | None = None,
+        sequence_partition_groups: tuple[Any, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the V4.1 learned router's selected experts and weights."""
-    output = (
-        module.gate(hidden_states)
-        if image_mask is None
-        else module.gate(hidden_states, image_mask=image_mask)
+    output = module.gate(
+        hidden_states, image_mask=image_mask, token_mask=router_token_mask,
+        sequence_ids=router_sequence_ids, num_sequences=router_num_sequences,
+        sequence_partition_groups=sequence_partition_groups,
     )
     if not isinstance(output, (tuple, list)) or len(output) != 3:
         raise TypeError("DeepSeek-V4.1 gate must return logits, weights, and indices")
@@ -104,14 +132,20 @@ def _routed_and_shared_forward(
         hidden_states: torch.Tensor,
         image_mask: torch.Tensor | None,
         ep_group: Any,
+        router_token_mask: torch.Tensor | None = None,
+        router_sequence_ids: torch.Tensor | None = None,
+        router_num_sequences: int | None = None,
+        sequence_partition_groups: tuple[Any, ...] = (),
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
-    routed = ep_routed_forward(
-        module,
-        hidden_states,
-        router_fn=lambda target_module, target_states: _router(target_module, target_states, image_mask),
-        ep_group=ep_group,
-    )
+    def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route with statistics over the current token partitions."""
+        return _router(
+            target, states, image_mask, router_token_mask, router_sequence_ids,
+            router_num_sequences, sequence_partition_groups=sequence_partition_groups,
+        )
+
+    routed = ep_routed_forward(module, hidden_states, router_fn=router_fn, ep_group=ep_group)
     return routed + module.shared_experts(hidden_states)
 
 
@@ -125,31 +159,64 @@ def deepseek_v41_ep_compute_fn(
         ep_mesh: Any,
         use_grouped_gemm: bool = False,
 ) -> Callable:
-    """Build the complete V4.1 routed-plus-shared expert forward."""
-    del mesh, cp_mesh
+    """Build EP routed/shared computation with optional auxiliary statistics.
+
+    CP and TP partition tokens inside the EP region. Bias updates additionally
+    reduce DP axes; expert dispatch itself is never a statistics axis. Router
+    coefficients independently disable sequence loss and bias updates at zero.
+    """
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
+    sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
+    ep_group = ep_mesh.get_group("ep")
+    tp_size = 1 if tp_mesh is None else tp_mesh.size()
+    tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     apply_gate = (
         module.experts._apply_gate  # pylint: disable=protected-access
         if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
     )
     if use_grouped_gemm:
         module.experts.forward_expert_major = MethodType(
-            _deepseek_v41_grouped_expert_forward,
-            module.experts,
+            _deepseek_v41_grouped_expert_forward, module.experts,
         )
-    ep_group = ep_mesh.get_group("ep")
-    tp_size = 1 if tp_mesh is None else tp_mesh.size()
-    tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     bind_local_expert_forward(
-        module,
-        ep_mesh["ep"].size(),
-        use_grouped_gemm=use_grouped_gemm,
+        module, ep_mesh["ep"].size(), use_grouped_gemm=use_grouped_gemm,
         apply_gate=None if use_grouped_gemm else apply_gate,
     )
+
+    def auxiliary_compute_fn(
+            module: Any,
+            hidden_states: torch.Tensor,
+            input_ids: torch.Tensor | None = None,
+            image_mask: torch.Tensor | None = None,
+            router_token_mask: torch.Tensor | None = None,
+            router_sequence_ids: torch.Tensor | None = None,
+            router_num_sequences: int | None = None,
+    ) -> torch.Tensor:
+        """Run text and image routing through the same dispatch/combine path.
+
+        Args:
+            module: MLP owning routed and shared experts.
+            hidden_states: Token activations before expert dispatch.
+            input_ids: Unused by learned routing.
+            image_mask: Optional image-token mask.
+            router_token_mask: Optional valid-token mask.
+            router_sequence_ids: Optional packed logical sample IDs.
+            router_num_sequences: Global sample count within this microbatch.
+        """
+        del input_ids
+        return _routed_and_shared_forward(
+            module, hidden_states, _local_router_metadata(image_mask, hidden_states, tp_mesh), ep_group,
+            router_token_mask=_local_router_metadata(router_token_mask, hidden_states, tp_mesh),
+            router_sequence_ids=_local_router_metadata(router_sequence_ids, hidden_states, tp_mesh),
+            router_num_sequences=router_num_sequences, sequence_partition_groups=sequence_groups,
+        )
+
+    if "router_token_mask" in inspect.signature(module.forward).parameters:
+        return auxiliary_compute_fn
 
     if "image_mask" not in inspect.signature(module.forward).parameters:
         def text_compute_fn(
@@ -198,14 +265,12 @@ def deepseek_v41_megamoe_compute_fn(
 ) -> Callable:
     """Bind a declaratively replaced expert module to the full EP mesh.
 
-    The source router, visual routing bias and shared experts retain their
-    original semantics. Parameter sharding and FSDP remain framework-owned.
+    Router statistics reduce CP/TP token partitions; bias updates also reduce
+    DP axes. Parameter sharding and FSDP remain framework-owned.
     """
-    del mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 MegaMoe")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 MegaMoe requires learned routing")
-    del cp_mesh  # Pointwise experts consume the sequence rows already owned by CP.
     if not isinstance(module.experts, DeepseekV41MegaMoeExperts):
         raise TypeError("MegaMoe compute requires the DeepseekV41MegaMoeExperts module replacement")
     if _swiglu_limit(module.shared_experts.limit) != module.experts.swiglu_limit:
@@ -221,13 +286,27 @@ def deepseek_v41_megamoe_compute_fn(
     tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     if dist.is_initialized() and dist.get_world_size(ep_group) != ep_size:
         raise ValueError("MegaMoe EP mesh and process group sizes must match")
+    sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
     module.experts.configure(ep_group, ep_size, module.gate.top_k)
 
     def compute_fn(
             module: Any, hidden_states: torch.Tensor,
             input_ids: torch.Tensor | None = None, image_mask: torch.Tensor | None = None,
+            router_token_mask: torch.Tensor | None = None,
+            router_sequence_ids: torch.Tensor | None = None,
+            router_num_sequences: int | None = None,
     ) -> torch.Tensor:
-        """Run original routing and shared experts around the MegaMoe call."""
+        """Run training-aware routing and shared experts around the MegaMoe call.
+
+        Args:
+            module: MLP owning the router and experts.
+            hidden_states: Token activations before expert dispatch.
+            input_ids: Unused by learned routing.
+            image_mask: Optional CP-local image-token mask.
+            router_token_mask: Optional CP-local valid-token mask.
+            router_sequence_ids: Optional CP-local packed sample IDs.
+            router_num_sequences: Total logical sample count in the microbatch.
+        """
         del input_ids
         local_image_mask = local_token_mask(
             image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
@@ -235,7 +314,12 @@ def deepseek_v41_megamoe_compute_fn(
         if local_image_mask is not None:
             # Slicing multiple batch rows leaves gaps, which native MegaGate rejects.
             local_image_mask = local_image_mask.contiguous()
-        indices, weights = _router(module, hidden_states, local_image_mask)
+        indices, weights = _router(
+            module, hidden_states, local_image_mask,
+            router_token_mask=_local_router_metadata(router_token_mask, hidden_states, tp_mesh),
+            router_sequence_ids=_local_router_metadata(router_sequence_ids, hidden_states, tp_mesh),
+            router_num_sequences=router_num_sequences, sequence_partition_groups=sequence_groups,
+        )
         return module.experts(hidden_states, indices, weights) + module.shared_experts(hidden_states)
 
     if "image_mask" in inspect.signature(module.forward).parameters:
