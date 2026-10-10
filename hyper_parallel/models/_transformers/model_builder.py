@@ -66,6 +66,11 @@ from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.codegen.modeling_backend import ModelingBackend
 from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
+from hyper_parallel.models.external_state import (
+    ExternalBuildContext,
+    ExternalLoadContext,
+    get_model_external_state,
+)
 from hyper_parallel.models.replacement import _apply_module_replacement_actions
 
 logger = logging.getLogger(__name__)
@@ -88,6 +93,10 @@ def instantiate_infrastructure(
 
     Returns:
         (sharding_planner, fsdp2_manager) tuple.
+
+    Args:
+        distributed_setup: Distributed training configuration.
+        device: Target device.
     """
     del kwargs, device
     # ShardingPlanner — already implemented in distributed/_builder.
@@ -376,8 +385,11 @@ def _initialize_model_weights(model: nn.Module) -> None:
     """Initialize materialized state through the model's native contract."""
     for module in model.modules():
         module._is_hf_initialized = False  # pylint: disable=W0212
+    external = get_model_external_state(model)
+    external_ids = {id(parameter) for parameter in external.parameters.values()} if external else set()
     for tensor in (*model.parameters(), *model.buffers()):
-        tensor._is_hf_initialized = False  # pylint: disable=W0212
+        if id(tensor) not in external_ids:
+            tensor._is_hf_initialized = False  # pylint: disable=W0212
 
     initialize_weights = getattr(model, "initialize_weights", None)
     native_initialization = callable(initialize_weights)
@@ -551,15 +563,37 @@ def _materialize_and_load_model(
     model = _move_model_to_device(model, is_meta_device, device)
     if not is_meta_device:
         return model
+    external = get_model_external_state(model)
+    external_result = None
+    if external is not None:
+        external_result = external.materialize(ExternalLoadContext(
+            load_base_model=load_base_model,
+            pretrained_path=pretrained_path,
+            weights_mapping=weights_mapping,
+        ))
+        if external_result.target_fqns != frozenset(external.parameters):
+            raise RuntimeError("External materialization did not cover exactly its parameters")
     if load_base_model:
         load_report = CheckpointManager(model).load_checkpoint(
-            pretrained_path, strict=False, weights_mapping=weights_mapping
+            pretrained_path, strict=False, weights_mapping=weights_mapping,
+            external_target_fqns=(external_result.target_fqns if external_result else frozenset()),
+            claimed_source_keys=(external_result.source_keys if external_result else frozenset()),
         )
+        if external_result is not None:
+            load_report = type(load_report)(
+                loaded_keys=tuple(sorted(set(load_report.loaded_keys) | external_result.target_fqns)),
+                missing_keys=load_report.missing_keys,
+                unexpected_keys=load_report.unexpected_keys,
+            )
         load_report = _finalize_model_loading(model, load_report, strict=True)
         model._hp_checkpoint_load_report = load_report  # pylint: disable=protected-access
         reason = "checkpoint_load"
     else:
+        fingerprint = getattr(external, "weight_digests", None)
+        before_init = fingerprint() if fingerprint is not None else None
         _initialize_model_weights(model)
+        if fingerprint is not None and fingerprint() != before_init:
+            raise RuntimeError("External model parameters changed during ordinary weight initialization")
         reason = "random_init"
     rebuild_materialized_state(
         model,
@@ -569,6 +603,107 @@ def _materialize_and_load_model(
             strict=True,
         ),
     )
+    if external is not None:
+        external.check_identities()
+    return model
+
+
+def _validate_external_state_build(external: Any, compile_for_execution: bool,
+                                   distributed_setup: Any,
+                                   fsdp2_manager: Optional[FSDP2Manager],
+                                   model_init_dtype: Optional[torch.dtype]) -> None:
+    """Reject unsupported optimizer, compile, and FSDP precision settings."""
+    if external is None:
+        return
+    if compile_for_execution:
+        raise ValueError("External Host state does not support torch.compile")
+    fp32_main_params = getattr(distributed_setup, "fp32_main_params", None)
+    expected_reduce_dtype = {
+        (torch.float32, True): "float32",
+        (torch.bfloat16, False): "bfloat16",
+    }.get((model_init_dtype, fp32_main_params))
+    if expected_reduce_dtype is None:
+        raise ValueError("External Host state requires float32 with fp32 main parameters "
+                         "or bfloat16 without fp32 main parameters")
+    precision = getattr(getattr(fsdp2_manager, "config", None), "mix_precision", None)
+    if (precision is None or precision.param_dtype != "bfloat16"
+            or precision.reduce_dtype != expected_reduce_dtype
+            or precision.cast_forward_inputs or precision.output_dtype is not None):
+        raise ValueError(f"External Host state requires BF16 forward and {expected_reduce_dtype} reduction policy")
+
+
+def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
+                           source_shard_info: Any, device: Optional[torch.device],
+                           is_meta_device: bool, model_init_dtype: Optional[str],
+                           validate_placement: bool, compile_for_execution: bool,
+                           distributed_setup: Any, fsdp2_manager: Optional[FSDP2Manager]) -> Any:
+    """Create and validate the model-owned external state after sharding."""
+    config = getattr(model, "config", None)
+    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
+    adapter_spec = None
+    for identity in identities:
+        if identity:
+            adapter_spec = get_model_adapter(identity)
+            if adapter_spec is not None:
+                break
+    provider = getattr(adapter_spec, "external_state", None)
+    if provider is None:
+        return None
+    resolved_dtype = _resolve_model_init_dtype(model_init_dtype)
+    external = provider(model, ExternalBuildContext(  # pylint: disable=not-callable
+        mesh_context=mesh,
+        source_shard_info=source_shard_info,
+        init_device=device if is_meta_device else None,
+        model_init_dtype=resolved_dtype,
+        validate_placement=validate_placement,
+    ))
+    model._hp_external_state = external  # pylint: disable=protected-access
+    _validate_external_state_build(external, compile_for_execution, distributed_setup, fsdp2_manager, resolved_dtype)
+    return external
+
+
+def _maybe_apply_module_replacements(
+    model: nn.Module,
+    codegen_artifact_dir: Optional[str],
+    distributed_setup: Optional[Any],
+    low_precision_config: Optional[Any],
+    load_base_model: bool,
+    weights_mapping: Any,
+) -> tuple:
+    """Apply structure-preserving replacements unless codegen already did."""
+    if _module_replacements_covered_by_generated(codegen_artifact_dir):
+        logger.info(
+            "codegen: module overrides already applied by the generated __init__; "
+            "skipping native module replacement"
+        )
+        return model, weights_mapping
+    return _apply_module_replacement_actions(
+        model,
+        getattr(distributed_setup, "module_replacements", None),
+        weights_mapping=weights_mapping,
+        context=_build_replacement_context(distributed_setup, low_precision_config),
+        capture_checkpoint_metadata=load_base_model,
+    )
+
+
+def _apply_fsdp2_with_external(
+    model: nn.Module,
+    fsdp2_manager: Optional[FSDP2Manager],
+    source_shard_info: Any,
+    external: Optional[Any],
+) -> nn.Module:
+    """Wrap FSDP2 around the model, excluding external-state parameters."""
+    ignored_params = set(external.parameters.values()) if external is not None else None
+    # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
+    # as DTensors, and FSDP derives their source layouts directly.
+    model = _apply_fsdp2(
+        model,
+        fsdp2_manager,
+        source_shard_info,
+        ignored_params=ignored_params,
+    )
+    if external is not None:
+        model._hp_external_state = external  # pylint: disable=protected-access
     return model
 
 
@@ -615,19 +750,10 @@ def apply_model_infrastructure(
 
     # Step 5.5: structure-preserving replacement before plan derivation.
     weights_mapping = get_model_conversion_mapping(model)
-    if _module_replacements_covered_by_generated(codegen_artifact_dir):
-        logger.info(
-            "codegen: module overrides already applied by the generated __init__; "
-            "skipping native module replacement"
-        )
-    else:
-        model, weights_mapping = _apply_module_replacement_actions(
-            model,
-            getattr(distributed_setup, "module_replacements", None),
-            weights_mapping=weights_mapping,
-            context=_build_replacement_context(distributed_setup, low_precision_config),
-            capture_checkpoint_metadata=load_base_model,
-        )
+    model, weights_mapping = _maybe_apply_module_replacements(
+        model, codegen_artifact_dir, distributed_setup, low_precision_config,
+        load_base_model, weights_mapping,
+    )
     if is_meta_device:
         _apply_materialization_adapter(model)
 
@@ -660,13 +786,11 @@ def apply_model_infrastructure(
         selection=activation_checkpoint_selection,
         allow_cache_entry_mutation=allow_cache_entry_mutation,
     )
-    # Step 10: both dual modes use FSDP2. In validate mode the parameters stay
-    # as DTensors, and FSDP derives their source layouts directly.
-    model = _apply_fsdp2(
-        model,
-        fsdp2_manager,
-        source_shard_info,
+    external = _create_external_state(
+        model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
+        validate_placement, compile_for_execution, distributed_setup, fsdp2_manager,
     )
+    model = _apply_fsdp2_with_external(model, fsdp2_manager, source_shard_info, external)
 
     # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _materialize_and_load_model(
@@ -681,6 +805,8 @@ def apply_model_infrastructure(
     # Final dtype conversion belongs to the atomic build (05 stage-5 item
     # 5): the Trainer never patches model dtype after construction.
     apply_model_init_dtype(model, model_init_dtype)
+    if external is not None:
+        external.check_identities()
 
     # Step 13: compile only the execution model, after FSDP and loading.
     if compile_for_execution:
@@ -751,14 +877,17 @@ def _validate_model_state_dtype(
         target_dtype: torch.dtype,
 ) -> None:
     """Validate floating model parameters and buffers against a resolved dtype."""
+    external = get_model_external_state(model)
+    external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
     mismatched = [
         name
-        for name, tensor in (
-            list(model.named_parameters(remove_duplicate=False))
-            + list(model.named_buffers(remove_duplicate=False))
-        )
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
+        for name, tensor in model.named_parameters(remove_duplicate=False)
+        if id(tensor) not in external_ids and tensor.is_floating_point() and tensor.dtype != target_dtype
     ]
+    mismatched.extend(
+        name for name, tensor in model.named_buffers(remove_duplicate=False)
+        if tensor.is_floating_point() and tensor.dtype != target_dtype
+    )
     if mismatched:
         raise RuntimeError(
             "Model initialization dtype validation failed for: "
@@ -838,7 +967,7 @@ def _validate_optimize_dtype(
         model: nn.Module,
         fp32_main_params: bool,
 ) -> None:
-    """Reject low-precision parameters when fp32 optimizer updates are disabled.
+    """Reject FP16 parameters without FP32 main parameters.
 
     This check runs after model loading and ``model_init_dtype`` conversion,
     before optimizer construction, so model initialization choices determine
@@ -847,22 +976,18 @@ def _validate_optimize_dtype(
     if fp32_main_params:
         return
 
-    low_precision_parameters = [
-        (name, parameter.dtype)
+    fp16_parameters = [
+        name
         for name, parameter in model.named_parameters()
-        if parameter.dtype in (torch.float16, torch.bfloat16)
+        if parameter.dtype == torch.float16
     ]
-    if not low_precision_parameters:
+    if not fp16_parameters:
         return
 
-    parameter_summary = ", ".join(
-        f"{name} ({dtype})" for name, dtype in low_precision_parameters[:5]
-    )
-    if len(low_precision_parameters) > 5:
+    parameter_summary = ", ".join(fp16_parameters[:5])
+    if len(fp16_parameters) > 5:
         parameter_summary += ", ..."
     raise ValueError(
-        "Optimizer updates require fp32 model parameters when "
-        "fp32_main_params is disabled; found low-precision parameters: "
-        f"{parameter_summary}. Set optimizer.fp32_main_params=true or set "
-        "model_init_dtype: float32."
+        "FP16 optimizer updates require optimizer.fp32_main_params=true; "
+        f"found FP16 parameters: {parameter_summary}. Set model_init_dtype: bfloat16 or float32."
     )
