@@ -12,14 +12,14 @@ HyperParallel 主项目提供分布式模型构建、训练和并行能力；RL 
 
 | 层次 | 当前职责与边界 | 代码依据 |
 | --- | --- | --- |
-| 主项目 | DTensor、TP、FSDP/HSDP、CP、EP、PP、checkpoint 等基础能力；各模块后端范围分别维护 | `hyper_parallel/core/`、`hyper_parallel/distributed/`、`hyper_parallel/platform/` |
-| RL 运行时 | 同步在线 GRPO/PPO/GSPO；当前模型注册只接受 Qwen3 dense，公开配方面向单节点 Ascend NPU | `hyper_parallel/rl/rl/trainer.py`、`hyper_parallel/rl/rl/roles/model_setup.py` |
-| 训练拓扑 | `dp_replicate=1`、`tp=1` 或 `2`、`cp=pp=ep=1`；`dp_shard` 为正整数 | `hyper_parallel/rl/rl/config.py::_trainer_topology`、`hyper_parallel/rl/rl/config.py::_validate_trainer_ep` |
+| 主项目 | Torch 原生 DTensor、TP、FSDP/HSDP、CP、EP、PP、checkpoint 等基础能力 | `hyper_parallel/core/`、`hyper_parallel/distributed/`、`hyper_parallel/collectives/` |
+| RL 运行时 | 同步 GRPO/PPO/GSPO；代表模型为 Qwen3 dense、Qwen3-MoE 和 Qwen3.5-family text，具体算法边界分别校验 | `hyper_parallel/rl/rl/trainer.py`、`hyper_parallel/rl/rl/roles/model_setup.py` |
+| 训练拓扑 | 各模型族独立校验；Qwen3.5-family 当前限定 FSDP、训练 TP=CP=1 | `hyper_parallel/rl/rl/config.py::_trainer_topology`、`hyper_parallel/rl/rl/config.py::_validate_qwen3_5_scope` |
 | Rollout | 一个共享 vLLM 服务，支持 DP 与 TP；colocated 共用训练设备，disjoint 使用独立设备集；dense 模型拒绝 EP/EPLB | `hyper_parallel/rl/rl/config.py::_validate_vllm`、`hyper_parallel/rl/rl/roles/rollout/topology.py` |
-| 验证范围 | UT 验证合同及局部计算；真实模型、通信与学习效果由明确的 NPU 配方验证 | [功能盘点](../hyper_parallel/rl/docs/current_feature_inventory.md)、[PPO](../hyper_parallel/rl/docs/ppo.md)、[ST](../hyper_parallel/rl/docs/hyper-rl-st.md) |
+| 验证范围 | UT 验证合同及局部计算；真实模型、通信与学习效果由明确的 NPU 配方验证 | [支持范围](../hyper_parallel/rl/README.md#支持范围)、[ST](../hyper_parallel/rl/README.md#系统测试) |
 
 算法注册支持扩展，内置算法为 GRPO/PPO/GSPO；GSPO 的 Qwen3 dense 配方仍待真实 NPU 验收。模型层对 Qwen3 家族身份的接受，不代表任意模型规模、设备或拓扑已验收。
-DeepSeek Harness 是 Agent 程序接入方式，不表示支持 DeepSeek-V3 模型。多节点、MoE、异步/off-policy 等能力
+DeepSeek Harness 是 Agent 程序接入方式，不表示支持 DeepSeek-V3 模型。多节点、异步/off-policy 等能力
 不应从主项目接口或外部目录中的文档推断为当前 RL 已支持。
 
 ## 2. 模块位置与职责
@@ -45,9 +45,14 @@ Qwen3 主项目构建使用通用 `HyperAutoModelForCausalLM` 和 `models/qwen3/
 RL 的实例级构建兼容位于 `hyper_parallel/rl/rl/roles/qwen3_builder.py`，价值头和 Critic 工厂位于
 `hyper_parallel/rl/rl/roles/policy/critic.py`。当前 rollout 的 Hyper Qwen3 实现在
 `hyper_parallel/rl/rl/roles/rollout/consistency_models/qwen3/`，由 `vllm_plugin.py` 注册。
-主项目调用边界和隔离适配理由见 [Qwen3 适配说明](../hyper_parallel/rl/docs/qwen3_master_adaptation.md)。
+主项目调用边界和隔离适配理由见 [模型接入](../hyper_parallel/rl/docs/architecture.md#master-模型接入)。
 
 ## 3. 一步同步训练如何执行
+
+仓库型 Code Agent 复用下述训练链路，在 `examples/swe_smith/` 持有任务、冻结产物与独立 grader。
+Qwen3.5-family 的概率/重算能力位于公共模型目录，RL 使用现有 `rl/weight_sync/` 发布完整文本策略。
+主线 GSPO、奖励模型及 Search-R1 的职责保持原样。合同与复现入口见
+[仓库配方](../hyper_parallel/rl/examples/swe_smith/README.md)。
 
 ```text
 YAML → 配置校验 → 分布式设置、角色、数据源与 vLLM 服务
@@ -75,9 +80,8 @@ Actor 更新 → PPO Critic 更新 → 发布 Actor 策略 → 提交 policy_ver
 
 ## 4. Torch 与平台边界
 
-RL 和 `hyper_parallel/models/qwen3/` 直接使用 Torch 与 Torch distributed API，不通过 Platform 或
-`get_platform()` 调度。主项目仍处于分模块移除平台抽象的阶段，不能把 RL 的规则扩大到全部主项目模块，
-也不能把旧的全局 Platform 禁令重新施加给 Torch 原生组件。
+主项目和 RL 均直接使用 Torch 与 Torch distributed API；Platform/MindSpore 抽象已移除，
+不重新引入 `get_platform()` 调度。RL 的产品支持范围不替代主项目各模块自己的能力与开发规则。
 
 主项目规则以 [AGENTS.md](../AGENTS.md)、[代码风格](../.agent/rules/code-style.md) 和
 [分布式规则](../.agent/rules/distributed.md) 为准。尤其是 Multicore、Pipeline 和 DFunction 已有明确的

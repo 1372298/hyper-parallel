@@ -151,14 +151,19 @@ export HYPER_QWEN3_TP_MAX_STEPS=1
 
 **Qwen3-4B + Search-R1, two Ascend devices.** The Codex agent searches per-question HotpotQA article files in an isolated container. Prepare data with [prepare_data.py](examples/search_r1/prepare_data.py), then follow the [Search-R1 procedure](docs/search_r1.md).
 
-~~~bash
+```bash
 cd hyper_parallel/rl
 bash examples/search_r1/scripts/run_search_r1.sh 0,1 2 /absolute/path/to/prepared-hotpotqa
-~~~
+```
 
 The script uses the unified ARM64 image and verifies optimizer updates, episode artifacts, and the final checkpoint. Reserve both devices and supply the local model and prepared data paths as described in the procedure.
 
 Other entries: [single-turn code](examples/code/README.md), [program agents](docs/agentic_rl.md), [rollout](docs/vllm_rollout.md).
+
+**Qwen3.5-9B + SWE-Smith Code Agent.** 按 [使用说明](examples/swe_smith/README.md) 准备数据和任务镜像，
+先用 `examples.swe_smith.infer` 独立检查求解，再用 `train_rl.py` 和模型配方训练。
+支持本地或 SSH 远端 Docker；与 Search-R1 共用程序扩展及 Trainer。
+已验证范围和后续限制见 [开发说明](docs/swe_smith.md)。
 
 ---
 
@@ -228,6 +233,7 @@ GSM8K 的规则评分与模型评分都在 [agent.py](examples/gsm8k/agent.py)�
 | **单轮与多轮工具任务** | ✅ | Python 定义环境、工具与奖励，共用 token-first 轨迹；环境观察不参与 loss |
 | **单轮 Python code** | ✅ | 私有 stdio 测试、远程 SandboxFusion、全测二值奖励；dense 与 MoE 四卡两步/评估配方已验证，见 [code 示例](examples/code/README.md) |
 | **程序化 Agent** | ◐ | Codex / DeepSeek：真实调用上下文、episode GRPO、DP 补齐和失败归因；自定义程序需适配，见 [Agentic RL](docs/agentic_rl.md) |
+| **仓库型 Code Agent** | ◐ | SWE-Smith 隔离工作区、独立评分与逐调用 GRPO；9B 短预算 RL/恢复及长预算推理已验证，长轨迹学习和全量规模未验证，见[使用说明](examples/swe_smith/README.md) |
 | **采样与部署** | ✅ | Hyper/Native-vLLM；Qwen3 dense 支持共卡与分离部署，MoE 限共卡；DP/TP/EP 组合见 [vLLM Rollout](docs/vllm_rollout.md) |
 | **权重同步与运行保障** | ✅ | 流式 full-gather / 显式 direct-reshard、IPC/HCCL、策略发布校验、checkpoint 恢复及 console / W&B 指标；见[架构合同](docs/architecture.md) |
 | **Bit-Exact 校验** | ✅ | 可选更新前 logprob 校验，仅限 Qwen3 dense + Hyper-vLLM matched TP1/TP2，见[完整条件](docs/qwen3_training_inference_consistency.md) |
@@ -245,13 +251,14 @@ GSPO 默认 `kl_coef=0`，不创建 Reference 或 Critic；GRPO/PPO/GSPO 仅在 
 | :--- | :---: | :--- |
 | **Qwen3 dense** | ✅ | 单节点 GRPO；Hyper/Native-vLLM TP1/TP2，Trainer 支持 TP1、pure TP2 与 FSDP-shard×TP2 |
 | **Qwen3-30B-A3B** | ✅ | Native vLLM、GRPO 共卡；四卡 TP2/EP2/EDP2 的 full-gather 与 direct-reshard 均独立通过两步更新；MoE+code 的 full-gather 两步/评估通过，不支持 Hyper/MoE PPO |
+| **Qwen3.5-9B / Qwen3.8-27B** | ◐ | 公共 text AutoModel、FSDP TP=CP=1、共卡 native-vLLM GRPO 与流式 full-gather；9B 远端短预算闭环已验证，27B 本次迁移后未复验，不声明 bit-exact，见[边界](docs/swe_smith.md) |
 | **Moonlight-16B-A3B-Instruct** | ◐ | Hyper 两步非零学习通过；Native 发布通过，连续非零学习验收未通过 |
 | **Qwen2.5-VL-7B-Instruct** | ○ | 图像数学问答与多模态 Agent |
 | **DeepSeek-V3 完整模型** | ○ | 完整 checkpoint 的多节点同步基线与异步训练对照 |
 
 Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.md#qwen3-30b-a3b)，
 本次迁移的实际验收见 [M1 执行记录](docs/moe_code_agent.md#功能与支持边界)。
-规划依赖与量化标准见 [TODO](docs/TODO.md)，使用限制见[当前边界](#当前边界)。
+后续方向见[规划方向](#规划方向)，使用限制见[当前边界](#当前边界)。
 
 ---
 
@@ -264,7 +271,7 @@ Qwen3-MoE 的具体配置与同步边界见 [vLLM Rollout](docs/vllm_rollout.md#
 - **多模态训练**：以 Qwen2.5-VL-7B-Instruct 的图像数学问答打通视觉 RL，再验证多模态 Agent 交互。
 - **Agent 学习与异步执行**：完善已有多轮环境与程序化接入，以工具和状态化代码任务验证学习效果，扩展长耗时任务的异步执行。
 
-各方向通过完整 recipe、学习结果与资源成本对照验收；模型、依赖及量化标准统一见 [TODO](docs/TODO.md)。世界模型与具身智能属于长期定位，具体交付范围尚待定义。
+各方向通过完整 recipe、学习结果与资源成本对照验收。世界模型与具身智能属于长期定位，具体交付范围尚待定义。
 
 ---
 
@@ -321,6 +328,7 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 | --- | --- |
 | [运行镜像](docker/README.md) | 镜像下载、校验、固定依赖和宿主要求 |
 | [Agentic RL](docs/agentic_rl.md) | 内部环境、Codex / DeepSeek Harness 的配置、轨迹与接入边界 |
+| [Code Agent](examples/swe_smith/README.md) | 隔离仓库、SWE 判题、模型配方与训练入口 |
 | [MoE 模型](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md) | 模型、TP/EP 配置、组件归属与验证边界 |
 | [Qwen3 训练-推理一致性](docs/qwen3_training_inference_consistency.md) | Bit-Exact 定义、recipe 和验收门禁 |
 
@@ -331,7 +339,7 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
 | [设计目标与原则](docs/design.md) | 基础设施选型、模块边界与扩展取舍 |
 | [HyperParallel-RL 架构](docs/architecture.md) | 组件、数据合同、训练生命周期和边界 |
 | [vLLM Rollout](docs/vllm_rollout.md) | 资源归属、采样准入、权重事务与失败语义 |
-| [交付计划](docs/TODO.md) | 阶段任务、依赖关系与验收标准 |
+| [规划方向](#规划方向) | 后续开发方向；实际支持范围以已验收配方为准 |
 
 ### 开发与代码导航
 

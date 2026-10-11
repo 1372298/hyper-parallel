@@ -131,8 +131,8 @@ class TestMoEWeightSync(unittest.TestCase):
         gate, up = "model.layers.0.mlp.experts.0.gate_proj.weight", "model.layers.0.mlp.experts.0.up_proj.weight"
         loaded = []
         model = SimpleNamespace(load_weights=lambda weights: loaded.extend(weights) or {weights[0][0]})
-        worker = SimpleNamespace(_hyper_layerwise_reload=True, _hyper_expected_weights={gate, up},
-                                 _hyper_received_weights=set(), model_config=SimpleNamespace(hf_config=self.config))
+        worker = SimpleNamespace(_rl_layerwise_reload=True, _rl_expected_weights={gate, up},
+                                 _rl_received_weights=set(), model_config=SimpleNamespace(hf_config=self.config))
         reload_module = SimpleNamespace(finalize_layerwise_reload=lambda *args: None,
                                         initialize_layerwise_reload=lambda *args: None)
         source = torch.arange(12, dtype=torch.float32).reshape(4, 3)

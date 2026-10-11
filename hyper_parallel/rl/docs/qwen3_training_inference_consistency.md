@@ -15,7 +15,7 @@ sharding plan；训练侧使用可反向传播的 attention 路径，推理侧�
 执行边界在固定 Ascend recipe 下产生相同的 selected-token raw logprobs。
 
 检查仅覆盖更新前的 selected-token raw logprobs，不覆盖 Native-vLLM、其他模型、TP4/TP8、
-梯度、optimizer state、更新后参数或收敛表现。各拓扑的验收以对应[系统测试](hyper-rl-st.md)为准。
+梯度、optimizer state、更新后参数或收敛表现。各拓扑的验收以对应[系统测试](../README.md#系统测试)为准。
 
 ## Bit-Exact 定义
 
@@ -68,7 +68,7 @@ consistency:
 | 侧         | Profile 行为                                                                                  |
 | ---------- | --------------------------------------------------------------------------------------------- |
 | Trainer    | BF16 forward、FP32 reduce、packed THD、trainable FA2 varlen、batch-invariant ops、NPU RMSNorm |
-| Hyper-vLLM | Qwen3 Hyper adapter、FA3 KV-cache attention、batch-invariant、raw logprobs                    |
+| Hyper-vLLM | Qwen3 model adapter、FA3 KV-cache attention、batch-invariant、raw logprobs                    |
 | Scheduler  | 保留 Prefix Cache/Chunked Prefill，并恢复 discarded partial-prefill 的 RNG offset             |
 | 共同设置   | 相同 checkpoint/tokenizer、selected-token FP32 log-softmax 和 deterministic collectives       |
 

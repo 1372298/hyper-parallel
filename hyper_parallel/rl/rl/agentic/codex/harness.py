@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
+import secrets
 import shutil
 import signal
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -40,12 +43,19 @@ from rl.agentic.core.program_runner import (
 )
 from rl.agentic.core.types import RewardResult
 from rl.dataset.contracts import PromptRecord, Trajectory
+
+
+_LOGGER = logging.getLogger(__name__)
 DEFAULT_CODEX_VERSION = "0.152.1"
 RewardCallable = Callable[[str, PromptRecord], float | RewardResult]
 WorkspaceCallable = Callable[[PromptRecord, Path], None]
 ExecutionCallable = Callable[[list[str], Path, Path, dict[str, str]], tuple[list[str], Path, dict[str, str]]]
 _MODEL_METADATA_FALLBACK = re.compile(
     r"^Model metadata for `[^`]+` not found\. Defaulting to fallback metadata;"
+)
+_COMPACTION_WARNING = (
+    "Heads up: Long threads and multiple compactions can cause the model to be less accurate. "
+    "Start a new thread when possible to keep threads small and targeted."
 )
 
 
@@ -100,7 +110,17 @@ def build_codex_call_trajectories(
         reward_components=reward_components,
         max_episode_tokens=max_episode_tokens,
         metadata=metadata,
+        status_resolver=_repository_call_status,
     )
+
+
+def _repository_call_status(traces: Sequence[Mapping[str, Any]],
+                            metadata: Mapping[str, Any]) -> tuple[bool, str] | None:
+    """Mark every call in a controller-validated repository budget episode as truncated."""
+    del traces
+    if metadata.get("repository_budget_truncated") is True:
+        return True, "max_completions"
+    return None
 
 
 def _toml_string(value: str) -> str:
@@ -154,11 +174,23 @@ def _classify_codex_events(
         ):
             continue
         message = str(item.get("message", ""))
-        if _MODEL_METADATA_FALLBACK.search(message):
+        if _MODEL_METADATA_FALLBACK.search(message) or message == _COMPACTION_WARNING:
             diagnostics.append(event)
         else:
             failed_events.append(event)
     return final_answer, diagnostics, failed_events
+
+
+def _has_completed_codex_turn(output: str) -> bool:
+    """Require the CLI terminal event even when a repository summary is absent."""
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "turn.completed":
+            return True
+    return False
 
 
 def _http_json(
@@ -166,8 +198,14 @@ def _http_json(
     url: str,
     payload: Optional[Mapping[str, Any]],
     timeout: float,
+    admin_token: str | None = None,
+    *, max_response_bytes: int | None = None,
 ) -> dict[str, Any]:
-    return request_gateway_json("Codex", method, url, payload, timeout)
+    """Send a bounded gateway request with optional controller authentication."""
+    if admin_token is not None and max_response_bytes is None:
+        max_response_bytes = 32 * 1024 * 1024
+    return request_gateway_json("Codex", method, url, payload, timeout,
+                                admin_token=admin_token, max_response_bytes=max_response_bytes)
 
 
 class CodexRuntime(HarnessRuntime):
@@ -175,14 +213,22 @@ class CodexRuntime(HarnessRuntime):
 
     def __init__(self, engine: Any, config: Mapping[str, Any]) -> None:
         """Bind the runtime to the existing shared rollout engine."""
+        gateway_options = {
+            "max_inflight_requests": int(config.get("max_inflight_requests", 1)),
+        }
+        for name in ("max_request_bytes", "max_response_bytes"):
+            if name in config:
+                gateway_options[name] = int(config[name])
+        if config.get("admin_auth", False):
+            gateway_options["admin_token"] = secrets.token_urlsafe(32)
         super().__init__(
             engine, config, CodexGateway, "Codex", 8200,
-            gateway_options={"max_inflight_requests": int(config.get("max_inflight_requests", 1))},
+            gateway_options=gateway_options,
         )
 
 
 class CodexAgentProgram:
-    """Run one complete Codex tool loop and return one immutable trajectory."""
+    """Run one Codex tool loop and return policy-aligned call trajectories."""
 
     def __init__(
         self,
@@ -192,12 +238,18 @@ class CodexAgentProgram:
         gateway_url: str,
         config: Mapping[str, Any],
         end_of_turn_token_id: Optional[int],
+        admin_url: str | None = None,
+        admin_token: str | None = None,
     ) -> None:
         """Capture the episode identity and immutable harness settings."""
+        if not isinstance(policy_version, int) or isinstance(policy_version, bool) or policy_version < 0:
+            raise ValueError("Training requires a non-negative policy version")
         self.prompt = prompt
         self.policy_version = policy_version
         self.sample_index = sample_index
         self.gateway_url = gateway_url.rstrip("/")
+        self.admin_url = (admin_url or gateway_url).rstrip("/")
+        self.admin_token = admin_token
         self.config = dict(config)
         self.end_of_turn_token_id = end_of_turn_token_id
         self.reward_callable = _load_reward_callable(self.config.get("reward_callable"))
@@ -205,39 +257,71 @@ class CodexAgentProgram:
         self.execution_callable = _load_execution_callable(self.config.get("execution_callable"))
 
     async def run(self) -> tuple[Trajectory, ...]:
-        """Run Codex, fetch the captured network trace, score it, and convert it."""
+        """Run Codex, freeze and score its output, then construct call trajectories."""
         session_id = uuid.uuid4().hex
         artifact_dir, workspace_dir, codex_home = self._prepare_directories(session_id)
         timeout = float(self.config.get("request_timeout", 600.0))
-        await asyncio.to_thread(
-            _http_json,
-            "POST",
-            f"{self.gateway_url}/internal/sessions",
-            {
+        try:
+            await self._admin_request("POST", "/internal/sessions", {
                 "session_id": session_id,
                 "policy_version": self.policy_version,
                 "artifact_dir": str(artifact_dir),
                 "max_completions": int(self.config["max_turns"]),
                 "generation": self._generation_settings(),
+                **self._session_settings(),
                 "instructions_override": self.config.get("system_instructions"),
                 "enable_thinking": self.config.get("enable_thinking"),
                 "compact_harness_context": self.config.get("compact_harness_context", False),
                 "exec_command_yield_time_ms": self.config.get("exec_command_yield_time_ms"),
-            },
-            timeout,
-        )
-        try:
+            }, timeout)
             return await self._run_registered(
                 session_id, artifact_dir, workspace_dir, codex_home, timeout
             )
         finally:
-            await asyncio.to_thread(
-                _http_json,
-                "DELETE",
-                f"{self.gateway_url}/internal/sessions/{session_id}",
-                None,
-                timeout,
-            )
+            original_error = sys.exc_info()[1]
+            try:
+                await self._admin_request("DELETE", f"/internal/sessions/{session_id}", None, timeout)
+            except Exception:  # pylint: disable=broad-exception-caught
+                if original_error is None:
+                    raise
+                _LOGGER.exception("Codex session cleanup failed while preserving original failure")
+
+    def _session_settings(self) -> dict[str, Any]:
+        """Allow a trusted program to opt into additional gateway protocol checks."""
+        return {}
+
+    async def _admin_request(self, method: str, path: str, payload: Mapping | None,
+                             timeout: float) -> dict[str, Any]:
+        """Settle an in-flight controller request before cancellation cleanup."""
+        options = {}
+        arguments = (method, self.admin_url + path, payload, timeout)
+        if self.admin_token is not None:
+            arguments = (*arguments, self.admin_token)
+            options = {
+                "max_response_bytes": int(self.config.get("max_response_bytes", 32 * 1024 * 1024)),
+            }
+        request = asyncio.create_task(asyncio.to_thread(
+            _http_json, *arguments, **options,
+        ))
+        try:
+            return await asyncio.shield(request)
+        except asyncio.CancelledError:
+            await asyncio.gather(request, return_exceptions=True)
+            raise
+
+    def _captured_failure(self, captured: Mapping[str, Any],
+                          execution_error: Exception | None) -> RewardResult | None:
+        """Return zero only for a verified trainable model failure."""
+        if captured.get("policy_version") != self.policy_version:
+            raise RuntimeError("Codex gateway returned a different policy version")
+        failure = captured.get("failure")
+        if failure is None:
+            return None
+        if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
+                or failure.get("trainable") is not True):
+            raise RuntimeError(f"Codex gateway reported an untrainable failure: {failure}") from execution_error
+        return RewardResult(0.0, {"outcome": 0.0}, dict(failure))
+
 
     async def _run_registered(
         self,
@@ -261,28 +345,21 @@ class CodexAgentProgram:
                 raise RuntimeError(f"Codex exited with status {return_code}; see {artifact_dir}")
         except RuntimeError as error:
             execution_error = error
-        captured = await asyncio.to_thread(
-            _http_json,
-            "GET",
-            f"{self.gateway_url}/internal/sessions/{session_id}",
-            None,
-            timeout,
-        )
-        if captured.get("policy_version") != self.policy_version:
-            raise RuntimeError("Codex gateway returned a different policy version")
-        failure = captured.get("failure")
-        if failure is not None:
-            if (not isinstance(failure, Mapping) or failure.get("failure_origin") != "model"
-                    or failure.get("trainable") is not True):
-                raise RuntimeError(f"Codex gateway reported an untrainable failure: {failure}") from execution_error
-            reward_result = RewardResult(0.0, {"outcome": 0.0}, dict(failure))
-        else:
+        captured = await self._admin_request("GET", f"/internal/sessions/{session_id}", None, timeout)
+        reward_result = self._captured_failure(captured, execution_error)
+        if reward_result is None:
             if execution_error is not None:
                 raise execution_error
             reward_result = self.reward_callable(final_answer, self.prompt)
             if not isinstance(reward_result, RewardResult):
                 reward_value = float(reward_result)
                 reward_result = RewardResult(reward_value, {"outcome": reward_value})
+        return self._build_rows(session_id, artifact_dir, workspace_dir, started, final_answer,
+                                diagnostics, captured, reward_result)
+
+    def _build_rows(self, session_id: str, artifact_dir: Path, workspace_dir: Path, started: float,
+                    final_answer: str, diagnostics: list, captured: Mapping,
+                    reward_result: RewardResult) -> tuple[Trajectory, ...]:
         return build_codex_call_trajectories(
             prompt=self.prompt,
             policy_version=self.policy_version,
@@ -336,15 +413,23 @@ class CodexAgentProgram:
         codex_home.mkdir()
         return artifact_dir, workspace_dir, codex_home
 
-    def _write_codex_config(self, codex_home: Path, session_id: str) -> None:
+    def _write_codex_config(self, codex_home: Path, session_id: str, *, gateway_url: str | None = None,
+                            runtime_home: Path | None = None) -> None:
         """Write the isolated provider and tool configuration for this session."""
-        lines = [
-            'model_provider = "hyper_rl"',
-            'web_search = "disabled"',
+        lines = ['model_provider = "hyper_rl"', 'web_search = "disabled"']
+        instructions = self.config.get("model_instructions")
+        if instructions is not None:
+            if not isinstance(instructions, str) or not instructions.strip():
+                raise ValueError("agentic.codex.model_instructions must be a non-empty string when configured")
+            filename = "model-instructions.md"
+            (codex_home / filename).write_text(instructions, encoding="utf-8")
+            instructions_path = (runtime_home or codex_home.resolve()) / filename
+            lines.append(f"model_instructions_file = {_toml_string(str(instructions_path))}")
+        lines.extend([
             "",
             "[model_providers.hyper_rl]",
             'name = "Hyper-RL local policy"',
-            f"base_url = {_toml_string(self.gateway_url)}",
+            f"base_url = {_toml_string(gateway_url or self.gateway_url)}",
             'env_key = "OPENAI_API_KEY"',
             'wire_api = "responses"',
             "requires_openai_auth = true",
@@ -359,6 +444,8 @@ class CodexAgentProgram:
             "browser_use = false",
             "computer_use = false",
             "image_generation = false",
+        ])
+        lines.extend([
             "",
             "[analytics]",
             "enabled = false",
@@ -368,7 +455,7 @@ class CodexAgentProgram:
             "",
             "[otel]",
             'exporter = "none"',
-        ]
+        ])
         for server in self.config.get("mcp_servers", []):
             if not isinstance(server, Mapping):
                 raise ValueError("Every Codex MCP server configuration must be a mapping")
@@ -607,10 +694,12 @@ class CodexProgramFactory(HarnessProgramFactory):
 
     program_type = CodexAgentProgram
     label = "Codex"
+    include_admin_url = True
 
     def __init__(
         self, runtime: CodexRuntime, end_of_turn_token_id: int | None, generation_config: Mapping[str, Any]
     ) -> None:
+        """Keep the mainline custom program override and authenticated repository runtime."""
         super().__init__(runtime, end_of_turn_token_id, generation_config)
         program = self.config.get("program_callable")
         if program is not None:

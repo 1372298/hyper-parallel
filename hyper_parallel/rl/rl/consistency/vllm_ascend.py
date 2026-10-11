@@ -23,12 +23,12 @@ from functools import wraps
 from typing import Any
 
 
-_PRE_SAMPLE_GENERATOR_OFFSETS = "_hyper_rl_pre_sample_generator_offsets"
+_PRE_SAMPLE_GENERATOR_OFFSETS = "_rl_pre_sample_generator_offsets"
 
 
 def patch_partial_prefill_rng(model_runner_cls: type[Any]) -> None:
     """Restore seeded generators after vLLM discards partial-prefill samples."""
-    if getattr(model_runner_cls, "_hyper_rl_partial_prefill_rng_patched", False):
+    if getattr(model_runner_cls, "_rl_partial_prefill_rng_patched", False):
         return
     original_sample = model_runner_cls._sample
     original_bookkeeping = model_runner_cls._bookkeeping_sync
@@ -84,7 +84,7 @@ def patch_partial_prefill_rng(model_runner_cls: type[Any]) -> None:
 
     model_runner_cls._sample = capture_offsets
     model_runner_cls._bookkeeping_sync = restore_discarded_offsets
-    model_runner_cls._hyper_rl_partial_prefill_rng_patched = True
+    model_runner_cls._rl_partial_prefill_rng_patched = True
 
 
 def install_partial_prefill_rng_fix() -> None:

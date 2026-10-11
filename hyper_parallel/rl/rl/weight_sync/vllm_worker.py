@@ -15,21 +15,28 @@
 """vLLM worker hooks used by Actor-to-rollout weight synchronization."""
 import asyncio
 import base64
+import gc
+from importlib.metadata import version as package_version
+import json
+import logging
 import os
 import pickle
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Optional
 
 # Installed worker hooks share RL-owned version state on foreign vLLM worker instances.
 # vLLM has no public policy-version API for these transaction fields.
 # pylint: disable=protected-access
-import torch
+import torch  # pylint: disable=forbidden-backend-import
+from safetensors import safe_open
 
 from rl.roles.model_setup import (
-    HYPER_QWEN3_ARCHITECTURE,
+    ADAPTED_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_MOE_ARCHITECTURE,
+    NATIVE_QWEN3_5_ARCHITECTURE,
 )
 from rl.weight_sync.model_adapter import rollout_tensor_descriptions
 from rl.weight_sync.packed_weight import unpack_packed_weights
@@ -37,9 +44,10 @@ from rl.weight_sync.vllm_client import KEEP_SCHEDULER_PAUSED_TAG
 
 _SUPPORTED_ARCHITECTURES = frozenset(
     (
-        HYPER_QWEN3_ARCHITECTURE,
+        ADAPTED_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_ARCHITECTURE,
         NATIVE_QWEN3_MOE_ARCHITECTURE,
+        NATIVE_QWEN3_5_ARCHITECTURE,
     )
 )
 
@@ -133,7 +141,7 @@ def _validate_topology(
 
 def get_policy_version(worker: Any) -> dict[str, int]:
     """Return the committed version without touching sleeping model tensors."""
-    return {"version": int(getattr(worker, "_hyper_loaded_policy_version", 0))}
+    return {"version": int(getattr(worker, "_rl_loaded_policy_version", 0))}
 
 
 def _receive_ack(
@@ -157,6 +165,8 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
         raise RuntimeError("vLLM model runner is not initialized")
     if not _is_supported_worker(worker):
         raise ValueError("Direct reshard requires a supported Qwen3 rollout model")
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        raise ValueError("Qwen3.5/Qwen3.8 supports full_gather only")
     topology = _rollout_worker_topology(worker)
     model = worker.model_runner.get_model()
     return {
@@ -164,7 +174,7 @@ def get_direct_reshard_layout(worker: Any) -> dict[str, Any]:
         "model_type": getattr(getattr(worker.model_config, "hf_config", None), "model_type", "qwen3"),
         "tensors": rollout_tensor_descriptions(
             model, getattr(worker.model_config, "hf_config", None),
-            is_hyper=_is_hyper_worker(worker),
+            is_adapted=_is_adapted_worker(worker),
             tp_rank=int(topology["tp_rank"]), tp_size=int(topology["tp_size"]),
         ),
     }
@@ -263,7 +273,7 @@ def init_direct_reshard_group(
     receiver_rank = 1 + dp_rank
     _join_hccl_group(
         worker,
-        attribute="_hyper_direct_reshard_groups",
+        attribute="_rl_direct_reshard_groups",
         group_id=group_id,
         master_address=master_address,
         master_port=master_port,
@@ -307,7 +317,7 @@ def init_packed_weight_group(
     receiver_rank = 1 + dp_rank * int(expected_tensor_parallel_size) + tp_rank
     _join_hccl_group(
         worker,
-        attribute="_hyper_packed_weight_groups",
+        attribute="_rl_packed_weight_groups",
         group_id=group_id,
         master_address=master_address,
         master_port=master_port,
@@ -332,8 +342,8 @@ def _validate_update(worker: Any, policy_version: int, *, transport: str) -> int
     if not bool(getattr(worker, "_weight_update_active", False)):
         raise RuntimeError(f"{transport} requires an active vLLM weight update")
     version = int(policy_version)
-    loaded_version = int(getattr(worker, "_hyper_loaded_policy_version", 0))
-    pending_version = getattr(worker, "_hyper_pending_policy_version", None)
+    loaded_version = int(getattr(worker, "_rl_loaded_policy_version", 0))
+    pending_version = getattr(worker, "_rl_pending_policy_version", None)
     if version <= loaded_version:
         raise ValueError(
             f"{transport} policy version must increase: "
@@ -424,13 +434,13 @@ def receive_direct_reshard(
             "bytes": 0,
         }
     version = _validate_update(worker, policy_version, transport="Direct reshard")
-    groups = getattr(worker, "_hyper_direct_reshard_groups", {})
+    groups = getattr(worker, "_rl_direct_reshard_groups", {})
     group = groups.get(group_id)
     if group is None:
         raise RuntimeError(f"Direct reshard HCCL group {group_id!r} is not initialized")
 
     received_bytes = _receive_direct_buckets(worker, group, buckets)
-    worker._hyper_pending_policy_version = version
+    worker._rl_pending_policy_version = version
     return _receive_ack(
         topology,
         received_bytes,
@@ -549,7 +559,7 @@ def receive_ipc_direct_reshard(
     buckets = payload["buckets_by_target"].get(target_rank, ())
     received_bytes = _apply_ipc_direct_buckets(worker, buckets, physical_npu_id)
 
-    worker._hyper_pending_policy_version = version
+    worker._rl_pending_policy_version = version
     return _receive_ack(
         topology,
         received_bytes,
@@ -569,7 +579,10 @@ def _load_packed_weights(
     if NATIVE_QWEN3_MOE_ARCHITECTURE in _worker_architectures(worker):
         _load_moe_checkpoint_weights(worker, model, weights)
         return
-    if _is_hyper_worker(worker):
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        _load_qwen3_5_checkpoint_weights(worker, model, weights)
+        return
+    if _is_adapted_worker(worker):
         loaded = model.load_weights(weights, require_all=False)
     else:
         loaded = model.load_weights(weights)
@@ -579,20 +592,56 @@ def _load_packed_weights(
         )
 
 
+def _qwen3_5_text_checkpoint_names(worker: Any) -> set[str]:
+    """Read the checkpoint's text policy keys without loading weight tensors."""
+    checkpoint = Path(worker.model_config.model)
+    index_path = checkpoint / "model.safetensors.index.json"
+    if index_path.is_file():
+        names = set(json.loads(index_path.read_text(encoding="utf-8"))["weight_map"])
+    else:
+        with safe_open(str(checkpoint / "model.safetensors"), framework="pt", device="cpu") as weights:
+            names = set(weights.keys())
+    text_names = {name for name in names if name.startswith("model.language_model.")}
+    if not text_names:
+        raise ValueError("Qwen3.5 checkpoint contains no text policy parameters")
+    if not worker.model_config.hf_text_config.tie_word_embeddings:
+        if "lm_head.weight" not in names:
+            raise ValueError("Qwen3.5 checkpoint is missing lm_head.weight")
+        text_names.add("lm_head.weight")
+    return text_names
+
+
+def _load_qwen3_5_checkpoint_weights(worker: Any, model: Any, weights: list[tuple[str, Any]]) -> None:
+    """Publish only complete text policies through the native fused-weight loader."""
+    if not getattr(worker, "_rl_expected_weights", set()):
+        worker._rl_expected_weights = _qwen3_5_text_checkpoint_names(worker)
+        worker._rl_received_weights = set()
+    for name, weight in weights:
+        if name not in worker._rl_expected_weights:
+            raise ValueError(f"Unexpected Qwen3.5 text policy weight {name!r}")
+        if name in worker._rl_received_weights:
+            raise ValueError(f"Duplicate Qwen3.5 text policy weight {name!r}")
+        # A native fused loader may retain an input until another projection arrives.
+        # The IPC producer can release its bucket as soon as this RPC acknowledges.
+        if not model.load_weights([(name, weight.clone())]):
+            raise RuntimeError(f"Native Qwen3.5 loader did not accept weight {name!r}")
+        worker._rl_received_weights.add(name)
+
+
 def _load_moe_checkpoint_weights(worker: Any, model: Any, weights: list[tuple[str, Any]]) -> None:
     """Reload checkpoint tensors with Native layerwise processing and logical coverage."""
     # Native reload restores loader attributes lost during Ascend expert postprocessing.
     from vllm.model_executor.model_loader.reload import initialize_layerwise_reload  # pylint: disable=C0415
 
-    if not getattr(worker, "_hyper_layerwise_reload", False):
+    if not getattr(worker, "_rl_layerwise_reload", False):
         descriptions = get_direct_reshard_layout(worker)["tensors"]
-        worker._hyper_expected_weights = {tensor["name"] for tensor in descriptions}
-        worker._hyper_received_weights = set()
+        worker._rl_expected_weights = {tensor["name"] for tensor in descriptions}
+        worker._rl_received_weights = set()
         with torch.device(worker.device):
             initialize_layerwise_reload(model)
-        worker._hyper_layerwise_reload = True
-    expected = worker._hyper_expected_weights
-    received = worker._hyper_received_weights
+        worker._rl_layerwise_reload = True
+    expected = worker._rl_expected_weights
+    received = worker._rl_received_weights
     expert_prefixes = {name.split(".experts.", maxsplit=1)[0] + ".experts."
                        for name in expected if ".experts." in name}
     for name, weight in weights:
@@ -616,7 +665,7 @@ def _finalize_moe_checkpoint_reload(worker: Any) -> None:
     """Require every local logical weight before finalizing Native reload once."""
     from vllm.model_executor.model_loader.reload import finalize_layerwise_reload  # pylint: disable=C0415
 
-    missing = worker._hyper_expected_weights - worker._hyper_received_weights
+    missing = worker._rl_expected_weights - worker._rl_received_weights
     if missing:
         raise RuntimeError(f"MoE checkpoint update is incomplete: missing={sorted(missing)}")
     with torch.device(worker.device):
@@ -634,7 +683,7 @@ def receive_packed_weights(
 ) -> dict[str, Any]:
     """Receive one HCCL bucket and load complete parameters through vLLM."""
     version = _validate_update(worker, policy_version, transport="Packed HCCL")
-    groups = getattr(worker, "_hyper_packed_weight_groups", {})
+    groups = getattr(worker, "_rl_packed_weight_groups", {})
     group = groups.get(group_id)
     if group is None:
         raise RuntimeError(f"Packed HCCL group {group_id!r} is not initialized")
@@ -644,7 +693,7 @@ def receive_packed_weights(
     torch.npu.current_stream().synchronize()
     _load_packed_weights(worker, packed, metadata)
     torch.npu.current_stream().synchronize()
-    worker._hyper_pending_policy_version = version
+    worker._rl_pending_policy_version = version
     topology = _rollout_worker_topology(worker)
     return _receive_ack(topology, total_bytes)
 
@@ -675,7 +724,7 @@ def receive_ipc_packed_weights(
     finally:
         torch.npu.current_stream().synchronize()
         del packed
-    worker._hyper_pending_policy_version = version
+    worker._rl_pending_policy_version = version
     return _receive_ack(
         topology,
         total_bytes,
@@ -685,10 +734,10 @@ def receive_ipc_packed_weights(
 
 def _clear_pending_update(worker: Any) -> None:
     """Reset the pending version before a new update starts."""
-    worker._hyper_pending_policy_version = None
-    worker._hyper_layerwise_reload = False
-    worker._hyper_expected_weights = set()
-    worker._hyper_received_weights = set()
+    worker._rl_pending_policy_version = None
+    worker._rl_layerwise_reload = False
+    worker._rl_expected_weights = set()
+    worker._rl_received_weights = set()
 
 
 def _worker_architectures(worker: Any) -> frozenset[str]:
@@ -699,9 +748,9 @@ def _worker_architectures(worker: Any) -> frozenset[str]:
     return frozenset(architectures or ())
 
 
-def _is_hyper_worker(worker: Any) -> bool:
-    """Return whether the worker hosts a Hyper-registered model."""
-    return HYPER_QWEN3_ARCHITECTURE in _worker_architectures(worker)
+def _is_adapted_worker(worker: Any) -> bool:
+    """Return whether the worker hosts an adapted model."""
+    return ADAPTED_QWEN3_ARCHITECTURE in _worker_architectures(worker)
 
 
 def _is_supported_worker(worker: Any) -> bool:
@@ -714,17 +763,91 @@ def _finish_custom_weight_update(worker: Any) -> None:
     worker._check_weight_transfer_engine()  # pylint: disable=W0212
     if not worker._weight_update_active:  # pylint: disable=W0212
         raise RuntimeError("start_weight_update must be called before finish_weight_update")
-    pending_version = getattr(worker, "_hyper_pending_policy_version", None)
+    pending_version = getattr(worker, "_rl_pending_policy_version", None)
     if pending_version is None:
         raise RuntimeError(
             "finish_weight_update requires received weights with a pending policy version"
         )
-    if getattr(worker, "_hyper_layerwise_reload", False):
+    if getattr(worker, "_rl_layerwise_reload", False):
         _finalize_moe_checkpoint_reload(worker)
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        expected = getattr(worker, "_rl_expected_weights", set())
+        missing = expected - getattr(worker, "_rl_received_weights", set())
+        if not expected or missing:
+            raise RuntimeError(f"Qwen3.5 text policy update is incomplete: missing={sorted(missing)}")
     worker._weight_update_active = False  # pylint: disable=W0212
     worker._is_checkpoint_format = True  # pylint: disable=W0212
-    worker._hyper_loaded_policy_version = pending_version
+    worker._rl_loaded_policy_version = pending_version
+    if NATIVE_QWEN3_5_ARCHITECTURE in _worker_architectures(worker):
+        worker._rl_graph_refresh_pending = not getattr(worker.model_config, "enforce_eager", True)
     _clear_pending_update(worker)
+
+
+def _retire_decode_graphs(wrappers: list[Any], params: Any) -> tuple[list, list]:
+    """Retain old pools while clearing capture and attention metadata for recapture."""
+    retired_entries = [list(wrapper.concrete_aclgraph_entries.values()) for wrapper in wrappers]
+    retired_metadata = [list(field.values()) for field in (
+        params.events, params.handles, params.attn_params, params.workspaces,
+    )]
+    for wrapper in wrappers:
+        wrapper.concrete_aclgraph_entries.clear()
+    for field in (params.events, params.handles, params.attn_params):
+        for size in field:
+            field[size] = []
+    for size in params.workspaces:
+        params.workspaces[size] = None
+    return retired_entries, retired_metadata
+
+
+def _refresh_ascend_decode_graphs(worker: Any) -> None:
+    """Recapture the pinned text decode graphs with new weights and awake KV memory.
+
+    The owned wake operation runs while admission is paused. Ascend 0.23 has no
+    public graph invalidation API, so both its capture entries and attention-task
+    metadata must be released together before using the runner's capture API.
+    """
+    if not getattr(worker, "_rl_graph_refresh_pending", False):
+        return
+    runtime = tuple(package_version(name).split("+", maxsplit=1)[0] for name in ("vllm", "vllm-ascend"))
+    if runtime != ("0.23.0", "0.23.0.post1"):
+        raise RuntimeError("Decode graph publication requires the pinned vLLM/Ascend 0.23.0.post1 runtime")
+    from vllm.compilation.monitor import set_cudagraph_capturing_enabled  # pylint: disable=C0415
+    from vllm.config import CUDAGraphMode  # pylint: disable=C0415
+    from vllm_ascend.compilation import acl_graph  # pylint: disable=C0415
+
+    runner = worker.model_runner
+    if runner.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+        raise RuntimeError("Policy publication only supports FULL_DECODE_ONLY graphs")
+    wrappers = [wrapper for wrapper in acl_graph._acl_graph_wrappers
+                if wrapper.vllm_config is runner.vllm_config]
+    descriptors = [set(wrapper.concrete_aclgraph_entries) for wrapper in wrappers]
+    params = acl_graph.get_graph_params()
+    if not wrappers or not any(descriptors) or params is None:
+        raise RuntimeError("Decode graph publication requires initialized capture entries and attention metadata")
+    torch.npu.synchronize()
+    # Keep the shared pool alive until its replacement captures exist. Retiring
+    # its final graph first invalidates the handle; minting pools grows residency.
+    retired_entries, retired_metadata = _retire_decode_graphs(wrappers, params)
+    gc.collect()
+    try:
+        runner.capture_model()
+    finally:
+        set_cudagraph_capturing_enabled(False)
+    torch.npu.synchronize()
+    for entries in retired_entries:
+        for entry in entries:
+            if entry.aclgraph is not None:
+                entry.aclgraph.reset()
+    retired_entries.clear()
+    retired_metadata.clear()
+    gc.collect()
+    if any(set(wrapper.concrete_aclgraph_entries) != expected
+           or any(entry.aclgraph is None for entry in wrapper.concrete_aclgraph_entries.values())
+           for wrapper, expected in zip(wrappers, descriptors)):
+        raise RuntimeError("Decode graph recapture did not restore every original capture descriptor")
+    worker._rl_graph_refresh_pending = False
+    logging.getLogger(__name__).info("Recaptured decode graphs for policy version %s (%s descriptors)",
+                                     get_policy_version(worker)["version"], sum(map(len, descriptors)))
 
 
 def _patch_ascend_weight_update_lifecycle() -> None:
@@ -744,6 +867,8 @@ def _patch_ascend_weight_update_lifecycle() -> None:
         if (NATIVE_QWEN3_MOE_ARCHITECTURE not in _worker_architectures(worker)
                 or (tags is not None and "weights" not in tags)):
             original_wake(worker, tags)
+            if tags is None or "kv_cache" in tags:
+                _refresh_ascend_decode_graphs(worker)
             return
         model = worker.model_runner.get_model()
         experts = [
@@ -763,7 +888,7 @@ def _patch_ascend_weight_update_lifecycle() -> None:
         """Start one model-owned direct weight-update transaction."""
         if not _is_supported_worker(worker):
             original_start(worker, is_checkpoint_format=is_checkpoint_format)
-            worker._hyper_pending_policy_version = None
+            worker._rl_pending_policy_version = None
             return
         if not is_checkpoint_format:
             raise ValueError("Direct weight transfer requires checkpoint-format names")
@@ -784,10 +909,10 @@ def _patch_ascend_weight_update_lifecycle() -> None:
         else:
             _finish_custom_weight_update(worker)
             return
-        pending_version = getattr(worker, "_hyper_pending_policy_version", None)
+        pending_version = getattr(worker, "_rl_pending_policy_version", None)
         if pending_version is not None:
-            worker._hyper_loaded_policy_version = pending_version
-        worker._hyper_pending_policy_version = None
+            worker._rl_loaded_policy_version = pending_version
+        worker._rl_pending_policy_version = None
     NPUWorker.wake_up = wake_up
     NPUWorker.start_weight_update = start_weight_update
     NPUWorker.finish_weight_update = finish_weight_update
@@ -802,7 +927,7 @@ def _patch_engine_core_wake_lifecycle() -> None:
     original_wake_up = EngineCore.wake_up
 
     def wake_up(engine_core: Any, tags: Optional[list[str]] = None) -> Any:
-        """Handle the Hyper sentinel before vLLM's unconditional scheduler resume."""
+        """Handle the RL sentinel before vLLM's unconditional scheduler resume."""
         if tags is None or KEEP_SCHEDULER_PAUSED_TAG not in tags:
             return original_wake_up(engine_core, tags)
         memory_tags = [tag for tag in tags if tag != KEEP_SCHEDULER_PAUSED_TAG]

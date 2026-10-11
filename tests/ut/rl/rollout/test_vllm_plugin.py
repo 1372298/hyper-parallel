@@ -49,3 +49,34 @@ def test_external_plugin_entry_point_registers_qwen3(monkeypatch: pytest.MonkeyP
     registry.register_model.assert_called_once_with(
         "HyperQwen3ForCausalLM", "rl.roles.rollout.consistency_models.qwen3.model:HyperQwen3ForCausalLM",
     )
+
+
+@pytest.mark.parametrize("pair,supported", [
+    (("0.23.0+empty", "0.23.0.post1"), True),
+    (("0.23.0", "0.22.1rc1"), False),
+    (("0.24.0", "0.23.0.post1"), False),
+])
+def test_plugin_installs_all_private_hooks_only_for_exact_runtime_pairs(
+    monkeypatch: pytest.MonkeyPatch, pair: tuple[str, str], supported: bool,
+) -> None:
+    """Known new versions enable the full adapter; mixed/unknown pairs never do."""
+    versions = dict(zip(("vllm", "vllm-ascend"), pair))
+    hooks = Mock()
+    evidence = Mock()
+    registry = SimpleNamespace(get_supported_archs=lambda: (), register_model=Mock())
+    monkeypatch.setattr(plugin_module, "package_version", versions.__getitem__)
+    monkeypatch.setattr(plugin_module, "install_vllm_weight_sync_hooks", hooks)
+    monkeypatch.setattr(plugin_module, "install_tool_evidence", evidence)
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(ModelRegistry=registry))
+    monkeypatch.delenv("HYPER_RL_CONSISTENCY_PROFILE", raising=False)
+    monkeypatch.delenv("HYPER_RL_TEST_QWEN3_RMS_NORM", raising=False)
+    plugin_module.register_hyper_models()
+    assert hooks.call_args_list[0].kwargs == {"private_lifecycle": False}
+    if supported:
+        assert hooks.call_args_list[1].kwargs == {"private_lifecycle": True}
+        evidence.assert_called_once_with()
+        registry.register_model.assert_called_once()
+    else:
+        assert hooks.call_count == 1
+        evidence.assert_not_called()
+        registry.register_model.assert_not_called()
