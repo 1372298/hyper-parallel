@@ -88,7 +88,7 @@ class DeepseekV41VisionPatchEmbed(nn.Module):
         """Embed ``[patches, 3, patch, patch]`` RGB patches."""
         if patches.ndim != 4 or patches.shape[1] != 3:
             raise ValueError(f"pixel patches must have shape [N, 3, P, P], got {tuple(patches.shape)}")
-        return self.proj(patches.flatten(1))
+        return self.proj(patches.flatten(1).to(self.proj.weight.dtype))
 
 
 class DeepseekV41VisionAttention(nn.Module):

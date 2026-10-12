@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header,forbidden-backend-import
 """forward_rewriter: forward-mutation machinery for the sharding applier.
 
 All boundary forward generation, validation and installation lives here:
@@ -36,12 +37,13 @@ import inspect
 import logging
 import types
 import weakref
-from typing import Any, Callable, List, Sequence
+from typing import Any, Callable, List, Optional, Sequence, Union
 
 import torch
 from torch import nn
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed.recipe_spec import (
     INNER_WRAPPER,
@@ -371,10 +373,11 @@ def _descendant_boundary_fqns(plan, module_fqn):
     module.named_parameters(recurse=True)); the root spec (fqn "") treats
     every other boundary as a descendant.
     """
+    boundaries = [fqn for fqn, spec in plan.modules.items() if spec.is_boundary]
     if module_fqn == "":
-        return [f for f in plan.modules if f]
+        return [f for f in boundaries if f]
     prefix = module_fqn + "."
-    return [f[len(prefix):] for f in plan.modules if f.startswith(prefix)]
+    return [f[len(prefix):] for f in boundaries if f.startswith(prefix)]
 
 
 def _bind_input_indices(boundary, module):
@@ -595,13 +598,28 @@ def _rewrap_local_outputs(output, spec, mesh, mesh_dim_names, module_name):
     return items[0]
 
 
-def rewrap_declared_outputs(output, entries, mesh, *, label):
+def rewrap_declared_outputs(
+    output: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
+    entries: List[tuple[int, str, tuple]],
+    mesh: DeviceMesh,
+    *,
+    label: str,
+) -> Union[torch.Tensor, Sequence[Optional[torch.Tensor]]]:
     """Re-wrap declared local-region outputs with their ``out_src`` layout.
 
     The codegen-runtime counterpart of :func:`_rewrap_local_outputs`:
     ``InstalledBoundary.rewrap_outputs`` calls this with placements it
     pre-resolved from the frozen plan at install time, so the forward-path
     work is a plain replay.  ``None`` and already-DTensor items pass through.
+
+    Args:
+        output: Forward output tensor, or tuple/list of optional tensors.
+        entries: Pre-resolved ``(index, out_name, placements)`` rewrap plan.
+        mesh: Dense mesh the declared outputs shard across.
+        label: Caller label used in error messages.
+
+    Returns:
+        The output with declared entries re-wrapped as DTensors.
     """
     is_sequence = isinstance(output, (tuple, list))
     items = list(output) if is_sequence else [output]
@@ -1127,7 +1145,13 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     ) -> torch.Tensor:
         """Masked vocab-parallel embedding forward: zero out-of-range token
         ids, shift indices by the local vocab offset, and mask the output so
-        it is a pure Partial contribution."""
+        it is a pure Partial contribution.
+
+        Args:
+            input_ids: Global token IDs at the vocab-parallel boundary.
+            *args: Additional original embedding arguments.
+            **kwargs: Additional original embedding keyword arguments.
+        """
         mask = (input_ids >= lo) & (input_ids < hi)
         local_ids = torch.where(mask, input_ids - lo, torch.zeros_like(input_ids))
         out = original_forward(local_ids, *args, **kwargs)
@@ -1155,7 +1179,8 @@ class _ForwardRewriteRequest:
 
     __slots__ = ("target", "forward", "companion_attrs")
 
-    def __init__(self, target, forward, companion_attrs=()):
+    def __init__(self, target: nn.Module, forward: Callable[..., Any], companion_attrs: Any = ()) -> None:
+        """Keep one forward replacement and its companion attribute updates."""
         self.target = target
         self.forward = forward
         self.companion_attrs = dict(companion_attrs)

@@ -94,6 +94,9 @@ class ModelAdapterSpec:
             validation-only dependencies therefore stay outside import paths.
         loss: provider returning model-family output-loss adapters that must
             intercept the model before a full terminal output is materialized.
+        encoder_parallel: lazy provider returning construction-time visual
+            replacement/isolation rules and a factory for a model-bound
+            Encoder-DP/Encoder-CP bridge.
     """
 
     architecture: str
@@ -111,3 +114,4 @@ class ModelAdapterSpec:
     recompute: Optional[Callable[..., RecomputePolicy]] = None
     validation: Optional[Callable[..., Any]] = None
     loss: Optional[Callable[..., Any]] = None
+    encoder_parallel: Optional[Callable[..., Any]] = None

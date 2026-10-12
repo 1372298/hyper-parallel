@@ -82,6 +82,7 @@ class TestRuntimeInputAdapter(unittest.TestCase):
         batch_runtime = OmniParallelBatch.__new__(OmniParallelBatch)
         batch_runtime.runtime_input_adapter = adapter
         batch_runtime.parallel_context = TestRuntimeInputAdapter._parallel_context()
+        batch_runtime.sequence_parallel = False
         return batch_runtime
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",

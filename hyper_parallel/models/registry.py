@@ -40,7 +40,7 @@ import logging
 from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 
@@ -170,7 +170,11 @@ def _discover_family_providers() -> Dict[str, str]:
 
 
 def register_model_adapter(spec: ModelAdapterSpec) -> None:
-    """Register one family's adapter spec (idempotent; conflicts fail fast)."""
+    """Register one family's adapter spec (idempotent; conflicts fail fast).
+
+    Args:
+        spec: Model family provider declaration to register.
+    """
     existing = MODEL_ADAPTER_REGISTRY.get(spec.model_type)
     if existing is not None and existing != spec:
         raise ValueError(
@@ -191,6 +195,9 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
     Accepts any spelling — model_type (``deepseek_v3``), HF architecture
     (``DeepseekV3ForCausalLM``) or the canonical arch name used by the
     planner (``deepseekv3``).
+
+    Args:
+        model_type: Registered model family or architecture spelling.
     """
     spec = MODEL_ADAPTER_REGISTRY.get(model_type)
     if spec is None:
@@ -213,3 +220,22 @@ def get_model_adapter(model_type: str) -> Optional[ModelAdapterSpec]:
             if canonical is not None:
                 spec = MODEL_ADAPTER_REGISTRY.get(canonical)
     return spec
+
+
+def resolve_model_adapter(model: Any) -> Optional[ModelAdapterSpec]:
+    """Resolve an adapter from a constructed model's configuration identity.
+
+    Args:
+        model: Model carrying a configuration with model type or architecture.
+
+    Returns:
+        Registered adapter, or ``None`` when the model has no provider.
+    """
+    config = getattr(model, "config", None)
+    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
+    for identity in identities:
+        if identity:
+            spec = get_model_adapter(identity)
+            if spec is not None:
+                return spec
+    return None
