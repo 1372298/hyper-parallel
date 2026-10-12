@@ -182,16 +182,18 @@ def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
         return function(*args, **kwargs)
 
 
-def checkpoint_exclude_wrapper(module: Any) -> Any:
+def checkpoint_exclude_wrapper(module: Any, *, preserve_inputs: bool = False) -> Any:
     """Wrap a callable whose region is excluded from activation recomputation.
 
     Args:
         module: The module or callable to exclude from recomputation.
+        preserve_inputs: Keep saved inputs instead of rebuilding them from outer
+            replay, for excluded graphs back-propagated before their trunk.
 
     Returns:
         The platform-specific checkpoint exclusion wrapper.
     """
-    return plat.checkpoint_exclude_wrapper(module)
+    return plat.checkpoint_exclude_wrapper(module, preserve_inputs=preserve_inputs)
 
 
 checkpoint_wrapper = plat.checkpoint_wrapper
