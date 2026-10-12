@@ -155,6 +155,7 @@ def _validate_training_sizes(
     rollout: Mapping[str, Any],
     data: Mapping[str, Any],
     algorithm: RLAlgorithm,
+    agentic: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Validate rollout and optimization batch sizes."""
     for field in (
@@ -175,6 +176,8 @@ def _validate_training_sizes(
         )
     mini_batch_size = int(train["response_mini_batch_size"])
     local_responses = int(train.get("prompt_batch_size", 1)) * num_responses
+    if agentic is not None and agentic.get("runner") in {"codex", "deepseek"}:
+        local_responses *= int(agentic.get("max_turns", 1))
     if mini_batch_size > local_responses:
         raise ValueError(
             "train.response_mini_batch_size cannot exceed the local rollout response count: "
@@ -446,10 +449,13 @@ def _validate_trainer_ep(accelerator: Mapping[str, Any]) -> None:
 
 
 def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -> None:
-    """Keep MoE rollout within the native colocated GRPO contract."""
+    """Validate checkpoint-specific RL boundaries before constructing roles."""
     accelerator = required_mapping(required_mapping(config, "train"), "accelerator")
     if model.family == "qwen3":
         _validate_trainer_ep(accelerator)
+        return
+    if model.family == "qwen3_5":
+        _validate_qwen3_5_scope(config, accelerator)
         return
     rollout = required_mapping(config, "rollout")
     vllm = optional_mapping(rollout, "vllm")
@@ -466,6 +472,51 @@ def _validate_model_scope(config: Mapping[str, Any], model: ModelRegistration) -
     if vllm.get("enable_eplb", False):
         raise ValueError("Qwen3-MoE does not support enable_eplb")
     _validate_moe_parallelism(accelerator, model)
+
+
+def _validate_qwen3_5_scope(config: Mapping[str, Any], accelerator: Mapping[str, Any]) -> None:
+    """Limit Qwen3.5-family text policies to the supported FSDP/native rollout path."""
+    rollout = required_mapping(config, "rollout")
+    vllm = optional_mapping(rollout, "vllm")
+    if (rollout.get("engine") != "vllm" or vllm.get("deployment") != "colocated"
+            or vllm.get("model_implementation", "native") != "native"):
+        raise ValueError("Qwen3.5/Qwen3.8 requires colocated native vLLM rollout")
+    if required_mapping(config, "algorithm").get("name") != "grpo":
+        raise ValueError("Qwen3.5/Qwen3.8 currently supports GRPO only")
+    if consistency_profile(config) != CONSISTENCY_PROFILE_OFF:
+        raise ValueError("Qwen3.5/Qwen3.8 requires consistency off")
+    for name in ("tp", "cp", "pp", "dp_replicate", "ep", "edp_shard"):
+        size = accelerator.get(name, 1)
+        if not isinstance(size, int) or isinstance(size, bool) or size != 1:
+            raise ValueError(f"Qwen3.5/Qwen3.8 requires train.accelerator.{name}=1")
+    if vllm.get("enforce_eager", True) is not True:
+        _validate_qwen3_5_graphs(vllm)
+    for name in ("enable_expert_parallel", "enable_eplb", "batch_invariant"):
+        if vllm.get(name, False) is not False:
+            raise ValueError(f"Qwen3.5/Qwen3.8 requires rollout.vllm.{name}=false")
+    if vllm.get("max_num_seqs") is None:
+        raise ValueError("Qwen3.5/Qwen3.8 requires an explicit rollout.vllm.max_num_seqs")
+    resolve_weight_sync_config(
+        optional_mapping(vllm, "weight_sync"), deployment="colocated", model_family="qwen3_5",
+        rollout_tp=int(vllm.get("tensor_parallel_size", 1)),
+    )
+
+
+def _validate_qwen3_5_graphs(vllm: Mapping[str, Any]) -> None:
+    """Bound graph publication to explicit decode captures without cross-DP dispatch."""
+    compilation = vllm.get("compilation_config", {})
+    if (not isinstance(compilation, Mapping) or compilation.get("mode") != 3
+            or compilation.get("cudagraph_mode") != "FULL_DECODE_ONLY"
+            or int(vllm.get("data_parallel_size", 1)) != 1):
+        raise ValueError("Qwen3.5/Qwen3.8 requires enforce_eager=true or mode=3 FULL_DECODE_ONLY with rollout DP=1")
+    sizes = compilation.get("cudagraph_capture_sizes")
+    max_seqs = vllm.get("max_num_seqs")
+    if (not isinstance(max_seqs, int) or isinstance(max_seqs, bool) or max_seqs < 1
+            or not isinstance(sizes, list) or not sizes
+            or any(isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= max_seqs for size in sizes)
+            or sizes != sorted(set(sizes)) or sizes[0] != 1 or sizes[-1] != max_seqs
+            or compilation.get("max_cudagraph_capture_size") != max_seqs):
+        raise ValueError("Qwen3.5/Qwen3.8 decode capture sizes must cover 1 through max_num_seqs explicitly")
 
 
 def _validate_moe_parallelism(accelerator: Mapping[str, Any], model: ModelRegistration) -> None:
@@ -558,8 +609,10 @@ def _validate_gateway_config(config: Mapping[str, Any], prefix: str) -> None:
     if not 0 < port < 65536:
         raise ValueError(f"{prefix}.gateway_port must be in [1, 65535]")
     for name in ("timeout_seconds", "request_timeout"):
-        if float(config.get(name, 0.0)) <= 0.0:
+        if not math.isfinite(float(config.get(name, 0.0))) or float(config.get(name, 0.0)) <= 0.0:
             raise ValueError(f"{prefix}.{name} must be positive")
+    for name, default in (("max_request_bytes", 8 * 1024 * 1024), ("max_response_bytes", 32 * 1024 * 1024)):
+        _positive_integer({name: config.get(name, default)}, name, prefix)
 
 
 def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
@@ -567,10 +620,18 @@ def _validate_codex_agentic(agentic: Mapping[str, Any]) -> None:
     codex = agentic.get("codex")
     if not isinstance(codex, Mapping):
         raise ValueError("agentic.codex must be a mapping for the Codex runner")
-    for name in ("version", "executable", "session_root", "reward_callable"):
+    for name in ("version", "executable", "session_root"):
         value = codex.get(name)
         if not isinstance(value, str) or not value:
             raise ValueError(f"agentic.codex.{name} must be a non-empty string")
+    instructions = codex.get("model_instructions")
+    if instructions is not None and (not isinstance(instructions, str) or not instructions.strip()):
+        raise ValueError("agentic.codex.model_instructions must be a non-empty string when configured")
+    reward = codex.get("reward_callable")
+    if not isinstance(reward, str) or reward.count(":") != 1 or not all(reward.split(":")):
+        raise ValueError("agentic.codex.reward_callable must use module:function syntax")
+    if not isinstance(codex.get("admin_auth", False), bool):
+        raise ValueError("agentic.codex.admin_auth must be a boolean")
     if codex["version"] != "0.152.1":
         raise ValueError("The Codex runner protocol is validated only for codex-cli 0.152.1")
     _validate_gateway_config(codex, "agentic.codex")
@@ -615,6 +676,8 @@ def _validate_external_agentic_rollout(
     engine_name: Any,
     rollout: Mapping[str, Any],
     agentic: Mapping[str, Any],
+    *,
+    model_family: Optional[str] = None,
 ) -> None:
     """Validate requirements shared by Codex and DeepSeek vLLM adapters."""
     display_name = {"codex": "Codex", "deepseek": "DeepSeek"}[runner]
@@ -629,10 +692,25 @@ def _validate_external_agentic_rollout(
     parser = vllm.get("tool_call_parser")
     if not isinstance(parser, str) or not parser:
         raise ValueError(f"The {display_name} runner requires rollout.vllm.tool_call_parser")
-    if parser != "hermes":
-        raise ValueError(f"{display_name} tool evidence currently requires rollout.vllm.tool_call_parser=hermes")
+    expected_parser = "qwen3_coder" if model_family == "qwen3_5" else "hermes"
+    if parser != expected_parser:
+        raise ValueError(
+            f"{display_name} tool evidence requires rollout.vllm.tool_call_parser={expected_parser}"
+        )
     if int(vllm.get("port", 0)) == int(runner_config["gateway_port"]):
         raise ValueError(f"{display_name} gateway_port must differ from rollout.vllm.port")
+    if runner == "codex" and runner_config.get("model_context_window") is not None:
+        context_window = _positive_integer(runner_config, "model_context_window", "agentic.codex")
+        model_limit = _positive_integer(vllm, "max_model_len", "rollout.vllm")
+        output_limit = _positive_integer(rollout, "max_new_tokens", "rollout")
+        # The pinned CLI starts compaction near 90% of its configured window.
+        # Leave room for one response and fixed overhead before vLLM's hard limit.
+        if context_window > model_limit or 9 * context_window // 10 + output_limit + 512 > model_limit:
+            raise ValueError(
+                "Repository Codex context reserve exceeds rollout.vllm.max_model_len: "
+                "require model_context_window <= max_model_len and "
+                "floor(0.9 * model_context_window) + rollout.max_new_tokens + 512 <= max_model_len"
+            )
 
 
 def validate_rollout_and_agentic(
@@ -655,7 +733,9 @@ def validate_rollout_and_agentic(
     _validate_agentic(agentic)
     runner = str(agentic.get("runner", "internal"))
     if runner in {"codex", "deepseek"}:
-        _validate_external_agentic_rollout(runner, engine_name, rollout, agentic)
+        _validate_external_agentic_rollout(
+            runner, engine_name, rollout, agentic, model_family=model_registration.family,
+        )
 
 
 def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
@@ -741,7 +821,7 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     _validate_model_scope(config, model_registration)
     validate_consistency_model_identity(config, model_registration)
     _validate_model_and_data_paths(model, data, evaluation)
-    _validate_training_sizes(train, rollout, data, algorithm)
+    _validate_training_sizes(train, rollout, data, algorithm, agentic)
     _validate_evaluation(evaluation)
     validate_rollout_and_agentic(rollout, agentic, accelerator, model_registration)
     if rollout.get("engine") != "vllm":
@@ -1124,7 +1204,7 @@ def _build_model_target(
 ) -> Target:
     """Build the pretrained causal-language-model target."""
     attention_implementation = trainer_attention_implementation(model_config)
-    if family == "qwen3_moe":
+    if family in ("qwen3_moe", "qwen3_5"):
         builder = HyperAutoModelForCausalLM.from_pretrained
         target_path = "hyper_parallel.models.HyperAutoModelForCausalLM.from_pretrained"
         builder_options = {}
@@ -1279,6 +1359,8 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
     _validate_model_scope(config, registration)
     if critic and registration.family == "qwen3_moe":
         raise ValueError("Qwen3-MoE does not support a Critic model")
+    if critic and registration.family == "qwen3_5":
+        raise ValueError("Qwen3.5/Qwen3.8 does not support a Critic model")
     model_config = required_mapping(config, "model")
     train_config = required_mapping(config, "train")
     accelerator_config = required_mapping(train_config, "accelerator")

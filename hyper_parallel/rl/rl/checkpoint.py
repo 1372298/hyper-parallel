@@ -20,19 +20,22 @@ import json
 import logging
 import os
 import pickle
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import torch
 import torch.distributed as dist
 import yaml
+from transformers import AutoConfig
+
+from rl.reward_model.scoring import scorer_fingerprint
+from rl.utils.monitoring.config import sanitize_config
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
 from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
-from rl.reward_model.scoring import scorer_fingerprint
-from rl.utils.monitoring.config import sanitize_config
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +123,8 @@ class RLCheckpointManager:
                 )
             with manifest_path.open(encoding="utf-8") as handle:
                 manifest = json.load(handle)
+            if not isinstance(manifest, dict):
+                raise RuntimeError("Checkpoint completion manifest must be an object")
             world_size = dist.get_world_size()
             if int(manifest.get("world_size", -1)) != world_size:
                 raise RuntimeError(
@@ -137,6 +142,15 @@ class RLCheckpointManager:
                 raise RuntimeError(f"Checkpoint rank-local state is missing: {rank_state}")
             if not (checkpoint_dir / "extra_state.json").is_file():
                 raise RuntimeError(f"Checkpoint training progress is missing: {checkpoint_dir}")
+            with (checkpoint_dir / "extra_state.json").open(encoding="utf-8") as handle:
+                progress = json.load(handle)
+            if not isinstance(progress, dict):
+                raise RuntimeError("Checkpoint training progress must be an object")
+            step = progress.get("global_step")
+            manifest_step = manifest.get("step")
+            if (any(not isinstance(value, int) or isinstance(value, bool) for value in (step, manifest_step))
+                    or step < 0 or manifest_step != step):
+                raise RuntimeError("Checkpoint manifest step and training global_step must match nonnegative integers")
 
         self.run_synchronized("checkpoint resume preflight", validate_files)
 
@@ -292,6 +306,22 @@ class RLCheckpointManager:
         def export() -> None:
             """All ranks gather; only the writing rank saves tokenizer files."""
             model_config = self.trainer.model.config
+            registration = self.trainer.model_registration
+            export_config = model_config
+            actor_architecture = registration.hf_architecture
+            if getattr(registration, "family", None) == "qwen3_5":
+                # Text Actor weights revert to the original conditional namespace.
+                # Its outer HF configuration must keep the matching model identity.
+                export_config = AutoConfig.from_pretrained(
+                    registration.weights_path, local_files_only=True, trust_remote_code=False,
+                )
+                if model_config.model_type != registration.text_model_type:
+                    raise ValueError("Qwen3.5 Actor configuration must describe the checkpoint text model")
+                if export_config.model_type != registration.model_type:
+                    raise ValueError("Qwen3.5 export configuration must retain the checkpoint model type")
+                actor_architecture = "Qwen3_5ForCausalLM"
+                export_config.text_config = deepcopy(model_config)
+                export_config.text_config.architectures = [actor_architecture]
             try:
                 wrote_weights = CheckpointManager(self.trainer.model).save_pretrained(
                     export_dir,
@@ -300,9 +330,10 @@ class RLCheckpointManager:
             finally:
                 # Transformers serializes the dynamic HSDP class name; inference
                 # loaders need the original architecture registered for this model.
-                model_config.architectures = [self.trainer.model_registration.hf_architecture]
+                model_config.architectures = [actor_architecture]
             if wrote_weights:
-                model_config.save_pretrained(export_dir)
+                export_config.architectures = [registration.hf_architecture]
+                export_config.save_pretrained(export_dir)
                 self.trainer.tokenizer.save_pretrained(str(export_dir))
 
         self.run_synchronized("checkpoint HF export", export)

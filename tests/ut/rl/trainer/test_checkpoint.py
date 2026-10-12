@@ -27,13 +27,26 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.distributed as dist
-from transformers import Qwen3Config, Qwen3ForCausalLM
+from safetensors import safe_open
+from transformers import (
+    AutoModelForCausalLM,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3_5Config,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5TextConfig,
+)
 
 import rl.checkpoint as checkpoint_backend
 from rl.checkpoint import (
     RLCheckpointManager,
     _clone_shared_checkpoint_tensors,
 )
+from rl.roles.model_setup import resolve_model
+
+import hyper_parallel.models._transformers.auto_model as auto_model_backend
+import hyper_parallel.models._transformers.checkpoint_loader as checkpoint_loader_backend
+from hyper_parallel.models import HyperAutoModelForCausalLM
 
 
 class _Stateful:
@@ -322,6 +335,111 @@ def test_final_hf_weights_reload_with_transformers(
         torch.testing.assert_close(restored.state_dict()[name], tensor, rtol=0, atol=0)
     if tie_word_embeddings:
         assert restored.lm_head.weight is restored.model.embed_tokens.weight
+
+
+def _qwen35_export_actor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    """Build actual conditional checkpoint weights through the public CPU text loader."""
+    text = Qwen3_5TextConfig.from_dict({
+        "vocab_size": 64, "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 2,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 16,
+        "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+        "linear_num_key_heads": 2, "linear_num_value_heads": 6,
+        "layer_types": ["linear_attention", "full_attention"], "pad_token_id": 0,
+        "max_position_embeddings": 128, "use_cache": False,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+    })
+    outer = Qwen3_5Config.from_dict({
+        "text_config": text.to_dict(),
+        "vision_config": {"depth": 1, "hidden_size": 32, "intermediate_size": 64, "num_heads": 2,
+                          "out_hidden_size": 32, "num_position_embeddings": 16, "deepstack_visual_indexes": []},
+    })
+    conditional = Qwen3_5ForConditionalGeneration(outer).cpu()
+    source = tmp_path / "conditional-source"
+    conditional.save_pretrained(source)
+    options = {"registry_name": "tiny_qwen35", "name": "qwen3_5", "weights_path": str(source),
+               "tokenizer_path": str(source), "trust_remote_code": False, "tokenizer_trust_remote_code": False}
+    registration = resolve_model(options)
+    # Explicit placement keeps the real public loader hardware-independent.
+    monkeypatch.setattr(auto_model_backend, "_current_device", lambda: torch.device("cpu"))
+    actor = HyperAutoModelForCausalLM.from_pretrained(
+        str(source), torch_dtype=torch.float32, attn_implementation="eager", force_hf=True,
+        local_files_only=True, trust_remote_code=False,
+    )
+    actor.config.rms_norm_eps = 2e-6
+    actor.__class__ = type("HSDPQwen3_5ForCausalLM", (type(actor),), {})
+    with torch.no_grad():
+        actor.model.layers[0].linear_attn.in_proj_qkv.weight.add_(0.01)
+    return actor, registration
+
+
+@pytest.mark.parametrize("writing_rank", [True, False])
+def test_qwen35_hf_export_retains_conditional_identity_and_actual_text_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writing_rank: bool,
+) -> None:
+    """Text policy export preserves native conditional names and public reload identity."""
+    actor, registration = _qwen35_export_actor(tmp_path, monkeypatch)
+    manager, trainer = _manager(tmp_path / "checkpoints")
+    trainer.model = actor
+    trainer.model_registration = registration
+    trainer.tokenizer = MagicMock()
+    monkeypatch.setattr(checkpoint_backend.dist, "get_rank", lambda: 0 if writing_rank else 1)
+    monkeypatch.setattr(checkpoint_loader_backend, "is_initialized", lambda: True)
+
+    manager._export_hf(manager.directory(1))
+
+    export_dir = manager.directory(1) / "hf"
+    assert actor.config.model_type == "qwen3_5_text", f"Expected text Actor, got {actor.config.model_type}"
+    assert actor.config.architectures == ["Qwen3_5ForCausalLM"], (
+        f"Expected actual text architecture, got {actor.config.architectures}"
+    )
+    assert actor.config.rms_norm_eps == 2e-6, f"Expected live Actor epsilon 2e-6, got {actor.config.rms_norm_eps}"
+    if not writing_rank:
+        assert not export_dir.exists(), f"Non-writer unexpectedly created export {export_dir}"
+        trainer.tokenizer.save_pretrained.assert_not_called()
+        return
+    trainer.tokenizer.save_pretrained.assert_called_once_with(str(export_dir))
+    saved_config = json.loads((export_dir / "config.json").read_text(encoding="utf-8"))
+    assert saved_config["model_type"] == "qwen3_5", f"Expected conditional model_type, got {saved_config}"
+    assert saved_config["architectures"] == ["Qwen3_5ForConditionalGeneration"], (
+        f"Expected native conditional architecture, got {saved_config['architectures']}"
+    )
+    assert saved_config["text_config"]["model_type"] == "qwen3_5_text", (
+        f"Expected nested text model_type, got {saved_config['text_config']['model_type']}"
+    )
+    assert saved_config["text_config"]["rms_norm_eps"] == actor.config.rms_norm_eps, (
+        f"Expected actual Actor epsilon {actor.config.rms_norm_eps}, got {saved_config['text_config']['rms_norm_eps']}"
+    )
+    source_config = json.loads((Path(registration.weights_path) / "config.json").read_text(encoding="utf-8"))
+    assert saved_config["vision_config"] == source_config["vision_config"], (
+        f"Expected original vision schema {source_config['vision_config']}, got {saved_config['vision_config']}"
+    )
+    with safe_open(str(export_dir / "model.safetensors"), framework="pt", device="cpu") as checkpoint:
+        expected_keys = {
+            "model.language_model." + name.removeprefix("model.") if name.startswith("model.") else name
+            for name in actor.state_dict()
+        }
+        assert set(checkpoint.keys()) == expected_keys, (
+            f"Expected conditional text keys {expected_keys}, got {set(checkpoint.keys())}"
+        )
+    restored, report = AutoModelForCausalLM.from_pretrained(
+        export_dir, local_files_only=True, trust_remote_code=False, torch_dtype=torch.float32,
+        attn_implementation="eager", output_loading_info=True,
+    )
+    assert not report["missing_keys"] and not report["unexpected_keys"] and not report["mismatched_keys"], (
+        f"Expected complete native text reload, got {report}"
+    )
+    assert set(restored.state_dict()) == set(actor.state_dict()), (
+        f"Expected Actor keys {set(actor.state_dict())}, got restored keys {set(restored.state_dict())}"
+    )
+    for name, tensor in actor.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], tensor, rtol=0, atol=0)
+    exported_registration = resolve_model({
+        "registry_name": "tiny_qwen35_export", "name": "qwen3_5", "weights_path": str(export_dir),
+        "tokenizer_path": str(export_dir), "trust_remote_code": False, "tokenizer_trust_remote_code": False,
+    })
+    assert exported_registration.family == registration.family, (
+        f"Expected original family {registration.family}, got {exported_registration.family}"
+    )
 
 
 @pytest.mark.parametrize("failure_stage", ["preparation", "model", "runtime"])

@@ -17,9 +17,10 @@ from typing import Any, Optional
 
 import torch
 import torch.distributed as dist
+from torch.nn import functional
 
 from rl.algorithm.loss import RLAlgorithm
-from rl.consistency import trainer_sequence_log_probs
+from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_runtime_state, trainer_sequence_log_probs
 from rl.dataset.contracts import ExperienceBatch
 from rl.utils.monitoring.metrics import (
     ActorMetricAccumulator,
@@ -28,6 +29,7 @@ from rl.utils.monitoring.metrics import (
 )
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
 # Role execution uses explicit compute/update APIs; forward remains the Module default.
 class Actor(torch.nn.Module):  # pylint: disable=abstract-method
@@ -87,8 +89,13 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         self,
         sequences: torch.Tensor,
         attention_mask: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute chosen-token log-probabilities at each next-token position."""
+        """Compute next-token probabilities, optionally selecting actions on capable models.
+
+        Unselected positions are zero only when the model declares mask support.
+        Consistency profiles and legacy models retain their complete-vector behavior.
+        """
         if tuple(attention_mask.shape) != tuple(sequences.shape):
             raise ValueError("attention_mask must align with sequences")
         packed_log_probs = trainer_sequence_log_probs(
@@ -98,6 +105,21 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         )
         if packed_log_probs is not None:
             return packed_log_probs
+        if getattr(self.actor_model, "supports_token_log_probs", False):
+            selected_kwargs = {}
+            if action_mask is not None and getattr(self.actor_model, "supports_token_log_probs_mask", False):
+                selected_kwargs["token_log_probs_mask"] = action_mask.bool()
+            log_probs = self.actor_model(
+                input_ids=sequences,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_token_log_probs=True,
+                **selected_kwargs,
+            )
+            if (not isinstance(log_probs, torch.Tensor) or log_probs.dtype != torch.float32
+                    or tuple(log_probs.shape) != (sequences.shape[0], sequences.shape[1] - 1)):
+                raise ValueError("Model token probabilities must be FP32 [batch, sequence_length - 1]")
+            return log_probs
         outputs = self.actor_model(
             input_ids=sequences,
             attention_mask=attention_mask,
@@ -110,6 +132,25 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             dim=-1,
             index=next_token_ids.unsqueeze(-1),
         ).squeeze(-1)
+
+    def _experience_log_probs(self, experience: ExperienceBatch, start: int, end: int) -> torch.Tensor:
+        """Trim selected-output micro-batches while retaining the batch's probability shape."""
+        sequences = experience.sequences[start:end]
+        attention_mask = experience.attention_mask[start:end]
+        padded_length = sequences.shape[1]
+        kwargs = {}
+        if getattr(self.actor_model, "supports_token_log_probs_mask", False):
+            kwargs["action_mask"] = experience.loss_action_mask[start:end]
+            if (experience.trajectories
+                    and consistency_runtime_state()["trainer_recipe"] == CONSISTENCY_PROFILE_OFF):
+                # Canonical trajectories retain the complete context before batch right-padding.
+                length = max(row.token_ids.numel() for row in experience.trajectories[start:end])
+                sequences = sequences[:, :length]
+                attention_mask = attention_mask[:, :length]
+                kwargs["action_mask"] = kwargs["action_mask"][:, :length - 1]
+        log_probs = self.sequence_log_probs(sequences, attention_mask, **kwargs)
+        padding = padded_length - sequences.shape[1]
+        return functional.pad(log_probs, (0, padding)) if padding else log_probs
 
     def compute_log_probs(self, experience: ExperienceBatch) -> torch.Tensor:
         """Compute detached policy log-probabilities in response micro-batches."""
@@ -127,12 +168,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                         start + self._micro_batch_size,
                         experience.sequences.shape[0],
                     )
-                    chunks.append(
-                        self.sequence_log_probs(
-                            experience.sequences[start:end],
-                            experience.attention_mask[start:end],
-                        )
-                    )
+                    chunks.append(self._experience_log_probs(experience, start, end))
         finally:
             self.train(was_training)
         return torch.cat(chunks, dim=0).detach()
@@ -161,10 +197,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             if global_sequences is None or global_sequences <= 0 or global_sequences > global_tokens:
                 raise ValueError("Sequence loss requires 0 < global_sequences <= global_tokens")
             normalizer = global_sequences
-        current_log_probs = self.sequence_log_probs(
-            experience.sequences[start:end],
-            experience.attention_mask[start:end],
-        )
+        current_log_probs = self._experience_log_probs(experience, start, end)
         old_log_probs = experience.old_log_probs[start:end].detach()
         action_mask = experience.loss_action_mask[start:end]
         reference_log_probs = experience.reference_log_probs
@@ -283,7 +316,11 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                     f"got={tuple(tensor.shape)}"
                 )
         response_count = int(sequences.shape[0])
-        if self._response_mini_batch_size > response_count:
+        segmented = bool(experience.trajectories) and all(
+            "episode_id" in row.metadata or row.metadata.get("dp_padding", False)
+            for row in experience.trajectories
+        )
+        if self._response_mini_batch_size > response_count and not segmented:
             raise ValueError(
                 "response_mini_batch_size cannot exceed the local response count: "
                 f"mini_batch={self._response_mini_batch_size}, responses={response_count}"
@@ -362,9 +399,12 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         return tokens, sequences
 
     def _set_gradient_sync(self, is_last_micro_batch: bool) -> None:
-        """Enable HSDP gradient synchronization for the final micro-batch."""
+        """Reduce each offloaded micro-batch, otherwise synchronize at the mini-batch boundary."""
         if isinstance(self.actor_model, HSDPModule):
-            self.actor_model.set_requires_gradient_sync(is_last_micro_batch)
+            # No-sync retains full gradients on device even with CPU parameter offload.
+            # Reduce each micro-batch so offloaded shards can accumulate on CPU instead.
+            offloaded = isinstance(self.actor_model.hsdp_scheduler.offload_policy, CPUOffloadPolicy)
+            self.actor_model.set_requires_gradient_sync(is_last_micro_batch or offloaded)
             self.actor_model.set_is_last_backward(is_last_micro_batch)
 
     def _optimizer_step(self) -> float:

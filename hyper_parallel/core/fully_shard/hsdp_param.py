@@ -986,6 +986,7 @@ class HSDPParamV2:
                 "Expected sharded_param._local_tensor to be contiguous"
             )
 
+    @torch.no_grad()
     def reset_sharded_param(self) -> None:
         """Reset sharded param after load_state_dict.
 

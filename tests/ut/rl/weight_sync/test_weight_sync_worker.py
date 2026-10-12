@@ -82,8 +82,8 @@ def _worker(model: Any) -> Any:
             hf_config=SimpleNamespace(architectures=["HyperQwen3ForCausalLM"])
         ),
         parallel_config=SimpleNamespace(data_parallel_index=0, data_parallel_size=1),
-        _hyper_loaded_policy_version=1,
-        _hyper_pending_policy_version=None,
+        _rl_loaded_policy_version=1,
+        _rl_pending_policy_version=None,
     )
 
 
@@ -147,8 +147,8 @@ def _receive_worker() -> Any:
         ),
         _weight_update_active=True,
         _check_weight_transfer_engine=lambda: None,
-        _hyper_loaded_policy_version=0,
-        _hyper_pending_policy_version=None,
+        _rl_loaded_policy_version=0,
+        _rl_pending_policy_version=None,
     )
 
 
@@ -219,7 +219,7 @@ def test_worker_receives_direct_reshard_and_commits_version(
         ),
     )
     worker = _receive_worker()
-    worker._hyper_direct_reshard_groups = {"route": Group()}
+    worker._rl_direct_reshard_groups = {"route": Group()}
 
     result = receive_direct_reshard(
         worker,
@@ -239,11 +239,11 @@ def test_worker_receives_direct_reshard_and_commits_version(
         "bytes": 16,
         "bucket_count": 1,
     }
-    assert worker._hyper_pending_policy_version == 1
-    assert worker._hyper_loaded_policy_version == 0
+    assert worker._rl_pending_policy_version == 1
+    assert worker._rl_loaded_policy_version == 0
     worker_module._finish_custom_weight_update(worker)
-    assert worker._hyper_loaded_policy_version == 1
-    assert worker._hyper_pending_policy_version is None
+    assert worker._rl_loaded_policy_version == 1
+    assert worker._rl_pending_policy_version is None
     assert synchronizations == ["sync"]
 
 
@@ -280,7 +280,7 @@ def test_worker_receives_packed_hccl_weights_through_model_loader(
         ),
     )
     worker = _receive_worker()
-    worker._hyper_packed_weight_groups = {"packed": Group()}
+    worker._rl_packed_weight_groups = {"packed": Group()}
 
     result = receive_packed_weights(
         worker,
@@ -294,7 +294,7 @@ def test_worker_receives_packed_hccl_weights_through_model_loader(
     torch.testing.assert_close(model.weight, source)
     assert model.load_modes == [False]
     assert result["bytes"] == 16
-    assert worker._hyper_pending_policy_version == 1
+    assert worker._rl_pending_policy_version == 1
 
 
 def test_worker_receives_ipc_reshard_and_releases_buffers_after_sync(
@@ -372,7 +372,7 @@ def test_worker_receives_ipc_reshard_and_releases_buffers_after_sync(
         "bytes": 16,
         "bucket_count": 1,
     }
-    assert worker._hyper_pending_policy_version == 2
+    assert worker._rl_pending_policy_version == 2
     assert synchronizations == ["sync"]
 
 
@@ -444,7 +444,7 @@ def test_worker_receives_ipc_packed_weights_through_model_loader(
                 policy_version=2,
             )
         assert events == ["load-error", "sync"]
-        assert worker._hyper_pending_policy_version is None
+        assert worker._rl_pending_policy_version is None
         assert get_policy_version(worker) == {"version": 0}
         return
 
@@ -458,7 +458,7 @@ def test_worker_receives_ipc_packed_weights_through_model_loader(
     torch.testing.assert_close(model.weight, source)
     assert model.load_modes == [False]
     assert result["bytes"] == 16
-    assert worker._hyper_pending_policy_version == 2
+    assert worker._rl_pending_policy_version == 2
 
 
 def test_worker_initializes_direct_group_for_target_rank(
@@ -521,7 +521,7 @@ def test_worker_initializes_direct_group_for_target_rank(
         "group_rank": 2,
         "group_id": "direct-tp1",
     }
-    assert worker._hyper_direct_reshard_groups == {"direct-tp1": "group-2"}
+    assert worker._rl_direct_reshard_groups == {"direct-tp1": "group-2"}
     assert [call[0][2] for call in group_calls] == [2]
 
     monkeypatch.setattr(
@@ -617,7 +617,7 @@ def test_worker_initializes_one_packed_group_for_all_rollout_workers(
     )
 
     assert result["group_rank"] == 4
-    assert worker._hyper_packed_weight_groups == {"packed": "packed-group"}
+    assert worker._rl_packed_weight_groups == {"packed": "packed-group"}
     assert calls[0][0][2:4] == (4, 5)
 
 
@@ -697,15 +697,15 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["HyperQwen3ForCausalLM"])
         ),
-        _hyper_loaded_policy_version=0,
-        _hyper_pending_policy_version=None,
+        _rl_loaded_policy_version=0,
+        _rl_pending_policy_version=None,
         _weight_update_active=False,
         _is_checkpoint_format=True,
         _check_weight_transfer_engine=lambda: None,
         _check_nz_disabled=lambda: None,
     )
     NPUWorker.start_weight_update(worker)
-    worker._hyper_pending_policy_version = 1
+    worker._rl_pending_policy_version = 1
     NPUWorker.finish_weight_update(worker)
 
     awakened = []
@@ -720,11 +720,11 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["OtherForCausalLM"])
         ),
-        _hyper_loaded_policy_version=0,
-        _hyper_pending_policy_version=None,
+        _rl_loaded_policy_version=0,
+        _rl_pending_policy_version=None,
     )
     NPUWorker.start_weight_update(native_worker, is_checkpoint_format=True)
-    native_worker._hyper_pending_policy_version = 2
+    native_worker._rl_pending_policy_version = 2
     NPUWorker.update_weights(
         native_worker,
         {"name": "native"},
@@ -732,8 +732,8 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
     NPUWorker.finish_weight_update(native_worker)
     EngineCore.wake_up(engine_core, ["kv_cache"])
 
-    assert worker._hyper_loaded_policy_version == 1
-    assert worker._hyper_pending_policy_version is None
+    assert worker._rl_loaded_policy_version == 1
+    assert worker._rl_pending_policy_version is None
     assert worker._weight_update_active is False
     assert original_calls == [
         ("start", native_worker, True),
@@ -742,8 +742,27 @@ def test_worker_hook_installation_runs_custom_update_and_wake_lifecycles(
         ("wake", engine_core, ["kv_cache"]),
     ]
     assert awakened == ["weights"]
-    assert native_worker._hyper_loaded_policy_version == 2
-    assert native_worker._hyper_pending_policy_version is None
+    assert native_worker._rl_loaded_policy_version == 2
+
+    graph_worker = SimpleNamespace(**vars(worker))
+    graph_worker.model_config = SimpleNamespace(enforce_eager=False, hf_config=SimpleNamespace(
+        architectures=[worker_module.NATIVE_QWEN3_5_ARCHITECTURE]))
+    graph_worker._weight_update_active = True
+    graph_worker._rl_pending_policy_version = 3
+    graph_worker._rl_expected_weights = {"model.norm.weight"}
+    graph_worker._rl_received_weights = {"model.norm.weight"}
+    NPUWorker.finish_weight_update(graph_worker)
+    assert graph_worker._rl_graph_refresh_pending, (
+        f"Missing pending refresh: actual={graph_worker._rl_graph_refresh_pending}, expected=True")
+    refreshed = []
+    monkeypatch.setattr(worker_module, "_refresh_ascend_decode_graphs",
+                        lambda value: refreshed.append((value, original_calls[-1])))
+    NPUWorker.wake_up(graph_worker, ["weights"])
+    assert not refreshed, f"Refresh ran before KV wake: actual={refreshed}, expected=[]"
+    NPUWorker.wake_up(graph_worker, ["kv_cache"])
+    expected = [(graph_worker, ("worker_wake", graph_worker, ["kv_cache"]))]
+    assert refreshed == expected, f"Refresh did not follow KV wake: actual={refreshed}, expected={expected}"
+    assert native_worker._rl_pending_policy_version is None
 
 
 def test_finish_weight_update_commits_pending_version() -> None:
@@ -751,14 +770,14 @@ def test_finish_weight_update_commits_pending_version() -> None:
     worker = SimpleNamespace(
         _weight_update_active=True,
         _is_checkpoint_format=True,
-        _hyper_pending_policy_version=1,
-        _hyper_loaded_policy_version=0,
+        _rl_pending_policy_version=1,
+        _rl_loaded_policy_version=0,
         _check_weight_transfer_engine=lambda: None,
     )
     worker_module._finish_custom_weight_update(worker)
 
-    assert worker._hyper_loaded_policy_version == 1
-    assert worker._hyper_pending_policy_version is None
+    assert worker._rl_loaded_policy_version == 1
+    assert worker._rl_pending_policy_version is None
 
 
 def test_worker_reports_native_qwen3_fused_qkv_layout(

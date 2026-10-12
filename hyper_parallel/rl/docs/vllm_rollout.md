@@ -134,6 +134,10 @@ consistency:
   enabled: false
 ```
 
+公开配置值沿用 `hyper/native`，vLLM 插件入口沿用 `register_hyper_models`，
+模型注册名称沿用 `HyperQwen3ForCausalLM`。这些名称属于已有配置及运行环境的兼容接口；
+RL 内部标识符的整改不要求更换镜像、调整依赖版本或迁移已有配置。
+
 HCCL base port 和 socket range 必须成对配置，位于 CANN 支持的 `[1024, 65520]` 内，且 base port 必须包含在
 `START-END` range 中。正式 launcher 会在创建 Docker 容器前验证。
 
