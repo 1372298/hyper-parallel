@@ -329,30 +329,38 @@ def _other_axes_are_replicated(placements, shard_axes) -> bool:
 
 
 def _build_regular_ragged_result(self_layout, output_global_shape, global_dim0, index):
-    """Build the original one-dimensional Shard(0) ragged result."""
+    """Build an owner-only RaggedShard result for a regular dim-zero shard."""
     placements = tuple(self_layout.placements)
-    placement = placements[0] if len(placements) == 1 else None
-    if (
-        len(self_layout.mesh_shape) != 1
-        or not isinstance(placement, Shard)
-        or not placement.is_shard(0)
-    ):
+    shard_axes = _dim0_shard_axes(placements)
+    if len(shard_axes) != 1 or not _other_axes_are_replicated(placements, shard_axes):
         return None
 
-    mesh_size = self_layout.mesh.size(0)
+    shard_axis = shard_axes[0]
+    mesh_size = self_layout.mesh_shape[shard_axis]
     if global_dim0 % mesh_size != 0:
         return None
 
     rows_per_rank = global_dim0 // mesh_size
     owner_rank = index // rows_per_rank
     local_index = index % rows_per_rank
-    local_units = tuple(1 if rank == owner_rank else 0 for rank in range(mesh_size))
-    output_layout = Layout.from_device_mesh(self_layout.mesh)
-    output_layout.set_placements(
-        (RaggedShard(tuple(range(len(output_global_shape))), local_units),)
+    local_units = tuple(
+        1 if rank == owner_rank else 0 for rank in range(mesh_size)
     )
+    output_layout = Layout.from_device_mesh(self_layout.mesh)
+    output_placements = [Replicate() for _ in placements]
+    output_placements[shard_axis] = RaggedShard(
+        tuple(range(len(output_global_shape))), local_units
+    )
+    output_layout.set_placements(tuple(output_placements))
     output_layout.placement_to_tensor_map(len(output_global_shape))
-    return output_layout, (owner_rank, local_index, output_global_shape)
+    if len(placements) == 1:
+        # Preserve the legacy metadata shape used by existing one-dimensional tests.
+        info = (owner_rank, local_index, output_global_shape)
+    else:
+        info = _StridedRaggedIndexInfo(
+            (shard_axis,), (owner_rank,), local_index, output_global_shape
+        )
+    return output_layout, info
 
 
 def _strided_owner_info(self_layout, placements, shard_axes, global_dim0, index):
