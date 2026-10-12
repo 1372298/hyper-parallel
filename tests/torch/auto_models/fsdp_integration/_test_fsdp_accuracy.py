@@ -76,7 +76,7 @@ from hyper_parallel.core.utils import clip_grad_norm_
 
 
 _TEST_YAML_DIRECTORY = Path(__file__).with_name("test_yamls")
-_LOG_DIRECTORY = Path("outputs/dualmode_trainer/fsdp_accuracy/adamw_fp32_main_params")
+_LOG_DIRECTORY = Path("outputs/auto_models/fsdp_integration/adamw_fp32_main_params")
 _INIT_SEED = 31415
 _DATA_SEED = 27182
 _TRAINING_STEPS = 20
