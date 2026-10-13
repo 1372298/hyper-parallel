@@ -19,7 +19,7 @@ import unittest
 
 from torch import nn
 
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed._builder.forward_rewriter import _descendant_boundary_fqns
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
@@ -44,6 +44,10 @@ class _Model(nn.Module):
 
 class TestEncoderPlanner(unittest.TestCase):
     """Verify source-only specs preserve placement and terminal semantics."""
+
+    def tearDown(self) -> None:
+        """Evict backend-less cached sub-meshes so later suites rebuild real groups."""
+        _DEVICE_MESH_MAP.clear()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

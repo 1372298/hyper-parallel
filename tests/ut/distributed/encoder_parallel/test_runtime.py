@@ -21,7 +21,7 @@ import torch
 import yaml
 from torch import nn
 
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_device_mesh
 from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
 from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.distributed.encoder_parallel.runtime import EncoderParallelRuntime
@@ -92,6 +92,10 @@ class TestEncoderRuntime(unittest.TestCase):
             execution_options={"micro_batch_size": 1, "compile_enabled": False,
                                "validate_placement": False},
         )
+
+    def tearDown(self) -> None:
+        """Evict backend-less cached sub-meshes so later suites rebuild real groups."""
+        _DEVICE_MESH_MAP.clear()
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
