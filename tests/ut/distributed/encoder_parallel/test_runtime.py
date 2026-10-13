@@ -14,7 +14,6 @@
 # ============================================================================
 """One-rank visual runtime compared with the unchanged DeepSeek encoder."""
 
-from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
@@ -36,8 +35,17 @@ from hyper_parallel.models.deepseek_v41.vision import (
 )
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements
 from hyper_parallel.trainer.config import entries_to_module_replacements
-from hyper_parallel.trainer.config.resolver import resolve_config
+from hyper_parallel.trainer.config.parallelism import PlanOverride
+from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.common.mark_utils import arg_mark
+
+_VISUAL_RECIPE_RULE = """
+match: "model.vision.blocks.*.attn"
+module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
+replace_module:
+  _target_: >-
+    hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+"""
 
 
 def _make_model(*, apply_recipe: bool = True, vision_depth: int = 2):
@@ -56,10 +64,9 @@ def _make_model(*, apply_recipe: bool = True, vision_depth: int = 2):
     facade.model.image_newline = nn.Parameter(torch.zeros(8))
     if not apply_recipe:
         return facade
-    recipe_path = (Path(__file__).resolve().parents[4] / "examples/training_demo/deepseek_v41"
-                   / "train_deepseek_v41_vlm_encoder_parallel_e0.yaml")
-    recipe = resolve_config(yaml.safe_load(recipe_path.read_text(encoding="utf-8")))
-    rules = entries_to_module_replacements(recipe.plan_overrides)
+    entry = resolve_component(yaml.safe_load(_VISUAL_RECIPE_RULE), annotation=PlanOverride,
+                              path="$.plan_overrides[0]")
+    rules = entries_to_module_replacements([entry])
     visual_rules = tuple(rule for rule in rules if rule.match == ("model.vision.blocks.*.attn",))
     if len(visual_rules) != 1:
         raise AssertionError("The VLM recipe must declare exactly one visual attention replacement")
