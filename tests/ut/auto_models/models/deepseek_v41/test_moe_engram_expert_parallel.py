@@ -300,8 +300,8 @@ class TestV41ClampedGroupedGemm(unittest.TestCase):
                 bind.assert_called_once()
                 self.assertEqual(bind.call_args.args, (module, 2))
                 self.assertIs(bind.call_args.kwargs["use_grouped_gemm"], grouped)
-                states = torch.randn(2, 16)
-                mask = torch.tensor([False, True]) if multimodal else None
+                states = torch.randn(1, 2, 16)
+                mask = torch.tensor([[False, True]]) if multimodal else None
                 with patch(f"{prefix}._routed_and_shared_forward", return_value=states) as routed:
                     output = compute(states, image_mask=mask) if multimodal else compute(states)
                 self.assertIs(output, states)
