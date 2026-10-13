@@ -532,6 +532,7 @@ class HSDPSchedulerV2:
     def _root_backward_hook(self):
         """Drain all DP pipelines, then run final TP reduction and apply gradients."""
         logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
+        self.check_state_prefetch_handles_consumed()
         for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
             # let modules which are not triggered backward_hook launch backward communication.
             hsdp_scheduler._backward_hook()
@@ -544,6 +545,35 @@ class HSDPSchedulerV2:
             self._finalize_comm_fusion_reductions()
             self._finalize_per_param_reductions()
             self.launch_tp_replicate_reduce_and_apply()
+
+    def check_state_prefetch_handles_consumed(self) -> None:
+        """Check that all parameters in the module tree consumed their prefetch work.
+
+        Raises:
+            RuntimeError: If a parameter or fused bucket retains an all-gather
+                handle because the configured prefetch order is incorrect.
+        """
+        unconsumed_param_fqns = []
+        for hsdp_scheduler in self.scheduler_ctx.all_hsdp_schedulers:
+            hsdp_state = hsdp_scheduler.hsdp_state
+            if hsdp_state is None:
+                continue
+            unconsumed_param_fqns.extend(
+                str(param) for param in hsdp_state.hsdp_params
+                if param.allgather_comm_ctx.allgather_handle is not None
+            )
+            if hsdp_state.param_group is not None:
+                for bucket in hsdp_state.param_group.all_gather_buckets:
+                    result = bucket.all_gather_result
+                    if result is not None and result.handle is not None:
+                        unconsumed_param_fqns.extend(str(param) for param in bucket.hsdp_params)
+        if unconsumed_param_fqns:
+            param_fqns = ", ".join(dict.fromkeys(unconsumed_param_fqns))
+            raise RuntimeError(
+                f"Unconsumed prefetch handles for parameters: {param_fqns}. "
+                "The prefetch order is incorrect. Set forward/backward prefetch order "
+                "according to the model's actual execution order."
+            )
 
     def _finalize_comm_fusion_reductions(self) -> None:
         """Drain the comm_fusion=True RS/AR pipeline."""

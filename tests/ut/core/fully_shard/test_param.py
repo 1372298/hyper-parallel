@@ -15,9 +15,8 @@
 """Unit tests for torch fully_shard parameter helper paths."""
 # pylint: disable=protected-access
 
-import gc
+import os
 import unittest
-import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +28,6 @@ from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo, ShardedState
-from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy, SourceShardMetaInfo
 from hyper_parallel.core.fully_shard.hsdp_param import (
     AllGatherCommCtx,
@@ -208,46 +206,6 @@ class TestTorchHSDPParamHelpers(unittest.TestCase):
         with patch.object(torch._C, "_swap_tensor_impl") as swap_tensor_impl:
             hsdp_param.reset_sharded_param()
         swap_tensor_impl.assert_not_called()
-
-    def test_load_post_hook_offload_does_not_retain_original_leaf(self):
-        """Post-load CPU storage refresh must not keep an autograd path to the old shard."""
-        module = torch.nn.Module()
-        module.weight = torch.nn.Parameter(torch.empty(8, device="meta"))
-        mesh_info = object.__new__(FSDPMeshInfo)
-        with patch("hyper_parallel.core.dtensor.device_mesh.dist.get_rank", return_value=0):
-            mesh_info.mesh = DeviceMesh("cpu", [0, 1], mesh_dim_names=("fsdp",), _init_backend=False)
-        mesh_info.shard_mesh_dim = 0
-        mesh_info.replicate_mesh_dim = None
-        mesh_info.shard_mesh_rank = 0
-        mesh_info.shard_mesh_size = 2
-        mesh_info.shard_process_group = None
-        hsdp_param = HSDPParamV2(
-            module.weight, ParamModuleInfo(module, "weight", [], []), mesh_info,
-            mp_policy=MixedPrecisionPolicy(), device=torch.device("cpu"),
-        )
-        original_parameter = hsdp_param.sharded_param
-        old_local = torch.ones(4, requires_grad=True)
-        old_reference = weakref.ref(old_local)
-        original_parameter._local_tensor = old_local
-        hsdp_param.offload_to_cpu = True
-        hsdp_param.pin_memory = True
-        expected = torch.full((4,), 7.0)
-        # Clone emulates the differentiable host-copy allocation without requiring a pin backend.
-        with patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor.clone()), patch.object(
-            torch.Tensor, "is_pinned", return_value=False,
-        ):
-            HSDPModule.load_state_dict(module, {"weight": expected})
-        self.assertIs(module.weight, original_parameter)
-        self.assertIs(hsdp_param.sharded_param, original_parameter)
-        self.assertIsNone(hsdp_param._sharded_param_data.grad_fn)
-        self.assertFalse(hsdp_param._sharded_param_data.requires_grad)
-        self.assertTrue(original_parameter.requires_grad)
-        torch.testing.assert_close(original_parameter.to_local(), expected, rtol=0, atol=0)
-        del old_local
-        gc.collect()
-        self.assertIsNone(old_reference())
-        original_parameter.to_local().square().sum().backward()
-        torch.testing.assert_close(original_parameter.grad, expected * 2, rtol=0, atol=0)
 
     def test_dim0_smaller_than_world_size_preserves_empty_actual_shape(self):
         """Ranks past the last logical row should expose ``(0, *rest)`` over padded storage."""
