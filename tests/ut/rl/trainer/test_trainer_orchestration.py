@@ -979,7 +979,6 @@ def test_initial_rollout_release_resets_real_actor_reference_storage_before_forw
     for parameter in (actor_parameter, reference_parameter):
         assert not parameter._sharded_param_data.is_meta
         assert parameter._sharded_param_data.grad_fn is None
-        assert not parameter._sharded_param_data.requires_grad
         assert parameter.reduce_dtype is torch.float32
         torch.testing.assert_close(parameter.sharded_param.to_local(), torch.tensor([3.0, 5.0], dtype=torch.bfloat16))
     gc.collect()

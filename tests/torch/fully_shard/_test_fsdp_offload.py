@@ -15,11 +15,13 @@
 """Distributed guards for FSDP CPU offload and mixed-precision storage lifecycle."""
 
 from copy import deepcopy
+import weakref
 
 import torch
 import torch.distributed as dist
 import torch_npu  # pylint: disable=W0611
 from torch import nn, optim
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from hyper_parallel import DTensor, DeviceMesh, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.fully_shard.api import fully_shard
@@ -62,19 +64,33 @@ def _mixed_precision_policy() -> MixedPrecisionPolicy:
 
 
 def _build_fsdp_model(model: nn.Module) -> nn.Module:
-    """Build an FSDP model with CPU-offloaded parameters on the current NPU mesh."""
+    """Build CPU-offloaded FSDP and verify the original NPU allocations expire."""
     mesh: DeviceMesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(dist.get_world_size(),),
         mesh_dim_names=("dp",),
     )
-    return fully_shard(
-        model.npu(),
+    model = model.npu()
+    original_parameter_refs = [
+        (name, weakref.ref(parameter), StorageWeakRef(parameter.untyped_storage()))
+        for name, parameter in model.named_parameters()
+    ]
+    model = fully_shard(
+        model,
         mesh=mesh,
         reshard_after_forward=True,
         mp_policy=_mixed_precision_policy(),
         offload_policy=CPUOffloadPolicy(pin_memory=True),
     )
+    torch.npu.synchronize()
+    for parameter_name, parameter_ref, storage_ref in original_parameter_refs:
+        assert parameter_ref() is None, f"Original NPU parameter {parameter_name} is still retained"
+        assert storage_ref.expired(), f"Original NPU storage for {parameter_name} is still retained"
+    for hsdp_param in model.hsdp_scheduler.hsdp_state.hsdp_params:
+        assert hsdp_param.sharded_param.device.type == "cpu", "Expected CPU-offloaded sharded parameter"
+        assert hsdp_param.sharded_param.to_local().device.type == "cpu", "Expected local shard on CPU"
+        assert hsdp_param._sharded_param_data.device.type == "cpu", "Expected communication storage on CPU"
+    return model
 
 
 def _run_standalone_step(
@@ -225,6 +241,10 @@ def _assert_apply_releases_npu_storage(model: nn.Module) -> None:
         hsdp_param._sharded_param_data.untyped_storage().data_ptr()  # pylint: disable=protected-access
         for hsdp_param in state.hsdp_params
     ]
+    original_storage_refs = [
+        StorageWeakRef(hsdp_param._sharded_param_data.untyped_storage())  # pylint: disable=protected-access
+        for hsdp_param in state.hsdp_params
+    ]
 
     torch.npu.synchronize()
     model.unshard()
@@ -247,7 +267,9 @@ def _assert_apply_releases_npu_storage(model: nn.Module) -> None:
         f"before={allocated_with_unsharded_params}, after={allocated_after_apply}, "
         f"unsharded_storage_nbytes={unsharded_storage_nbytes}"
     )
-    for original_storage_ptr, hsdp_param in zip(original_storage_ptrs, state.hsdp_params):
+    for original_storage_ptr, original_storage_ref, hsdp_param in zip(
+        original_storage_ptrs, original_storage_refs, state.hsdp_params
+    ):
         assert hsdp_param.sharded_state == ShardedState.SHARDED, (
             f"Expected sharded parameter state, got {hsdp_param.sharded_state}"
         )
@@ -258,6 +280,7 @@ def _assert_apply_releases_npu_storage(model: nn.Module) -> None:
             hsdp_param._sharded_param_data.untyped_storage().data_ptr()  # pylint: disable=protected-access
         )
         assert replaced_storage_ptr != original_storage_ptr, "Expected reset_sharded_param() to replace CPU storage"
+        assert original_storage_ref.expired(), "Expected _apply() to release the replaced CPU shard storage"
         for buffer in hsdp_param.unsharded_param_buffers:
             assert buffer.untyped_storage().nbytes() == 0, (
                 f"Expected unsharded NPU storage to be released, got {buffer.untyped_storage().nbytes()} bytes"
@@ -296,8 +319,8 @@ def test_cpu_offload_mixed_precision_training():
         forward/backward, and applies copied fp32 gradients on CPU. The distributed path also exercises `_apply()`
         and graph-backed DTensor local-storage replacement after training.
     Expectation: Losses, local gradients, and updated parameter shards match the standalone baseline; parameters,
-        gradients, and AdamW state remain on CPU; `_apply()` releases materialized NPU storage; reset storage has
-        no autograd history.
+        gradients, and AdamW state remain on CPU; original NPU parameters and storage expire; `_apply()` releases
+        materialized NPU storage and replaced CPU shard storage; reset storage has no autograd history.
     """
     rank, _ = init_dist()
     world_size = dist.get_world_size()
