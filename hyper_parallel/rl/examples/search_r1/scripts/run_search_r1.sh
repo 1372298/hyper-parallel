@@ -23,5 +23,3 @@ fi
 echo "Training output: ${PWD}/${output}"
 python3 examples/search_r1/launcher.py --devices "$devices" --steps "$steps" \
     --backend-privileged --data "$data_dir" --output "$output"
-python3 examples/search_r1/plot_reward.py "$output/train.log"
-echo "Reward plots: ${PWD}/${output}/reward_max.svg and reward_mean.svg"

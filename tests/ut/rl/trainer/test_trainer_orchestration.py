@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """CPU unit tests for the main synchronous Trainer orchestration contracts."""
+from __future__ import annotations
+
 # Tests intentionally exercise stable internal stage boundaries.
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
 # pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,unnecessary-lambda
@@ -31,6 +33,7 @@ import rl.trainer as trainer_module
 import rl.utils.monitoring.metrics as metrics_module
 from rl.algorithm import build_algorithm
 from rl.dataset.contracts import ExperienceBatch
+from rl.distillation.config import DistillationConfig
 from rl.roles import Actor
 from rl.trainer import SyncTrainer
 from rl.utils.monitoring.metrics import ActorUpdateMetrics
@@ -141,6 +144,7 @@ def test_trainer_builds_independent_trainable_and_reference_roles(
 ) -> None:
     """GRPO construction exposes one trainable Actor and one frozen Reference."""
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.resolved_config = {
         "train": {
@@ -187,6 +191,7 @@ def test_trainer_step_orchestrates_required_role_outputs_in_order(
     """One step orders consistency, required roles, updates, publication, and completion."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer._consistency_profile = "qwen3"
     trainer.algorithm = SimpleNamespace(
         name="acceptance",
@@ -329,6 +334,7 @@ def test_trainer_publication_releases_training_state_before_rollout_wake(
     """Colocated publication releases training allocations before waking rollout."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.actor = SimpleNamespace(actor_model=object())
     trainer.model_registration = SimpleNamespace(name="qwen")
     trainer._reshard_model = lambda _model: calls.append("reshard")
@@ -350,6 +356,7 @@ def test_trainer_completes_metrics_and_evaluation_after_published_step(
     """A successful publication advances step before metrics, evaluation, and logging."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.state = SimpleNamespace(global_step=0, max_steps=2)
     trainer._log_samples = 1
     trainer._log_steps = 1
@@ -406,6 +413,7 @@ def test_trainer_runs_one_complete_synchronous_training_step(
     """Production train and step methods complete one strongly synchronous publication."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer._consistency_profile = "off"
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.state = SimpleNamespace(global_step=0, max_steps=1, epoch=0)
@@ -532,9 +540,11 @@ def test_trainer_runs_one_complete_synchronous_training_step(
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("cpu_offload", [False, True])
 def test_trainer_sets_up_runtime_with_mocked_distributed_boundary(
     monkeypatch: pytest.MonkeyPatch,
     tp_size: int,
+    cpu_offload: bool,
 ) -> None:
     """Production runtime setup builds device, mesh, DP group, and deterministic seeds."""
     calls: list[Any] = []
@@ -547,10 +557,11 @@ def test_trainer_sets_up_runtime_with_mocked_distributed_boundary(
     setup = SimpleNamespace(mesh_context=mesh_context, strategy_config=None)
     handle = SimpleNamespace(set_device=lambda rank: calls.append(("set-device", rank)))
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.runtime_config = SimpleNamespace(
         training=SimpleNamespace(backend="hccl", seed=1234),
         accelerator=SimpleNamespace(tp_size=tp_size),
-        fsdp_config=object(),
+        fsdp_config=SimpleNamespace(enable_offload=cpu_offload),
     )
     trainer._runtime_started = False
     monkeypatch.setenv("LOCAL_RANK", "1")
@@ -572,7 +583,7 @@ def test_trainer_sets_up_runtime_with_mocked_distributed_boundary(
 
     assert trainer._runtime_started
     assert trainer.distributed_setup is setup
-    assert setup.strategy_config is (trainer.runtime_config.fsdp_config if tp_size > 1 else None)
+    assert setup.strategy_config is (trainer.runtime_config.fsdp_config if tp_size > 1 or cpu_offload else None)
     assert trainer.parallel_dims is mesh_context
     assert trainer.mesh == "device-mesh"
     assert trainer.device == torch.device("cpu", 1)
@@ -633,6 +644,7 @@ def test_trainer_builds_tokenizer_data_and_dataloader(
     monkeypatch.setattr(trainer_module, "PromptDataset", Dataset)
     monkeypatch.setattr(trainer_module, "build_train_dataloader", build_dataloader)
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.resolved_config = {
         "model": {"tokenizer_path": "/model"},
         "data": {
@@ -713,6 +725,7 @@ def test_trainer_builds_rollout_evaluator_and_tp_request_owner(
         lambda **kwargs: calls.append(("evaluator", kwargs)) or SimpleNamespace(**kwargs),
     )
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.model_registration = SimpleNamespace(name="qwen")
     trainer.model = SimpleNamespace(
@@ -769,6 +782,7 @@ def test_trainer_builds_runtime_and_tracker_components(
     """Production runtime and tracker methods retain component order and rank-zero config."""
     calls: list[Any] = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer._dp_group_info = None
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.resolved_config = {
@@ -827,6 +841,7 @@ def test_trainer_validates_supported_shared_runtime_topology(
 ) -> None:
     """Production topology validation accepts one consistent shared DP2xTP1 deployment."""
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.parallel_dims = SimpleNamespace(
         dp_size=2,
         cp_size=1,
@@ -860,6 +875,7 @@ def test_trainer_releases_colocated_training_state_for_rollout(
     """Production residency release reshards roles, validates CPU state, and clears cache."""
     calls: list[str] = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.resolved_config = {
         "rollout": {"engine": "vllm", "vllm": {"deployment": "colocated"}}
     }
@@ -957,6 +973,7 @@ def test_initial_rollout_release_resets_real_actor_reference_storage_before_forw
     previous_local = weakref.ref(actor.weight.to_local())
     optimizer = torch.optim.SGD(actor.parameters(), lr=0.1)
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.resolved_config = {"rollout": {"engine": "vllm", "vllm": {"deployment": "colocated"}}}
     trainer.actor = SimpleNamespace(actor_model=actor)
     trainer.reference_actor = SimpleNamespace(actor_model=reference)
@@ -976,9 +993,10 @@ def test_initial_rollout_release_resets_real_actor_reference_storage_before_forw
     assert optimizer.param_groups[0]["params"][0] is original_actor
     assert actor.weight.device.type == reference.weight.device.type == "cpu"
     assert actor.weight.requires_grad and not reference.weight.requires_grad
-    for parameter in (actor_parameter, reference_parameter):
+    for parameter, requires_grad in ((actor_parameter, True), (reference_parameter, False)):
         assert not parameter._sharded_param_data.is_meta
         assert parameter._sharded_param_data.grad_fn is None
+        assert parameter._sharded_param_data.requires_grad == requires_grad
         assert parameter.reduce_dtype is torch.float32
         torch.testing.assert_close(parameter.sharded_param.to_local(), torch.tensor([3.0, 5.0], dtype=torch.bfloat16))
     gc.collect()
@@ -1025,6 +1043,7 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
 ) -> None:
     """GRPO construction creates independent trainable/reference models and Actor roles."""
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.algorithm = build_algorithm(
         {"name": "grpo", "loss_aggregation": "token-mean"}
     )
@@ -1084,6 +1103,7 @@ def test_trainer_builds_required_models_optimizers_and_role_runtime(
         "response_mini_batch_size": 2,
         "update_epochs": 3,
         "max_grad_norm": 2.0,
+        "distillation": None,
         "algorithm": trainer.algorithm,
         "micro_batch_size": 1,
     }
@@ -1105,6 +1125,7 @@ def test_trainer_runtime_helpers_cover_epoch_cleanup_and_synchronization(
 ) -> None:
     """Loader rollover, recursive CPU state, reshard, cleanup, and rank sync compose."""
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.state = SimpleNamespace(epoch=0)
     epochs = []
     trainer.sampler = SimpleNamespace(set_epoch=lambda epoch: epochs.append(epoch))
@@ -1169,6 +1190,7 @@ def test_trainer_complete_step_coordinates_colocated_checkpoint_residency(
     """A saving step evaluates, enters training residency, commits, and restores rollout."""
     calls = []
     trainer = object.__new__(SyncTrainer)
+    trainer.distillation_config = DistillationConfig()
     trainer.state = SimpleNamespace(global_step=0, max_steps=2)
     trainer._log_samples = 0
     trainer._log_steps = 10

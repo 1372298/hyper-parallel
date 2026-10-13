@@ -19,6 +19,14 @@ from typing import Any, Sequence
 _CALL_FIELDS = ("episode_id", "call_index", "call_count")
 
 
+def generation_finish_reason(trajectory: Any) -> Any:
+    """Read the last model action's finish reason without confusing environment termination."""
+    for turn in reversed(getattr(trajectory, "turns", ())):
+        if turn.role == "assistant" and turn.trainable:
+            return turn.metadata.get("finish_reason")
+    return trajectory.metadata.get("finish_reason")
+
+
 def _call_identity(metadata: dict[str, Any]) -> str:
     """Validate the explicit identity and ordinal of one segmented model call."""
     identity = metadata.get("episode_id")

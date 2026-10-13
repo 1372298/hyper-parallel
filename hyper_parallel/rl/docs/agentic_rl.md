@@ -188,6 +188,14 @@ agentic:
 完整训练配置见 [单轮配置](../examples/gsm8k/configs/single_turn.yaml)和
 [多轮配置](../examples/gsm8k/configs/multi_turn.yaml)，训练入口为 [train_rl.py](../train_rl.py)。
 
+### GSM8K 数值奖励
+
+规则评分读取最后一个 `####` 后的完整数值行，或者工具 final-answer 的完整直接数值。
+允许货币符号、千位分隔符、符号和小数，按十进制精确值比较；例如 `$18`、`18.00` 与 `18` 等价。
+畸形数字、分式和无效最终答案不能用数值前缀或更早答案获得奖励；保留最后 300 字符的答案窗口。
+实现见 [GSM8K agent](../examples/gsm8k/agent.py)，回归见
+[实际奖励测试](../../../tests/ut/rl/agentic/test_gsm8k_reward.py)。
+
 ## 外部 runner 的必要配置
 
 Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：

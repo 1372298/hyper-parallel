@@ -40,6 +40,13 @@ from rl.consistency.vllm_ascend import (
 from rl.dataset.contracts import ExperienceBatch
 
 
+@pytest.fixture(autouse=True)
+def legacy_recipe_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the existing recipe tests explicitly pinned to the legacy runtime."""
+    monkeypatch.setattr(profile_module, "package_version",
+                        lambda name: profile_module._EXPECTED_PACKAGE_VERSIONS[name])
+
+
 def test_consistency_profile_installs_shared_recipe_idempotently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -60,7 +67,7 @@ def test_consistency_profile_installs_shared_recipe_idempotently(
     monkeypatch.setattr(runtime, "installed_rollout_profile", "off")
     monkeypatch.setattr(runtime, "batch_invariant_sum_compatibility_installed", False)
     monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
-    monkeypatch.setattr(profile_module, "_require_package_versions", lambda: None)
+    monkeypatch.setattr(profile_module, "_require_package_versions", lambda _profile: None)
     monkeypatch.setattr(profile_module, "ALL_ATTENTION_FUNCTIONS", FakeRegistry())
     monkeypatch.setattr(
         profile_module,
@@ -478,7 +485,7 @@ def test_consistency_installs_sum_rmsnorm_and_validates_rollout_dependencies(
         "transformers.models.qwen3.modeling_qwen3",
         SimpleNamespace(Qwen3RMSNorm=RMSNorm),
     )
-    monkeypatch.setattr(profile_module, "_require_package_versions", lambda: None)
+    monkeypatch.setattr(profile_module, "_require_package_versions", lambda _profile: None)
     monkeypatch.setitem(
         sys.modules,
         "flash_attn_npu_v3",

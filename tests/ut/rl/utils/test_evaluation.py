@@ -24,6 +24,20 @@ import torch
 
 import rl.evaluation as evaluation_module
 from rl.evaluation import Evaluator
+from rl.dataset.episodes import generation_finish_reason
+
+
+def test_finish_reason_uses_last_model_action_and_preserves_unknown() -> None:
+    """An environment completion must not hide a truncated last generation or invent a stop."""
+    trajectory = SimpleNamespace(metadata={"finish_reason": "stop"}, turns=(
+        SimpleNamespace(role="assistant", trainable=True, metadata={"finish_reason": "stop"}),
+        SimpleNamespace(role="assistant", trainable=True, metadata={"finish_reason": "length"}),
+        SimpleNamespace(role="environment", trainable=False, metadata={"finish_reason": "stop"}),
+    ))
+    assert generation_finish_reason(trajectory) == "length"
+    trajectory.turns[1].metadata.clear()
+    assert generation_finish_reason(trajectory) is None
+    assert generation_finish_reason(SimpleNamespace(metadata={"finish_reason": "stop"})) == "stop"
 
 
 def test_evaluator_excludes_padding_and_aggregates_rank_zero_results(

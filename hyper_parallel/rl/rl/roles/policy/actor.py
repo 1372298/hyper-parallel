@@ -20,6 +20,9 @@ import torch.distributed as dist
 from torch.nn import functional
 
 from rl.algorithm.loss import RLAlgorithm
+from rl.algorithm.distillation import compute_opd_loss
+from rl.distillation.monitoring import DistillationMetricAccumulator
+from rl.distillation.config import DistillationConfig
 from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_runtime_state, trainer_sequence_log_probs
 from rl.dataset.contracts import ExperienceBatch
 from rl.utils.monitoring.metrics import (
@@ -30,6 +33,7 @@ from rl.utils.monitoring.metrics import (
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
+from hyper_parallel.components.optim.mixed_precision_optimizer import MixedPrecisionOptimizer
 
 # Role execution uses explicit compute/update APIs; forward remains the Module default.
 class Actor(torch.nn.Module):  # pylint: disable=abstract-method
@@ -49,6 +53,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         response_mini_batch_size: Optional[int] = None,
         update_epochs: int = 1,
         max_grad_norm: float = 1.0,
+        distillation: Optional[DistillationConfig] = None,
     ) -> None:
         """Initialize a trainable Actor or an inference-only reference Actor."""
         super().__init__()
@@ -69,6 +74,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             )
         self.actor_model = actor_model
         self.algorithm = algorithm
+        self.distillation = distillation
+        self._opd_metrics = None
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self._device = device
@@ -173,6 +180,20 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             self.train(was_training)
         return torch.cat(chunks, dim=0).detach()
 
+    def _loss_is_finite(
+        self, scaled_loss: torch.Tensor, current_log_probs: torch.Tensor, action_mask: torch.Tensor,
+    ) -> bool:
+        """Synchronize the finite-loss decision before distillation or GSPO backward."""
+        if self.algorithm.name == "gspo" or (self.distillation is not None and self.distillation.enabled):
+            finite = scaled_loss.detach().isfinite() & current_log_probs.detach().masked_fill(
+                ~action_mask.bool(), 0.0,
+            ).isfinite().all()
+            finite = finite.to(dtype=torch.int32)
+            if self._dp_size > 1:
+                dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=self._dp_group_info.group)
+            return bool(finite.item())
+        return bool(scaled_loss.isfinite().item())
+
     def forward_backward(
         self,
         experience: ExperienceBatch,
@@ -198,7 +219,10 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 raise ValueError("Sequence loss requires 0 < global_sequences <= global_tokens")
             normalizer = global_sequences
         current_log_probs = self._experience_log_probs(experience, start, end)
-        old_log_probs = experience.old_log_probs[start:end].detach()
+        anchor_log_probs = experience.old_log_probs
+        if self.distillation is not None and self.distillation.enabled:
+            anchor_log_probs = experience.rollout_log_probs
+        old_log_probs = anchor_log_probs[start:end].detach()
         action_mask = experience.loss_action_mask[start:end]
         reference_log_probs = experience.reference_log_probs
         output = self.algorithm.compute_actor_loss(
@@ -210,17 +234,18 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             advantages=experience.advantages[start:end],
             action_mask=action_mask,
         )
-        scaled_loss = output.total_loss_sum / normalizer * self._dp_size
-        if self.algorithm.name == "gspo":
-            finite = scaled_loss.detach().isfinite() & current_log_probs.detach().masked_fill(
-                ~action_mask.bool(), 0.0,
-            ).isfinite().all()
-            finite = finite.to(dtype=torch.int32)
-            if self._dp_size > 1:
-                dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=self._dp_group_info.group)
-            is_finite = bool(finite.item())
-        else:
-            is_finite = bool(scaled_loss.isfinite().item())
+        total_loss_sum = output.total_loss_sum
+        scaled_loss = total_loss_sum / normalizer * self._dp_size
+        if self.distillation is not None and self.distillation.enabled:
+            opd_loss = compute_opd_loss(current_log_probs, old_log_probs,
+                                        experience.teacher_log_probs[start:end], action_mask, self.distillation)
+            total_loss_sum = total_loss_sum + self.distillation.coefficient * opd_loss * normalizer / global_tokens
+            scaled_loss = total_loss_sum / normalizer * self._dp_size
+            if self._opd_metrics is None:
+                self._opd_metrics = DistillationMetricAccumulator(opd_loss, self.distillation)
+            self._opd_metrics.add(current_log_probs, old_log_probs, experience.teacher_log_probs[start:end],
+                                  action_mask, experience.teacher_keys[start:end])
+        is_finite = self._loss_is_finite(scaled_loss, current_log_probs, action_mask)
         if not is_finite:
             raise RuntimeError(
                 f"Non-finite {self.algorithm.name} loss detected on response slice "
@@ -228,7 +253,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             )
         scaled_loss.backward()
         return ActorMicroBatchMetrics(
-            total_loss_sum=output.total_loss_sum.detach(),
+            total_loss_sum=total_loss_sum.detach(),
             policy_loss_sum=output.policy_loss_sum.detach(),
             kl_loss_sum=output.regularization_loss_sum.detach(),
             old_policy_kl_sum=output.old_policy_kl_sum.detach(),
@@ -242,8 +267,11 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
     def update(self, experience: ExperienceBatch) -> ActorUpdateMetrics:
         """Run policy epochs, optimizer steps, and metric finalization."""
         self._require_trainable()
+        self._opd_metrics = (DistillationMetricAccumulator(experience.rewards, self.distillation)
+                             if self.distillation is not None and self.distillation.enabled else None)
         response_count = (self._validate_update_experience(experience)
-                          if self.algorithm.name == "gspo" else self._validate_experience(experience))
+                          if self.algorithm.name == 'gspo' or self.distillation is not None
+                          else self._validate_experience(experience))
         accumulator = ActorMetricAccumulator.create(
             experience.sequences.new_zeros(()),
             dp_group_info=self._dp_group_info,
@@ -284,15 +312,32 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             learning_rate=float(self.optimizer.param_groups[0]["lr"])
         )
 
+    def distillation_metrics(self) -> dict[str, float]:
+        """Reduce separate token-normalized OPD diagnostics without changing task metrics."""
+        if self.distillation is None or not self.distillation.enabled:
+            return {}
+        if self._opd_metrics is None:
+            raise RuntimeError('Distillation metrics require a completed Actor update')
+        return self._opd_metrics.finalize(group=self._dp_group_info.group if self._dp_size > 1 else None,
+                                          size=self._dp_size)
+
     def _require_trainable(self) -> None:
         """Reject optimization calls on an inference-only reference Actor."""
         if self.optimizer is None:
             raise RuntimeError("An inference-only reference Actor cannot be updated")
 
+    def _validate_distillation_fields(self, experience: ExperienceBatch) -> None:
+        """Require teacher supervision and the original sampling anchor."""
+        if self.distillation is not None and self.distillation.enabled and experience.teacher_log_probs is None:
+            raise ValueError('Enabled distillation requires teacher_log_probs before Actor.update')
+        if self.distillation is not None and self.distillation.enabled and experience.rollout_log_probs is None:
+            raise ValueError("Enabled distillation requires original rollout_log_probs before Actor.update")
+
     def _validate_experience(self, experience: ExperienceBatch) -> int:
         """Validate token-aligned fields required by policy optimization."""
         if experience.metadata.get("reward_status") == "pending":
             raise ValueError("Pending model rewards cannot be used for Actor optimization")
+        self._validate_distillation_fields(experience)
         sequences = experience.sequences
         old_log_probs = experience.old_log_probs
         advantages = experience.advantages
@@ -352,6 +397,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             response_count = self._validate_experience(experience)
             mask = experience.loss_action_mask.bool()
             fields = [experience.old_log_probs, experience.advantages]
+            if self.distillation is not None and self.distillation.enabled:
+                fields.append(experience.teacher_log_probs)
             if self.algorithm.requirements.data.reference_log_probs:
                 fields.append(experience.reference_log_probs)
             finite = torch.stack([
@@ -410,13 +457,23 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
     def _optimizer_step(self) -> float:
         """Synchronize streams, clip gradients, and update Actor parameters."""
         hsdp_sync_stream()
+        main_optimizer = isinstance(self.optimizer, MixedPrecisionOptimizer)
+        if main_optimizer:
+            self.optimizer.prepare_grads()
+        parameters = (
+            (parameter for group in self.optimizer.param_groups for parameter in group["params"])
+            if main_optimizer else self.parameters()
+        )
         norm_limit = self._max_grad_norm if self._max_grad_norm > 0 else float("inf")
         grad_norm = clip_grad_norm_(
-            self.parameters(),
+            parameters,
             norm_limit,
             error_if_nonfinite=True,
         )
         with SkipDTensorDispatch():
-            self.optimizer.step()
+            if main_optimizer:
+                self.optimizer.step_with_ready_grads()
+            else:
+                self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         return float(grad_norm.item())

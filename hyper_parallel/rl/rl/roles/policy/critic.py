@@ -32,6 +32,7 @@ from rl.utils.monitoring.metrics import CriticUpdateMetrics
 from hyper_parallel import HSDPModule, SkipDTensorDispatch, hsdp_sync_stream
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.utils import clip_grad_norm_
+from hyper_parallel.components.optim.mixed_precision_optimizer import MixedPrecisionOptimizer
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
 
@@ -286,13 +287,23 @@ class Critic(torch.nn.Module):  # pylint: disable=abstract-method
     def _optimizer_step(self) -> float:
         """Clip gradients and advance the Critic optimizer and scheduler."""
         hsdp_sync_stream()
+        main_optimizer = isinstance(self.optimizer, MixedPrecisionOptimizer)
+        if main_optimizer:
+            self.optimizer.prepare_grads()
+        parameters = (
+            (parameter for group in self.optimizer.param_groups for parameter in group["params"])
+            if main_optimizer else self.parameters()
+        )
         norm_limit = self._max_grad_norm if self._max_grad_norm > 0 else float("inf")
         grad_norm = clip_grad_norm_(
-            self.parameters(),
+            parameters,
             norm_limit,
             error_if_nonfinite=True,
         )
         with SkipDTensorDispatch():
-            self.optimizer.step()
+            if main_optimizer:
+                self.optimizer.step_with_ready_grads()
+            else:
+                self.optimizer.step()
         self.optimizer.zero_grad(set_to_none=True)
         return float(grad_norm.item())

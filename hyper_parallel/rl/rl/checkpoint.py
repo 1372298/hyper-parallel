@@ -29,6 +29,7 @@ import torch.distributed as dist
 import yaml
 from transformers import AutoConfig
 
+from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_profile
 from rl.reward_model.scoring import scorer_fingerprint
 from rl.utils.monitoring.config import sanitize_config
 
@@ -38,6 +39,26 @@ from hyper_parallel.core.distributed_checkpoint import save as dcp_save
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 
 logger = logging.getLogger(__name__)
+
+
+def _rank_local_optimizer_state(value: Any) -> Any:
+    """Serialize local optimizer shards without pickling distributed tensor layouts."""
+    if isinstance(value, torch.Tensor):
+        return getattr(value, "_local_tensor", value).detach()
+    if isinstance(value, Mapping):
+        return {key: _rank_local_optimizer_state(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_rank_local_optimizer_state(item) for item in value)
+    if isinstance(value, list):
+        return [_rank_local_optimizer_state(item) for item in value]
+    return value
+
+
+def _optimizer_topology(config: Mapping[str, Any]) -> dict[str, int]:
+    """Identify the partitioning required to restore rank-local optimizer shards."""
+    accelerator = config.get("train", {}).get("accelerator", {})
+    return {name: int(accelerator.get(name, 1)) for name in (
+        "dp_replicate", "dp_shard", "tp", "cp", "pp", "ep", "edp_shard")}
 
 
 def _clone_shared_checkpoint_tensors(
@@ -106,6 +127,18 @@ class RLCheckpointManager:
         final = bool(self.config.get("save_final", True)) and step == self.trainer.state.max_steps
         return periodic or final
 
+    def _validate_optimizer_manifest(self, manifest: Mapping[str, Any]) -> None:
+        """Reject incompatible optimizer precision and partitioning on resume."""
+        main_params = self.resolved_config.get("train", {}).get("optimizer", {}).get("fp32_main_params", False)
+        if manifest.get("optimizer_fp32_main_params", False) is not main_params:
+            raise RuntimeError("Checkpoint optimizer main-parameter precision policy differs")
+        if manifest.get("training_consistency_profile", CONSISTENCY_PROFILE_OFF) != consistency_profile(
+                self.resolved_config):
+            raise RuntimeError("Checkpoint training numerical consistency recipe differs")
+        topology = manifest.get("optimizer_parallel_topology")
+        if (main_params or topology is not None) and topology != _optimizer_topology(self.resolved_config):
+            raise RuntimeError("Checkpoint rank-local optimizer parallel topology differs")
+
     def validate_resume(self) -> None:
         """Reject incomplete or topology-incompatible checkpoints before loading."""
         if not self.load_path:
@@ -137,6 +170,10 @@ class RLCheckpointManager:
             expected_scorer = None if reward_config is None else scorer_fingerprint(reward_config)
             if manifest.get("reward_model_scorer") != expected_scorer:
                 raise RuntimeError("Checkpoint reward model scorer does not match the active configuration")
+            expected_teacher = self._teacher_fingerprint()
+            if manifest.get("distillation_fingerprint") != expected_teacher:
+                raise RuntimeError("Checkpoint distillation objective or teacher identity differs")
+            self._validate_optimizer_manifest(manifest)
             rank_state = checkpoint_dir / f"rank_{dist.get_rank()}"
             if not rank_state.is_dir():
                 raise RuntimeError(f"Checkpoint rank-local state is missing: {rank_state}")
@@ -153,6 +190,16 @@ class RLCheckpointManager:
                 raise RuntimeError("Checkpoint manifest step and training global_step must match nonnegative integers")
 
         self.run_synchronized("checkpoint resume preflight", validate_files)
+
+    def _teacher_fingerprint(self) -> Optional[str]:
+        """Use the identity captured at startup without rereading teacher weights."""
+        if not (self.resolved_config.get("distillation") or {}).get("enabled", False):
+            return None
+        manager = getattr(self.trainer, "teacher_manager", None)
+        fingerprint = getattr(manager, "fingerprint", None)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise RuntimeError("Checkpoint requires a validated teacher weight identity")
+        return fingerprint
 
     def begin(self, state: Any) -> None:
         """Restore policy, optimizer, scheduler, RNG, dataloader, and progress state."""
@@ -286,7 +333,7 @@ class RLCheckpointManager:
             critic = getattr(self.trainer, "critic", None)
             if critic is not None:
                 with SkipDTensorDispatch():
-                    rank_state["critic_optimizer"] = critic.optimizer.state_dict()
+                    rank_state["critic_optimizer"] = _rank_local_optimizer_state(critic.optimizer.state_dict())
                 if critic.lr_scheduler is not None:
                     rank_state["critic_scheduler"] = critic.lr_scheduler.state_dict()
             dcp_save(
@@ -342,7 +389,7 @@ class RLCheckpointManager:
     def _optimizer_state_dict(self) -> dict[str, Any]:
         """Export optimizer state without dispatching its fused initialization step."""
         with SkipDTensorDispatch():
-            return self.trainer.optimizer.state_dict()
+            return _rank_local_optimizer_state(self.trainer.optimizer.state_dict())
 
     def _write_metadata(self, checkpoint_dir: Path, state: Any) -> None:
         """Persist resolved configuration and publish the completion marker."""
@@ -380,7 +427,12 @@ class RLCheckpointManager:
                     {"step": step, "world_size": dist.get_world_size(),
                      "critic": getattr(self.trainer, "critic", None) is not None,
                      "reward_model_scorer": (None if "reward_model" not in self.resolved_config
-                                             else scorer_fingerprint(self.resolved_config["reward_model"]))},
+                                             else scorer_fingerprint(self.resolved_config["reward_model"])),
+                     "distillation_fingerprint": self._teacher_fingerprint(),
+                     "optimizer_fp32_main_params": self.resolved_config.get("train", {}).get(
+                         "optimizer", {}).get("fp32_main_params", False),
+                     "optimizer_parallel_topology": _optimizer_topology(self.resolved_config),
+                     "training_consistency_profile": consistency_profile(self.resolved_config)},
                     handle,
                 )
             os.replace(temporary, manifest_path)

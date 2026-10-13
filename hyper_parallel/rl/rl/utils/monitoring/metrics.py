@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from rl.dataset.episodes import episode_rows
+from rl.dataset.episodes import episode_rows, generation_finish_reason
 
 if TYPE_CHECKING:
     from rl.dataset.contracts import ExperienceBatch
@@ -315,7 +315,9 @@ def _local_training_diagnostics(
     actor_log_probs: Any,
 ) -> dict[str, Any]:
     """Build mergeable pre-update probability and target statistics."""
-    rollout_log_probs = experience.old_log_probs
+    rollout_log_probs = getattr(experience, "rollout_log_probs", None)
+    if rollout_log_probs is None:
+        rollout_log_probs = experience.old_log_probs
     if rollout_log_probs is None:
         raise ValueError("Log-probability diagnostics require rollout log-probabilities")
     expected_shape = tuple(rollout_log_probs.shape)
@@ -535,7 +537,7 @@ def _rollout_samples(
                 "reward_components": dict(trajectory.reward_components),
                 "terminal_reason": rollout.trajectories[rows[-1]].terminal_reason,
                 "status": trajectory.metadata.get("status"),
-                "finish_reason": rollout.trajectories[rows[-1]].metadata.get("finish_reason"),
+                "finish_reason": generation_finish_reason(rollout.trajectories[rows[-1]]),
             }
         )
     return samples

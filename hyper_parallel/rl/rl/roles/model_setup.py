@@ -41,6 +41,7 @@ from typing import Any, Iterator, Mapping, Optional
 import torch
 
 from hyper_parallel import HSDPModule
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.models.qwen3_5.adapter.selected_log_probs import bind_token_log_probs
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
@@ -191,6 +192,8 @@ def build_role_model(runtime_config: object, distributed_setup: object, *, froze
 def build_role_optimizer(runtime_config: object, model: torch.nn.Module) -> tuple[object, object]:
     """Build an independent optimizer and scheduler for one trainable role."""
     optimizer = runtime_config.optimizer.target.build(model=model).get_optimizer()
+    if getattr(runtime_config.optimizer, "fp32_main_params", False):
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, model)
     lr_scheduler = None
     if runtime_config.lr_scheduler is not None:
         lr_scheduler = runtime_config.lr_scheduler.build(
