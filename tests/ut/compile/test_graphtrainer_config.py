@@ -101,6 +101,8 @@ class TestGraphModeIntegration(unittest.TestCase):
     def test_basetrainer_graph_train_fn_uses_postforward(self):
         """The graph wrapper should return postforward's (loss, loss_dict)."""
         base = BaseTrainer.__new__(BaseTrainer)
+        base.current_token_counts = {"foundation_tokens": torch.tensor(4)}
+        base.step_token_counts = {"foundation_tokens": torch.tensor(8)}
         base.model_fwd_context = nullcontext()
         joint_loss = torch.tensor(2.0)
         joint_loss_dict = {"main": joint_loss.clone()}
@@ -114,10 +116,16 @@ class TestGraphModeIntegration(unittest.TestCase):
             model,
             model_inputs={"input_ids": torch.tensor([1])},
             labels=labels,
+            current_token_counts=base.current_token_counts,
+            step_token_counts=base.step_token_counts,
         )
 
         model.assert_called_once_with(input_ids=torch.tensor([1]), use_cache=False)
-        base.postforward.assert_called_once_with(model.return_value, labels)
+        base.postforward.assert_called_once_with(
+            model.return_value, labels,
+            current_token_counts=base.current_token_counts,
+            step_token_counts=base.step_token_counts,
+        )
         # Both the backward loss and the named losses travel to the tracer:
         # the loss_dict values are emitted as extra graph outputs.
         self.assertIs(loss, joint_loss)
@@ -126,6 +134,8 @@ class TestGraphModeIntegration(unittest.TestCase):
     def test_forward_backward_step_runs_joint_graph_when_compiler_present(self):
         """A configured compiler replaces the eager forward/backward path."""
         base = BaseTrainer.__new__(BaseTrainer)
+        base.current_token_counts = {"foundation_tokens": torch.tensor(4)}
+        base.step_token_counts = {"foundation_tokens": torch.tensor(8)}
         base.config = SimpleNamespace(
             training=SimpleNamespace(empty_cache_before_backward=False),
         )
@@ -152,6 +162,8 @@ class TestGraphModeIntegration(unittest.TestCase):
         base.graph_compiler.forward_backward.assert_called_once_with(
             model_inputs=micro_batch,
             labels=labels,
+            current_token_counts=base.current_token_counts,
+            step_token_counts=base.step_token_counts,
         )
         self.assertIs(loss, joint_loss)
         # The named losses flow back from the graph as extra outputs.
@@ -160,6 +172,8 @@ class TestGraphModeIntegration(unittest.TestCase):
     def test_forward_backward_step_runs_joint_graph_end_to_end(self):
         """The BaseTrainer-captured joint graph should execute a real step."""
         base = BaseTrainer.__new__(BaseTrainer)
+        base.current_token_counts = {"foundation_tokens": torch.tensor(4)}
+        base.step_token_counts = {"foundation_tokens": torch.tensor(8)}
         base.config = SimpleNamespace(
             training=SimpleNamespace(empty_cache_before_backward=False),
         )
@@ -174,7 +188,7 @@ class TestGraphModeIntegration(unittest.TestCase):
         ).mean()
         # ``_graph_train_fn`` routes through ``postforward``; the plain
         # local loss keeps this UT dist-free (no token counting / mesh).
-        base.postforward = lambda outputs, labels: (
+        base.postforward = lambda outputs, labels, *, current_token_counts, step_token_counts: (
             base.loss_fn(model_output=outputs, labels=labels),
             {"foundation_loss": base.loss_fn(model_output=outputs, labels=labels).detach()},
         )
@@ -204,6 +218,8 @@ class TestGraphModeIntegration(unittest.TestCase):
     def test_forward_backward_step_warns_on_empty_cache_before_backward(self):
         """Graph mode must warn when empty_cache_before_backward is requested."""
         base = BaseTrainer.__new__(BaseTrainer)
+        base.current_token_counts = {"foundation_tokens": torch.tensor(4)}
+        base.step_token_counts = {"foundation_tokens": torch.tensor(8)}
         base.config = SimpleNamespace(
             training=SimpleNamespace(empty_cache_before_backward=True),
         )

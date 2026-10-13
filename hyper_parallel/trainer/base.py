@@ -559,8 +559,10 @@ class BaseTrainer(Stateful, ABC):
             model: torch.nn.Module,
             model_inputs: Dict[str, Any],
             labels: Optional[torch.Tensor],
+            current_token_counts: Dict[str, torch.Tensor],
+            step_token_counts: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Wrap the BaseTrainer forward/loss logic for joint-graph capture."""
+        """Capture forward/loss with explicit runtime token counts."""
         model_fwd_context = (
             self.model_fwd_context()
             if callable(self.model_fwd_context)
@@ -568,13 +570,13 @@ class BaseTrainer(Stateful, ABC):
         )
         with model_fwd_context:
             outputs = model(**model_inputs, use_cache=False)
-        # postforward adds the token-weighted global aggregation used by the
-        # eager path; it embeds .item()/all_reduce, which the tracer must be
-        # able to capture for this to compile. Both the backward loss and the
-        # named per-key losses are returned: the tracer emits the loss_dict
-        # values as extra graph outputs (after the gradients), so
-        # multi-key losses keep per-key logging parity with the eager path.
-        loss, loss_dict = self.postforward(outputs, labels)
+        # Counts must be graph inputs: packed lengths and ignored-label counts
+        # can vary even when tensor shapes happen to match the first batch.
+        loss, loss_dict = self.postforward(
+            outputs, labels,
+            current_token_counts=current_token_counts,
+            step_token_counts=step_token_counts,
+        )
         return loss, loss_dict
 
     def _init_callbacks(self):
@@ -685,13 +687,18 @@ class BaseTrainer(Stateful, ABC):
         return micro_batch
 
     def postforward(
-            self, outputs: ModelOutput, labels: Optional[torch.Tensor]
+            self, outputs: ModelOutput, labels: Optional[torch.Tensor],
+            *,
+            current_token_counts: Dict[str, torch.Tensor],
+            step_token_counts: Dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass.
 
         Args:
             outputs: Model outputs consumed by the configured loss.
             labels: Labels associated with the current micro-batch.
+            current_token_counts: Per-loss token counts for the current micro-batch.
+            step_token_counts: Per-loss token counts for the optimizer step.
 
         Returns:
             Backward loss and named globally aggregated loss values.
@@ -699,8 +706,8 @@ class BaseTrainer(Stateful, ABC):
         local_loss = self.loss_fn(model_output=outputs, labels=labels)
         loss_dict: Dict[str, torch.Tensor] = mean_global_loss(
             local_loss,
-            self.current_token_counts,
-            self.step_token_counts,
+            current_token_counts,
+            step_token_counts,
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
@@ -777,6 +784,8 @@ class BaseTrainer(Stateful, ABC):
                 loss, loss_dict = self.graph_compiler.forward_backward(
                     model_inputs=micro_batch,
                     labels=labels,
+                    current_token_counts=self.current_token_counts,
+                    step_token_counts=self.step_token_counts,
                 )
             else:
                 model_fwd_context = (
@@ -788,7 +797,11 @@ class BaseTrainer(Stateful, ABC):
                     outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
                 # with use_parallel_state("base"):
-                loss, loss_dict = self.postforward(outputs, labels)
+                loss, loss_dict = self.postforward(
+                    outputs, labels,
+                    current_token_counts=self.current_token_counts,
+                    step_token_counts=self.step_token_counts,
+                )
                 # The loss graph owns everything required for backward. Releasing
                 # the model output here avoids retaining large vocabulary logits
                 # until the whole backward pass finishes.
