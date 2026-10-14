@@ -103,8 +103,8 @@
           },
           {
             "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch",
-              "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
-              "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
+            "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
+            "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
           }
         ],
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
@@ -117,15 +117,22 @@
         "commit": "d30702bb55d0c9ce028a241ea608ae38dbaebc8e",
         "tree": "dec6d50ff39113fe892cdc3d52d35e56b24cd0c0",
         "git_archive_tar_sha256": "c3f207178b6a4f020bc1f98187ca703814e4876064b83e7416010f2f379385f9",
-        "resolution": "exact upstream commit supporting CANN 9.1 and 9.2 native builds",
-        "patches": [],
+        "resolution": "exact upstream commit with a locked Runtime symbol-loading adapter applied only to an isolated source copy",
+        "patches": [
+          {
+            "path": "hyper_parallel/core/multicore/shmem/cann_runtime_symbols.patch",
+            "sha256": "049d3e85e413dbebc6953aaf0940108b66348e2ff3647aeb11349fd8ead2bc98",
+            "purpose": "resolve required rt APIs from libruntime.so when libascendcl.so does not depend on it"
+          }
+        ],
         "packaging_policy": {
           "upstream_source_modified": false,
           "private_sonames": [
             "libhyper_parallel_shmem.so",
             "libhyper_parallel_shmem_utils.so"
           ],
-          "reason": "avoid collision with framework-provided libshmem.so in one process"
+          "reason": "avoid collision with framework-provided libshmem.so in one process",
+          "isolated_source_adapted": true
         }
       }
     }

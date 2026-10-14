@@ -15,6 +15,7 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, PropertyMock, patch
 
@@ -22,48 +23,30 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import module as mega_moe_module
 from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from tests.common.mark_utils import arg_mark
 
 
 class TestMegaMoeExperts(unittest.TestCase):
     """Validate the public API and execution-resource lifecycle."""
 
-    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
-    def test_constructor_defaults_to_lossless_capacity(
-        self,
-        mock_create_parameters: Mock,
-    ) -> None:
-        """Expose local-token topology with a lossless default capacity."""
-        mock_create_parameters.return_value = (object(), object())
+    # pylint: disable=protected-access
 
-        experts = MegaMoeExperts(
-            local_num_tokens=128,
-            hidden_size=16,
-            intermediate_size=8,
-            num_experts=4,
-            top_k=2,
-            ep_size=2,
-        )
-        try:
-            self.assertEqual(experts.local_num_tokens, 128)
-            self.assertIsNone(experts.expert_capacity_factor)
-            self.assertIsNone(experts.swiglu_limit)
-            self.assertEqual(
-                experts._resource_group.specification,
-                {
-                    "local_num_tokens": 128,
-                    "hidden_size": 16,
-                    "intermediate_size": 8,
-                    "num_experts": 4,
-                    "top_k": 2,
-                    "expert_capacity_factor": None,
-                    "swiglu_limit": None,
-                    "ep_size": 2,
-                    "ep_group": None,
-                },
-            )
-            mock_create_parameters.assert_called_once_with(2, 16, 8)
-        finally:
-            experts.close()
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    @patch.object(mega_moe_module, "_create_mega_moe_parameters")
+    def test_constructor_defaults_to_growing_push(self, mock_create_parameters: Mock) -> None:
+        """Feature: Push capacity defaults.
+        Description: Construct a layer without explicit capacity factors.
+        Expectation: Resolve both factors to 1.25 and create the expected local weights.
+        """
+        mock_create_parameters.return_value = (object(), object())
+        experts = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                                 num_experts=4, top_k=2, ep_size=2)
+        self.addCleanup(experts.close)
+        self.assertEqual((experts.dispatch_mode, experts.initial_capacity_factor, experts.capacity_growth_factor),
+                         ("push", 1.25, 1.25))
+        mock_create_parameters.assert_called_once_with(2, 16, 8)
+        self.assertIsNone(experts.swiglu_limit)
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
     def test_constructor_rejects_invalid_static_values_before_allocation(
@@ -73,8 +56,14 @@ class TestMegaMoeExperts(unittest.TestCase):
         """Reject invalid capacity and token split during construction."""
         for overrides, message in (
             ({"local_num_tokens": 129}, "divisible"),
-            ({"expert_capacity_factor": 0.999}, "expert_capacity_factor"),
-            ({"num_experts": 34}, "device scratch capacity"),
+            ({"initial_capacity_factor": 0.999}, "initial_capacity_factor"),
+            ({"num_experts": 35}, "divisible"),
+            ({"dispatch_mode": "invalid"}, "dispatch_mode"),
+            ({"capacity_growth_factor": 0.999}, "capacity_growth_factor"),
+            ({"initial_capacity_factor": float("nan")}, "initial_capacity_factor"),
+            ({"capacity_growth_factor": float("inf")}, "capacity_growth_factor"),
+            ({"initial_capacity_factor": True}, "initial_capacity_factor"),
+            ({"capacity_growth_factor": 1.5, "dispatch_mode": "pull"}, "push"),
         ):
             with (
                 self.subTest(overrides=overrides),
@@ -85,8 +74,10 @@ class TestMegaMoeExperts(unittest.TestCase):
                     hidden_size=16,
                     intermediate_size=8,
                     num_experts=overrides.get("num_experts", 4),
+                    dispatch_mode=overrides.get("dispatch_mode", "push"),
+                    capacity_growth_factor=overrides.get("capacity_growth_factor"),
                     top_k=2,
-                    expert_capacity_factor=overrides.get("expert_capacity_factor"),
+                    initial_capacity_factor=overrides.get("initial_capacity_factor"),
                     ep_size=2,
                 )
 
@@ -147,8 +138,13 @@ class TestMegaMoeExperts(unittest.TestCase):
                     ep_size=2,
                 )
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_forward_passes_router_inputs_and_restores_shape(self) -> None:
-        """Preserve Router inputs, expert parameters and the caller's shape."""
+        """Feature: forward passes router inputs and restores shape.
+        Description: Execute forward with router metadata and caller-shaped inputs.
+        Expectation: Preserve Router inputs, expert parameters and the caller's shape.
+        """
         experts = MegaMoeExperts(
             local_num_tokens=128,
             hidden_size=16,
@@ -163,9 +159,9 @@ class TestMegaMoeExperts(unittest.TestCase):
         topk_weights = torch.full((128, 2), 0.5)
         tokens_per_expert = torch.tensor([256, 0, 0, 0], dtype=torch.int32)
         expected = hidden_states.reshape(128, 16) + 1
-        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object())
+        resources = SimpleNamespace(spec=object(), plan=object(), workspace=object(), ensure_capacity=Mock())
         route = SimpleNamespace(
-            routed_tokens=object(), metadata=object(), unpermute_mapping=object()
+            routed_tokens=object(), metadata=object(), unpermute_mapping=object(), maximum_received_slots=512
         )
         expert_output = object()
 
@@ -173,6 +169,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             patch.object(
                 torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True
             ),
+            patch.object(torch.npu, "is_current_stream_capturing", return_value=False),
             patch.object(experts, "_get_execution_resources", return_value=resources),
             patch.object(
                 mega_moe_module, "prepare_topk_route", return_value=route
@@ -198,6 +195,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             hidden_flat, topk_ids, topk_weights, resources.spec, tokens_per_expert,
             workspace=resources.workspace,
         )
+        resources.ensure_capacity.assert_called_once_with(512)
         mock_execute.assert_called_once_with(
             hidden_flat,
             topk_ids,
@@ -206,6 +204,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             route,
             resources.plan,
             resources.workspace,
+            topk_weights=None,
+            workspace_claimed=False,
         )
         mock_restore.assert_called_once_with(
             expert_output, route.unpermute_mapping, topk_weights
@@ -240,6 +240,14 @@ class TestMegaMoeExperts(unittest.TestCase):
                 torch.zeros((128, 2), dtype=torch.int32),
                 torch.full((128, 2), 0.5),
             )
+        experts.gate_up_weight = experts.down_weight = None
+        with (patch.object(torch.Tensor, "is_npu", new_callable=PropertyMock, return_value=True),
+              patch.object(experts, "_create_execution_resources", mock_create_resources)):
+            for weights, error in ((None, ValueError),
+                                   ((torch.zeros(2, 16, 16), torch.zeros(2, 8, 16)), TypeError)):
+                with self.assertRaises(error):
+                    experts(torch.zeros(128, 16, dtype=torch.bfloat16), torch.zeros(128, 2),
+                            torch.ones(128, 2), expert_weights=weights)
         mock_create_resources.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
@@ -265,6 +273,12 @@ class TestMegaMoeExperts(unittest.TestCase):
         resources = Mock()
         input_tensor = SimpleNamespace(device="npu:0", dtype="bfloat16")
 
+        other = MegaMoeExperts(local_num_tokens=128, hidden_size=16, intermediate_size=8,
+                               num_experts=4, top_k=2, ep_size=2, dispatch_mode="pull")
+        self.addCleanup(other.close)
+        with self.assertRaises(ValueError):
+            MegaMoeExperts.share_execution_resources([layers[0], other])
+        other.close()
         MegaMoeExperts.share_execution_resources(layers)
         shared_group = layers[0]._resource_group
         with patch.object(
@@ -295,10 +309,15 @@ class TestMegaMoeExperts(unittest.TestCase):
         layers[-1].close()
         resources.close.assert_called_once_with()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_execution_resource_pairs_shmem_acquire_and_release(self) -> None:
-        """Pair one SHMEM reference with one execution-resource lifetime."""
+        """Feature: execution resource pairs shmem acquire and release.
+        Description: Create one execution resource and close it twice.
+        Expectation: Pair one SHMEM reference with one execution-resource lifetime.
+        """
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group)
+        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128, dispatch_mode="push")
         workspace = Mock()
 
         with (
@@ -307,19 +326,23 @@ class TestMegaMoeExperts(unittest.TestCase):
                 "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module.shmem, "get_heap_manager",
+                         return_value=Mock(heap_bytes=1024, access=nullcontext, growth_records=[])),
             patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
             patch.object(mega_moe_module.shmem, "release") as mock_release,
-            patch.object(mega_moe_module, "build_mega_moe_plan", return_value=object()),
+            patch.object(
+                mega_moe_module, "build_mega_moe_plan", return_value=object()
+            ) as mock_build_plan,
             patch.object(mega_moe_module, "MegaMoeWorkspace", return_value=workspace),
         ):
             resources = mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
                 {},
-                SimpleNamespace(device="npu:0"),
+                SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
                 shared=False,
                 active_specifications=(),
             )
-            mock_acquire.assert_called_once_with(root_group)
+            mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
+            mock_build_plan.assert_called_once_with(bound_spec, "npu:0")
             mock_release.assert_not_called()
             resources.close()
             resources.close()
@@ -327,10 +350,15 @@ class TestMegaMoeExperts(unittest.TestCase):
         workspace.close.assert_called_once_with()
         mock_release.assert_called_once_with()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_execution_resource_construction_failure_releases_shmem(self) -> None:
-        """Release the acquired SHMEM reference when resource construction fails."""
+        """Feature: execution resource construction failure releases shmem.
+        Description: Fail plan creation after acquiring the native reference.
+        Expectation: Release the acquired SHMEM reference when resource construction fails.
+        """
         root_group = object()
-        bound_spec = SimpleNamespace(ep_group=root_group)
+        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128, dispatch_mode="push")
 
         with (
             patch.object(
@@ -338,7 +366,8 @@ class TestMegaMoeExperts(unittest.TestCase):
                 "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module, "configure_symmetric_heap"),
+            patch.object(mega_moe_module.shmem, "get_heap_manager",
+                         return_value=Mock(heap_bytes=1024, access=nullcontext, growth_records=[])),
             patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
             patch.object(mega_moe_module.shmem, "release") as mock_release,
             patch.object(
@@ -350,12 +379,12 @@ class TestMegaMoeExperts(unittest.TestCase):
         ):
             mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
                 {},
-                SimpleNamespace(device="npu:0"),
+                SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
                 shared=False,
                 active_specifications=(),
             )
 
-        mock_acquire.assert_called_once_with(root_group)
+        mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
         mock_release.assert_called_once_with()
 
     def test_workspace_close_failure_keeps_shmem_user(self) -> None:
@@ -364,6 +393,7 @@ class TestMegaMoeExperts(unittest.TestCase):
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )
         resources.workspace = Mock()
+        resources.heap_manager = Mock(access=nullcontext)
         resources.workspace.close.side_effect = RuntimeError("workspace busy")
         resources._workspace_closed = False  # pylint: disable=protected-access
         resources._closed = False  # pylint: disable=protected-access
@@ -384,6 +414,7 @@ class TestMegaMoeExperts(unittest.TestCase):
         )
         resources.workspace = Mock()
         resources._workspace_closed = False  # pylint: disable=protected-access
+        resources.heap_manager = Mock(access=nullcontext)
         resources._closed = False  # pylint: disable=protected-access
 
         with (

@@ -19,10 +19,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 from hyper_parallel.core.multicore.shmem import _lifecycle
+from tests.common.mark_utils import arg_mark
 
 
+# These tests deliberately inspect the private state machine and mocked native entry points.
 class TestRuntimeLifecycle(unittest.TestCase):
     """Validate lifecycle coordination without Torch distributed or NPU hardware."""
+
+    # pylint: disable=protected-access
 
     def setUp(self) -> None:
         """Install deterministic framework and Native boundaries."""
@@ -34,12 +38,17 @@ class TestRuntimeLifecycle(unittest.TestCase):
             get_process_group_ranks=Mock(return_value=[0, 1]),
             get_rank=Mock(return_value=0),
             barrier=Mock(),
+            broadcast_object_list=Mock(),
+            all_gather_object=Mock(
+                side_effect=lambda output, value, **_kw: output.__setitem__(slice(None), [value] * 2)),
         )
         self.torch = SimpleNamespace(npu=SimpleNamespace(synchronize=Mock()))
         self.native = SimpleNamespace(
             _initialize=Mock(),
+            _get_unique_id=Mock(return_value=b"group-bootstrap"),
             _validate_shutdown=Mock(),
             _shutdown=Mock(),
+            _debug_state=Mock(return_value={"config": {"heap_size_bytes": 128}}),
         )
         self.framework_patch = patch.object(_lifecycle, "_torch_modules", return_value=(self.torch, self.dist))
         self.native_patch = patch.object(_lifecycle, "_load_native", return_value=self.native)
@@ -53,9 +62,12 @@ class TestRuntimeLifecycle(unittest.TestCase):
     @staticmethod
     def _reset_runtime() -> None:
         """Reset private process state after each isolated test."""
+        _lifecycle._retained_users = 0  # pylint: disable=protected-access
         _lifecycle._users = 0  # pylint: disable=protected-access
         _lifecycle._root_group = None  # pylint: disable=protected-access
         _lifecycle._root_uses_distributed = None  # pylint: disable=protected-access
+        _lifecycle._root_ranks = None  # pylint: disable=protected-access
+        _lifecycle._root_size = None  # pylint: disable=protected-access
         _lifecycle._shutdown_failed = False  # pylint: disable=protected-access
 
     def test_single_process_runtime_is_reference_counted(self) -> None:
@@ -108,7 +120,7 @@ class TestRuntimeLifecycle(unittest.TestCase):
         self.dist.get_process_group_ranks.side_effect = ranks
         _lifecycle.acquire(self.world)
 
-        with self.assertRaisesRegex(RuntimeError, "complete Torch WORLD"):
+        with self.assertRaisesRegex(RuntimeError, "different ordered membership"):
             _lifecycle.acquire(different_group)
 
         self.native._initialize.assert_called_once_with(0, 2)
@@ -253,6 +265,42 @@ class TestRuntimeLifecycle(unittest.TestCase):
         """Expose an unmatched release instead of silently underflowing the user count."""
         with self.assertRaisesRegex(RuntimeError, "no active reference"):
             _lifecycle.release()
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_retained_reference_commits_only_after_success(self) -> None:
+        """Feature: retained reference commits only after success.
+        Description: Retain a root pin and fail its final release before retrying.
+        Expectation: Distinguish a registered root pin from ordinary owners and retain failed-release ownership.
+        """
+        _lifecycle.acquire()
+        release_pin = _lifecycle.retain_runtime(self.world)
+        self.assertEqual(_lifecycle._retained_users, 1)
+        self.assertEqual(_lifecycle._reference_count(), 2)
+        _lifecycle.release()
+        self.native._validate_shutdown.side_effect = RuntimeError("busy")
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            release_pin()
+        self.assertEqual(_lifecycle._retained_users, 1)
+        self.assertEqual(_lifecycle._reference_count(), 1)
+        self.native._validate_shutdown.side_effect = None
+        release_pin()
+        self.assertEqual(_lifecycle._retained_users, 0)
+        self.assertEqual(_lifecycle._reference_count(), 0)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_explicit_default_group_does_not_select_the_active_subgroup(self) -> None:
+        """Feature: Default-root collective selection.
+        Description: Check WORLD layout while another subgroup owns the native Runtime.
+        Expectation: Explicit None selects WORLD; an omitted group selects the active root.
+        """
+        subgroup = object()
+        with patch.object(_lifecycle, "_root_group", subgroup):
+            _lifecycle._reconfiguration_stage(Mock(), group=None, value="world layout")
+            self.assertIsNone(self.dist.all_gather_object.call_args.kwargs["group"])
+            _lifecycle._reconfiguration_stage(Mock())
+            self.assertIs(self.dist.all_gather_object.call_args.kwargs["group"], subgroup)
 
 
 if __name__ == "__main__":

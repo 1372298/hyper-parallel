@@ -11,11 +11,13 @@
 #include "cann/host.h"
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "runtime/log.h"
 #include "shmem.h"
 
 namespace hyper_parallel::multicore::shmem::cann::host {
@@ -26,10 +28,12 @@ constexpr uint32_t kOptionalAttrVersionMajorShift = 16U;
 constexpr int32_t kInitOptionalAttrVersion = static_cast<int32_t>(
   (kOptionalAttrVersionMajor << kOptionalAttrVersionMajorShift) + sizeof(aclshmem_init_optional_attr_t));
 constexpr int32_t kInvalidDeviceIndex = -1;
+constexpr int32_t kUnknownRootRank = -1;
 constexpr int32_t kNoSocketFd = -1;
 constexpr uint64_t kDefaultInstanceId = 0U;
 constexpr std::size_t kCannEndpointCapacity = ACLSHMEM_MAX_IP_PORT_LEN;
 constexpr std::size_t kCannMaxEndpointBytes = kCannEndpointCapacity - 1U;
+constexpr int32_t kCannErrorLogLevel = 3;
 
 static_assert(runtime::kMaxBootstrapEndpointBytes == kCannMaxEndpointBytes,
               "Runtime endpoint limit must match the locked CANN SHMEM ABI");
@@ -50,6 +54,22 @@ runtime::Status CannFailure(std::string_view operation, int32_t error_code) {
     IsTimeoutError(error_code) ? runtime::ErrorCode::Timeout : runtime::ErrorCode::CannError;
   return runtime::Status{category, error_code,
                          std::string(operation) + " failed with CANN error code " + std::to_string(error_code)};
+}
+
+void ForwardCannLog(int32_t level, const char *message) noexcept {
+  if (message == nullptr) {
+    return;
+  }
+  const runtime::log::Level severity = level >= kCannErrorLogLevel ? runtime::log::Level::Error
+                                       : level > 0                 ? runtime::log::Level::Info
+                                                                   : runtime::log::Level::Debug;
+  runtime::log::Line(severity, kUnknownRootRank, __FILE__, __LINE__, "source=shmem %s", message);
+}
+
+runtime::Status ConfigureCannLogger() {
+  // The private SHMEM library otherwise writes SMEM failures outside the worker's captured logs.
+  const int32_t status = aclshmemx_set_extern_logger(ForwardCannLog);
+  return status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmemx_set_extern_logger", status);
 }
 
 runtime::Status AclFailure(std::string_view operation, int32_t error_code) {
@@ -130,6 +150,20 @@ int32_t CannCompareOp(CompareOp comparison) {
 
 }  // namespace
 
+runtime::Result<std::string> get_unique_id() {
+  const runtime::Status logging_status = ConfigureCannLogger();
+  if (logging_status.error_code != runtime::ErrorCode::Ok) {
+    return runtime::Result<std::string>::Failure(logging_status);
+  }
+  aclshmemx_uniqueid_t unique_id{};
+  const int32_t status = aclshmemx_get_uniqueid(&unique_id);
+  if (status != ACLSHMEM_SUCCESS) {
+    return runtime::Result<std::string>::Failure(CannFailure("aclshmemx_get_uniqueid", status));
+  }
+  return runtime::Result<std::string>::Success(
+    std::string(reinterpret_cast<const char *>(&unique_id), sizeof(unique_id)));
+}
+
 runtime::Status initialize(const InitOptions &options) {
   if (options.effective_bootstrap_endpoint.empty() ||
       options.effective_bootstrap_endpoint.size() > kCannMaxEndpointBytes) {
@@ -141,6 +175,11 @@ runtime::Status initialize(const InitOptions &options) {
   const auto data_engine_mask = DataEngineMask(options.data_engine);
   if (!data_engine_mask.ok()) {
     return data_engine_mask.error();
+  }
+
+  const runtime::Status logging_status = ConfigureCannLogger();
+  if (logging_status.error_code != runtime::ErrorCode::Ok) {
+    return logging_status;
   }
 
   const int32_t tls_status = aclshmemx_set_conf_store_tls(false, nullptr, 0);
@@ -164,7 +203,21 @@ runtime::Status initialize(const InitOptions &options) {
   attributes.comm_args = nullptr;
   attributes.instance_id = kDefaultInstanceId;
 
-  const int32_t init_status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
+  // The ID owns an independent rendezvous and uses EP-local PE coordinates, even for noncontiguous subgroups.
+  aclshmemx_uniqueid_t unique_id{};
+  if (!options.unique_id.empty()) {
+    if (options.unique_id.size() != sizeof(unique_id)) {
+      return InvalidArgument("unique_id has an invalid byte count: " + std::to_string(options.unique_id.size()));
+    }
+    std::memcpy(&unique_id, options.unique_id.data(), sizeof(unique_id));
+    const int32_t status = aclshmemx_set_attr_uniqueid_args(
+      options.root_rank, options.root_size, options.heap_size_bytes, &unique_id, &attributes);
+    if (status != ACLSHMEM_SUCCESS) {
+      return CannFailure("aclshmemx_set_attr_uniqueid_args", status);
+    }
+  }
+  const int32_t init_status = aclshmemx_init_attr(
+    options.unique_id.empty() ? ACLSHMEMX_INIT_WITH_DEFAULT : ACLSHMEMX_INIT_WITH_UNIQUEID, &attributes);
   return init_status == ACLSHMEM_SUCCESS ? Success() : CannFailure("aclshmemx_init_attr", init_status);
 }
 
