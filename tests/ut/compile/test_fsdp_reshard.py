@@ -136,6 +136,31 @@ class _ChunkedMLP(nn.Module):
         return h @ a.t() + h @ b.t() + h @ self.w2
 
 
+class _OddWeightMLP(nn.Module):
+    """Linear stack whose odd-sized middle weight the backward reads.
+
+    ``w``'s dim 0 (5) is not divisible by the shard degree, so FSDP pad-shards
+    it: the gathered ``[6, 8]`` is narrowed back to ``[5, 8]`` for the forward.
+    The ``v @ (w @ h.t())`` chain needs ``w`` (through its ``t`` view) for the
+    grad_input, so the reshard rematerialization must carry the alias through
+    the inserted ``narrow`` — otherwise the padded gather is freed out from
+    under its forward consumer. Output stays ``(N, 4)`` to fit ``_trace_and_run``.
+    """
+
+    def __init__(self) -> None:
+        """Create the leading linear, the odd 5x8 weight and the 4x5 tail."""
+        super().__init__()
+        self.lin = nn.Linear(8, 8, dtype=torch.float64)
+        self.w = nn.Parameter(torch.randn(5, 8, dtype=torch.float64))
+        self.v = nn.Parameter(torch.randn(4, 5, dtype=torch.float64))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """ReLU-linear, then ``v @ (w @ h.t())`` so the backward needs ``w``."""
+        h = torch.relu(self.lin(x))
+        z = self.w @ h.t()
+        return (self.v @ z).t()
+
+
 def _trace_and_run(
     model: nn.Module,
     reshard: bool,
@@ -399,6 +424,48 @@ class TestReshardNumerics(unittest.TestCase):
         self.assertEqual(_count_nodes(graph, "fsdp_reshard_free"), 4)
         self.assertEqual(_count_nodes(graph, "fsdp_all_gather_backward"), 2)
         self.assertEqual(_count_nodes(graph, "fsdp_reshard_free_backward"), 2)
+
+    def test_pad_sharded_param_gradients_match(self):
+        """Odd dim-0 weight: pad-shard + narrow remat still matches reference.
+
+        The narrow restoring the real ``[n, ...]`` aliases the padded gather, so
+        the reshard alias walk must track it (via the ``aten.narrow`` schema). A
+        free inserted before the forward consumer would raise in the simulated
+        run (``_SimulatedRank`` executes the storage free for real).
+        """
+        torch.manual_seed(11)
+        reference = _OddWeightMLP()
+        graph, live = _trace_and_run(reference, reshard=True)
+
+        inputs = torch.randn(4, 8, dtype=torch.float64)
+        labels = torch.randn(4, 4, dtype=torch.float64)
+        loss, grads = _run_simulated(graph, live, reference, inputs, labels)
+
+        ref = copy.deepcopy(reference)
+        ref_loss = nn.functional.mse_loss(ref(inputs), labels)
+        ref_grads = torch.autograd.grad(ref_loss, list(ref.parameters()))
+
+        self.assertTrue(torch.allclose(loss, ref_loss, atol=1e-10))
+        for grad, ref_grad in zip(grads, ref_grads):
+            expected = ref_grad.chunk(_DEGREE, dim=0)[0]
+            self.assertTrue(torch.allclose(grad, expected, atol=1e-10))
+        # ``w`` is pad-sharded: 5 rows -> padded to 6 -> a uniform 3-row shard,
+        # restored by one forward narrow plus one backward remat clone, and the
+        # grad is padded back to the padded size before the reduce.
+        self.assertEqual(tuple(live.w.shape), (3, 8))
+        fwd_narrow = [
+            n
+            for n in graph.graph.nodes
+            if "narrow" in str(n.target) and not n.meta.get("autograd_backward", False)
+        ]
+        bwd_narrow = [
+            n
+            for n in graph.graph.nodes
+            if "narrow" in str(n.target) and n.meta.get("autograd_backward", False)
+        ]
+        self.assertEqual(len(fwd_narrow), 1)
+        self.assertEqual(len(bwd_narrow), 1)
+        self.assertEqual(_count_nodes(graph, "fsdp_grad_pad"), 1)
 
 
 if __name__ == "__main__":

@@ -45,7 +45,6 @@ No real distributed communication happens at pass time: collectives are
 inserted as FX nodes only, so ``torch.distributed`` is mocked throughout.
 """
 
-import os
 import unittest
 from contextlib import contextmanager
 from typing import Iterator
@@ -193,10 +192,16 @@ def _frozen_joint_graph() -> fx.GraphModule:
 
 
 def _odd_joint_graph() -> fx.GraphModule:
-    """Joint-graph stub for ``_OddParam`` (state = ``odd`` only)."""
+    """Joint-graph stub for ``_OddParam`` (state = ``odd`` only).
+
+    ``odd`` is read by the forward so the pass has a live parameter to gather —
+    an unused placeholder is treated as dead and skipped.
+    """
     g = fx.Graph()
     odd = g.placeholder("odd")
-    loss = g.placeholder("loss")
+    x = g.placeholder("x")
+    mm = g.call_function(torch.matmul, args=(odd, x))
+    loss = g.call_function(torch.sum, args=(mm,))
     grad_odd = g.placeholder("grad_odd")
     g.output([loss, grad_odd])
     gm = fx.GraphModule({}, g)
@@ -452,46 +457,61 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         )
         self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 1)
 
-    def test_run_skips_non_divisible_params(self):
-        """Test params whose dim 0 is not divisible by ``fsdp_degree`` stay replicated.
+    def test_run_pad_shards_non_divisible_params(self):
+        """Test params whose dim 0 is not divisible by ``fsdp_degree`` are pad-sharded.
 
-        The divisibility gate must agree between graph and live model: a
-        non-divisible param is skipped on both sides, so no AllGather is
-        inserted and the live tensor keeps its shape.
+        Mirrors eager ``fully_shard``: dim 0 is zero-padded to a multiple of the
+        degree so the parameter is still sharded (uniform shard size) and
+        gradient-reduced, instead of being left replicated. The graph gathers the
+        padded shard, narrows the gathered tensor back to the real size, and pads
+        the gradient back to the padded size before the reduce_scatter.
         """
         cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         pas = FSDPPass()
         gm = _odd_joint_graph()
         model = _OddParam()
-        before = tuple(model.odd.shape)
+        self.assertEqual(tuple(model.odd.shape), (3, 4))
 
         with _patch_dist(world_size=2, rank=0, initialized=True):
             result = pas.run(gm, cfg, model=model, fsdp_group_name="fsdp")
 
         self.assertIs(result, gm, "run() should return the same graph_module")
+        # 3 rows, degree 2 -> padded to 4 -> this rank owns a uniform 2-row shard.
         self.assertEqual(
             tuple(model.odd.shape),
-            before,
+            (2, 4),
             (
-                f"non-divisible param must stay replicated, "
-                f"odd shape={tuple(model.odd.shape)} expected={before}"
+                "non-divisible param must be pad-sharded to a uniform shard, "
+                f"got shape={tuple(model.odd.shape)}"
             ),
         )
         self.assertEqual(
             _count_targets(gm, "all_gather_into_tensor"),
-            0,
-            (
-                f"non-divisible param must get no AllGather, "
-                f"got {_count_targets(gm, 'all_gather_into_tensor')}"
-            ),
+            1,
+            "pad-sharded param must get one AllGather of the padded shard",
         )
         self.assertEqual(
             _count_targets(gm, "reduce_scatter_tensor"),
-            0,
-            (
-                f"non-divisible param must get no ReduceScatter, "
-                f"got {_count_targets(gm, 'reduce_scatter_tensor')}"
-            ),
+            1,
+            "pad-sharded param must get one ReduceScatter",
+        )
+        narrows = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and "narrow" in str(n.target)
+        ]
+        self.assertEqual(
+            len(narrows), 1, "the padded full tensor must be narrowed back once"
+        )
+        self.assertEqual(
+            tuple(narrows[0].args[1:]),
+            (0, 0, 3),
+            "the narrow must restore the real dim 0 (3 rows)",
+        )
+        self.assertEqual(
+            _count_targets(gm, "constant_pad_nd"),
+            1,
+            "the [3, 4] gradient must be padded back to [4, 4] before reduction",
         )
 
     def test_run_uses_fsdp_degree_from_config_not_world_size(self):
@@ -520,13 +540,15 @@ class TestFSDPPassRunSharding(unittest.TestCase):
         )
 
     def test_partial_plan_shards_only_wrapped_params(self):
-        """Test a partial plan shards wrapped params and leaves others full-size.
+        """Test a partial plan shards wrapped params and DDP-falls-back the rest.
 
         The plan-gate must agree between graph and live model: only ``lin``'s
         params (inside an FSDP-wrapped module) get AllGather/ReduceScatter and
-        are physically sharded. The root-level ``extra`` param stays full-size
-        on both sides — sharding it live while the graph holds it replicated
-        (no AllGather) would mismatch at ``run_traced_graph`` time.
+        are physically sharded. The root-level ``extra`` param is unmarked, so it
+        stays full-size on both sides and its gradient is instead all-reduced
+        over the fsdp group (DDP fallback) — sharding it live while the graph
+        holds it replicated (no AllGather) would mismatch at ``run_traced_graph``
+        time.
         """
         cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
         plan = GraphParallelPlan().fsdp_mark("lin")
@@ -580,6 +602,23 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 f"only lin.weight/lin.bias grads should reduce_scatter, "
                 f"got {_count_targets(gm, 'reduce_scatter_tensor')}"
             ),
+        )
+        # The unmarked root-level param falls back to DDP: its gradient is
+        # all-reduced over the fsdp group (no shard, no gather).
+        fallback_ar = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and "all_reduce" in str(n.target)
+        ]
+        self.assertEqual(
+            len(fallback_ar),
+            1,
+            "unmarked 'extra' must get exactly one fallback all_reduce",
+        )
+        self.assertEqual(
+            fallback_ar[0].meta.get("comm_group"),
+            "fsdp",
+            "the DDP fallback must reduce over the fsdp group in fsdp mode",
         )
 
 
