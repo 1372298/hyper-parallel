@@ -33,6 +33,7 @@ except ImportError as exc:
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_ep_compute_fn,
 )
+from hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc import DeepseekV41HyperMegaMhc
 from hyper_parallel.models.deepseek_v41.adapter.validation.native_module_parity import HyperParallelMoE
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41Model,
@@ -84,6 +85,50 @@ def _native_shared_oracle(module: torch.nn.Module, states: torch.Tensor) -> torc
 
 class TestV41SharedExpert(unittest.TestCase):
     """Check activation precision, autograd, state compatibility, and entry points."""
+
+    def test_shifted_mhc_preserves_dspark_targets_and_backbone_gradients(self) -> None:
+        """Keep DSpark targets and backbone training equivalent after mHC replacement.
+
+        Feature: Single-pass mHC and DSpark backbone integration.
+        Description: Compare two real backbone layers with ordinary and shifted mHC.
+        Expectation: Outputs, detached DSpark targets, and parameter gradients match.
+        """
+        torch.manual_seed(94)
+        config = _config()
+        config.num_hidden_layers = 2
+        config.layer_types = ["sliding_attention"] * 2
+        config.mlp_layer_types = ["moe"] * 2
+        config.v41_compress_ratios = [0, 0]
+        config.v41_dspark_target_layer_ids = [0, 1]
+        config.hc_mult = 4
+        config.hc_sinkhorn_iters = 20
+        with patch(
+                "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.Path.open",
+                mock_open(read_data='{"layer_ids": []}')):
+            reference = DeepseekV41Model(config)
+        shifted = copy.deepcopy(reference)
+        for layer in shifted.layers:
+            layer.attn_hc = DeepseekV41HyperMegaMhc(module=layer.attn_hc)
+            layer.ffn_hc = DeepseekV41HyperMegaMhc(module=layer.ffn_hc)
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+
+        expected = reference(input_ids=input_ids).last_hidden_state
+        actual = shifted(input_ids=input_ids).last_hidden_state
+
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(len(shifted.dspark_target_hiddens), 2)
+        for target, expected_target in zip(shifted.dspark_target_hiddens, reference.dspark_target_hiddens):
+            torch.testing.assert_close(target, expected_target)
+            self.assertFalse(target.requires_grad)
+        self.assertFalse(shifted.dspark_inputs_embeds.requires_grad)
+        expected.square().sum().backward()
+        actual.square().sum().backward()
+        for name, parameter in shifted.named_parameters():
+            expected_grad = reference.get_parameter(name).grad
+            if expected_grad is None:
+                self.assertIsNone(parameter.grad)
+            else:
+                torch.testing.assert_close(parameter.grad, expected_grad)
 
     def test_forward_and_backward_match_native_formula(self) -> None:
         """FP32/BF16, positive/nonpositive limits, and empty inputs retain parity."""

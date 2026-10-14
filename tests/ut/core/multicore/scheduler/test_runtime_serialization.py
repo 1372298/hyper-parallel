@@ -52,6 +52,7 @@ from hyper_parallel.core.multicore.scheduler.runtime import (
     runtime_config_task_capacity,
     serialize_runtime_config,
 )
+from tests.common.mark_utils import arg_mark
 
 FORMER_TASK_LIMIT = 25600
 
@@ -177,6 +178,54 @@ class TestRuntimeCppReader(unittest.TestCase):
         cls.reader.read_layout.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cls.reader.group_list_offset.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
         cls.reader.group_list_offset.restype = ctypes.c_uint32
+        cls.reader.append_runtime_bounds.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int64, ctypes.c_int64,
+        ]
+        cls.reader.append_runtime_bounds.restype = ctypes.c_size_t
+        cls.reader.valid_runtime_from_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        cls.reader.valid_runtime_from_launch.restype = ctypes.c_bool
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_launch_bounds_preserve_native_tiling_and_use_real_storage(self) -> None:
+        """Feature: Graph-owned runtime storage validation.
+
+        Description: Append real buffer sizes behind aligned and unaligned native tiling.
+        Expectation: Native bytes are untouched and truncated storage is rejected.
+        """
+        image = serialize_runtime_config(allocate_runtime_config(17))
+        runtime = ctypes.create_string_buffer(image)
+        for native_bytes in (64, 67):
+            offset = (native_bytes + 7) // 8 * 8
+            capacity = offset + 16
+            for runtime_bytes, event_bytes, valid in (
+                (len(image), 4096, True), (len(image) - 1, 4096, False), (len(image), 4095, False),
+            ):
+                with self.subTest(native_bytes=native_bytes, runtime_bytes=runtime_bytes, event_bytes=event_bytes):
+                    prefix = bytes([0xA5]) * native_bytes
+                    tiling = ctypes.create_string_buffer(prefix, capacity)
+                    size = self.reader.append_runtime_bounds(tiling, capacity, native_bytes, runtime_bytes, event_bytes)
+                    if event_bytes < 4096:
+                        self.assertEqual(size, 0)
+                        continue
+                    self.assertEqual(size, capacity)
+                    self.assertEqual(tiling.raw[:native_bytes], prefix)
+                    self.assertEqual(struct.unpack_from("<QQ", tiling.raw, offset), (runtime_bytes, event_bytes))
+                    self.assertEqual(self.reader.valid_runtime_from_launch(runtime, tiling, native_bytes), valid)
+            tiling = ctypes.create_string_buffer(capacity)
+            for available, native, runtime_bytes, event_bytes in (
+                (capacity - 1, native_bytes, len(image), 4096),
+                (capacity, 0, len(image), 4096),
+                (capacity, capacity + 1, len(image), 4096),
+                (capacity, native_bytes, -1, 4096),
+                (capacity, native_bytes, 63, 4096),
+                (capacity, native_bytes, 1 << 32, 4096),
+                (capacity, native_bytes, len(image), -1),
+            ):
+                with self.subTest(available=available, native=native, runtime=runtime_bytes, events=event_bytes):
+                    self.assertEqual(
+                        self.reader.append_runtime_bounds(tiling, available, native, runtime_bytes, event_bytes), 0,
+                    )
 
     def _round_trip(self, cfg) -> None:
         """Compare every TaskDesc field, queues, events, dynamic data and tail."""
@@ -266,8 +315,9 @@ class TestRuntimeCppReader(unittest.TestCase):
             with self.subTest(offset=offset, value=value):
                 invalid = bytearray(good)
                 struct.pack_into("<I", invalid, offset, value)
-                self.assertFalse(self.reader.valid_runtime(ctypes.create_string_buffer(bytes(invalid)),
-                                                         len(invalid), 4096))
+                self.assertFalse(self.reader.valid_runtime(
+                    ctypes.create_string_buffer(bytes(invalid)), len(invalid), 4096,
+                ))
 
     def test_header_padding_has_no_format_semantics(self) -> None:
         """The reader uses capacities directly and does not inspect format tags."""

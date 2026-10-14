@@ -33,6 +33,7 @@ inline void WaitFlag(uint32_t) {}
 }  // namespace AscendC
 using AscendC::GetTPipePtr;
 #include "hyper_parallel/core/multicore/ops/runtime/runtime_config.hpp"
+#include "hyper_parallel/core/multicore/ops/runtime/runtime_storage_bounds_host.h"
 
 namespace Runtime = MulticoreRuntime;
 
@@ -41,6 +42,17 @@ static_assert(sizeof(Runtime::TaskDesc) == 576);
 
 extern "C" bool valid_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes) {
   return Runtime::isRuntimeStorageValid(image, bytes, event_bytes);
+}
+
+extern "C" size_t append_runtime_bounds(uint8_t *tiling, size_t capacity, size_t native_bytes,
+                                       int64_t runtime_bytes, int64_t event_bytes) {
+  return Runtime::AppendRuntimeStorageBounds(tiling, capacity, native_bytes, runtime_bytes, event_bytes);
+}
+
+extern "C" bool valid_runtime_from_launch(uint8_t *image, uint8_t *tiling, size_t native_bytes) {
+  auto bounds = reinterpret_cast<Runtime::RuntimeStorageBounds *>(
+    tiling + Runtime::RuntimeStorageBoundsOffset(native_bytes));
+  return Runtime::isRuntimeStorageValid(image, bounds->runtime_config_bytes, bounds->event_counter_bytes);
 }
 
 extern "C" bool valid_ready_runtime(uint8_t *image, uint64_t bytes, uint64_t event_bytes, uint32_t ep_size) {

@@ -77,12 +77,13 @@ plan_overrides:
     module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
     replace_module:
       _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+  # HyperMegaMhc reuses the original fn/base/scale parameters.
   - match:
       - "model.layers.*.attn_hc"
       - "model.layers.*.ffn_hc"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
     replace_module:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
   - match: "model.layers.*.engram"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
     replace_module:
