@@ -544,14 +544,59 @@ class TestGetItemDistributedOp(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
-    def test_sharded_int_rejects_multidimensional_mesh(self, mock_platform):
-        """Reject owner-only RaggedShard indexing when the input mesh is not one-dimensional."""
+    def test_sharded_int_supports_replicate_plus_multidimensional_mesh(self, mock_platform):
+        """Support an EP replicate axis combined with an FSDP Shard(0) axis."""
         mesh = self._make_2x2_mesh(mock_platform)
-        self_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
-        key_desc, kind = _key_cache_descriptor(2)
+        self_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
+        # The same placement structure scales to the EP8 x FSDP8 production
+        # topology; exercise the geometry for every FSDP owner coordinate.
+        global_shape = (128, 4)
+        for padding_idx in (0, 17, 64, 127):
+            with self.subTest(padding_idx=padding_idx):
+                key_desc, kind = _key_cache_descriptor(padding_idx)
+                cache_values = [self_layout, key_desc, global_shape, kind]
+                infer_result = getitem_op.infer_layout(cache_values)
+                owner_rank = padding_idx // 64
+                local_index = padding_idx % 64
+                self.assertEqual(
+                    tuple(infer_result[0][0].placements),
+                    (
+                        Replicate(),
+                        RaggedShard(
+                            dims=(0,),
+                            local_units=tuple(
+                                int(rank == owner_rank) for rank in range(2)
+                            ),
+                        ),
+                    ),
+                )
 
-        with self.assertRaisesRegex(ValueError, "non-replicate dim 0"):
-            getitem_op.infer_layout([self_layout, key_desc, (8, 10), kind])
+                impl = getitem_op.get_expand_impl(
+                    lambda tensor, key: tensor[key], infer_result, cache_values
+                )
+                local_parent = torch.arange(256).reshape(64, 4) + 1
+                expected_parent = local_parent.clone()
+                expected_parent[local_index].zero_()
+                with patch.object(
+                    self_layout.mesh,
+                    "get_local_rank",
+                    side_effect=lambda mesh_dim, rank=owner_rank: rank,
+                ):
+                    result = impl(local_parent, padding_idx)
+                    result.zero_()
+                self.assertTrue(torch.equal(local_parent, expected_parent))
+
+                non_owner_rank = 1 - owner_rank
+                non_owner_parent = torch.arange(256).reshape(64, 4) + 1
+                expected_non_owner = non_owner_parent.clone()
+                with patch.object(
+                    self_layout.mesh,
+                    "get_local_rank",
+                    side_effect=lambda mesh_dim, rank=non_owner_rank: rank,
+                ):
+                    result = impl(non_owner_parent, padding_idx)
+                    result.zero_()
+                self.assertTrue(torch.equal(non_owner_parent, expected_non_owner))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.dist")
     def test_sharded_int_rejects_non_divisible_dim0(self, mock_platform):
