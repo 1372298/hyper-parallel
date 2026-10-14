@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.modules.engram import local_token_mask
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -121,7 +122,7 @@ def deepseek_v41_ep_compute_fn(
         use_grouped_gemm: bool = False,
 ) -> Callable:
     """Build the complete V4.1 routed-plus-shared expert forward."""
-    del mesh, tp_mesh, cp_mesh
+    del mesh, cp_mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
@@ -137,6 +138,8 @@ def deepseek_v41_ep_compute_fn(
             module.experts,
         )
     ep_group = ep_mesh.get_group("ep")
+    tp_size = 1 if tp_mesh is None else tp_mesh.size()
+    tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     bind_local_expert_forward(
         module,
         ep_mesh["ep"].size(),
@@ -150,7 +153,13 @@ def deepseek_v41_ep_compute_fn(
                 hidden_states: torch.Tensor,
                 input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            """Run the text-only source contract without visual routing state."""
+            """Run the text-only source contract without visual routing state.
+
+            Args:
+                module: Routed and shared expert module.
+                hidden_states: Current decoder hidden rows.
+                input_ids: Unused token IDs from the local compute contract.
+            """
             del input_ids
             return _routed_and_shared_forward(module, hidden_states, None, ep_group)
 
@@ -162,9 +171,19 @@ def deepseek_v41_ep_compute_fn(
             input_ids: torch.Tensor | None = None,
             image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the multimodal source contract with optional visual routing state."""
+        """Run the multimodal source contract with optional visual routing state.
+
+        Args:
+            module: Routed and shared expert module.
+            hidden_states: TP-local decoder hidden rows.
+            input_ids: Unused token IDs from the local compute contract.
+            image_mask: CP-local mask identifying image tokens.
+        """
         del input_ids
-        return _routed_and_shared_forward(module, hidden_states, image_mask, ep_group)
+        local_image_mask = local_token_mask(
+            image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
+        )
+        return _routed_and_shared_forward(module, hidden_states, local_image_mask, ep_group)
 
     return multimodal_compute_fn
 
@@ -187,11 +206,9 @@ def deepseek_v41_engram_compute_fn(
         "parallel_forward",
         owner="DeepSeek-V4.1 Engram EP",
     )
-    if ep_mesh is None:
-        raise ValueError("DeepSeek-V4.1 Engram EP requires an active ep_mesh")
-    ep_group = ep_mesh.get_group("ep")
-    ep_size = ep_mesh["ep"].size()
-    ep_rank = ep_mesh.get_local_rank("ep")
+    ep_group = None if ep_mesh is None else ep_mesh.get_group("ep")
+    ep_size = 1 if ep_mesh is None else ep_mesh["ep"].size()
+    ep_rank = 0 if ep_mesh is None else ep_mesh.get_local_rank("ep")
     cp_group = None if cp_mesh is None else cp_mesh.get_group()
     cp_size = 1 if cp_mesh is None else cp_mesh.size()
     cp_rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()
@@ -205,20 +222,31 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Route hash-row requests and run the exact V4.1 fusion."""
-        return module.parallel_forward(
-            hidden_states,
-            input_ids,
-            segment_starts,
-            token_mask,
-            ep_group=ep_group,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            cp_group=cp_group,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+        """Route hash-row requests and run the exact V4.1 fusion.
+
+        Args:
+            module: Active Engram module.
+            hidden_states: TP-local decoder hidden rows.
+            input_ids: CP-local token IDs.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: CP-local mask selecting Engram updates.
+        """
+        if ep_size > 1:
+            return module.parallel_forward(
+                hidden_states, input_ids, segment_starts, token_mask,
+                ep_group=ep_group, ep_rank=ep_rank, ep_size=ep_size,
+                cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+                tp_rank=tp_rank, tp_size=tp_size,
+            )
+        hash_ids = module._aligned_hash_ids(  # pylint: disable=protected-access
+            hidden_states, input_ids, segment_starts, token_mask,
+            cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+            tp_rank=tp_rank, tp_size=tp_size,
+        )
+        fused = module._fuse(hidden_states, module.embed(hash_ids))  # pylint: disable=protected-access
+        mask = local_token_mask(token_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size)
+        return fused if mask is None else torch.where(
+            mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states,
         )
 
     return compute_fn

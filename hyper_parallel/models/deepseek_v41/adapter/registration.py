@@ -60,6 +60,15 @@ def _load_validation_spec():
     return get_validation_spec()
 
 
+def _load_encoder_parallel_spec():
+    """Load DeepSeek construction rules and its model-bound bridge factory lazily."""
+    from hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel import (  # pylint: disable=C0415
+        get_deepseek_v41_encoder_parallel_spec,
+    )
+
+    return get_deepseek_v41_encoder_parallel_spec()
+
+
 register_custom_model(
     "DeepseekV41ForCausalLM",
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
@@ -78,6 +87,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     fsdp_execution_order=get_fsdp_execution_order,
     recompute=build_recompute_policy,
     validation=_load_validation_spec,
+    encoder_parallel=_load_encoder_parallel_spec,
 )
 register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
 

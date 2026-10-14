@@ -31,7 +31,7 @@ from hyper_parallel.data.batching.runtime_input import (
 
 
 class DeepseekV41Runtime(RuntimeInputAdapter):
-    """Build V4.1 packed attention and CP-local image insertion inputs."""
+    """Build V4.1 packed attention and local image insertion inputs."""
 
     def __init__(
             self,
@@ -44,7 +44,7 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
         Args:
             include_position_ids: Build CP-global position IDs. Omni batches
                 require this; ``TextParallelBatch`` already owns them.
-            include_image_sequence_start: Build the CP-local image insertion
+            include_image_sequence_start: Build the local decoder image insertion
                 offset. Text-only batches do not need this field.
         """
         self.include_position_ids = include_position_ids
@@ -97,7 +97,16 @@ class DeepseekV41Runtime(RuntimeInputAdapter):
             ).unsqueeze(0)
             runtime_inputs["position_ids"] = position_ids
         if self.include_image_sequence_start:
-            runtime_inputs["image_sequence_start"] = cp_start
+            tp_size = context.parallel_sizes.get("tp", 1)
+            if context.options.get("sequence_parallel", False):
+                if local_sequence_length % tp_size:
+                    raise ValueError("CP-local image sequence must divide evenly across sequence-parallel TP ranks")
+                tp_rank = context.parallel_ranks.get("tp", 0)
+                runtime_inputs["image_sequence_start"] = (
+                    cp_start + tp_rank * (local_sequence_length // tp_size)
+                )
+            else:
+                runtime_inputs["image_sequence_start"] = cp_start
         return runtime_inputs
 
 

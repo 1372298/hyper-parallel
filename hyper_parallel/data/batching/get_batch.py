@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import lcm
 from typing import Any
 
 import torch
@@ -54,7 +55,6 @@ class OmniParallelBatch:
             mesh_context: Any,
             device: Any,
             pp_shared_data: bool = False,
-            encoder_dp: bool = False,
             runtime_input_adapter: RuntimeInputAdapter | None = None,
             data_config: Mapping[str, Any] | None = None,
     ) -> None:
@@ -64,12 +64,9 @@ class OmniParallelBatch:
             mesh_context: Trainer mesh exposing TP, CP, and PP sizes.
             device: Destination model device.
             pp_shared_data: Whether pipeline stages share the source batch.
-            encoder_dp: Reserved for image-bucket distribution; not implemented.
-            runtime_input_adapter: Model-owned hook for additional forward inputs.
+            runtime_input_adapter: Provider of additional forward inputs.
             data_config: Dataset cache settings used by DataLoader ownership.
         """
-        if encoder_dp:
-            raise NotImplementedError("OmniParallelBatch encoder_dp image-bucket distribution is not implemented")
         if runtime_input_adapter is not None and not isinstance(runtime_input_adapter, RuntimeInputAdapter):
             raise TypeError("OmniParallelBatch runtime_input_adapter must be a RuntimeInputAdapter")
         if int(getattr(mesh_context, "pp_size", 1)) != 1 or pp_shared_data:
@@ -85,9 +82,16 @@ class OmniParallelBatch:
         ):
             raise ValueError("OmniParallelBatch requires an initialized process group for TP or CP")
         self.device = device
+        self.sequence_parallel = bool(mesh_context.sequence_parallel)
         self.runtime_input_adapter = runtime_input_adapter
         token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
-        self.cp_sharder = CPBatchSharder(self.parallel_context, token_pad_values=token_pad_values)
+        cp_size = int(mesh_context.cp_size)
+        tp_parts = int(mesh_context.tp_size) if mesh_context.sequence_parallel else 1
+        alignment = lcm(2 * cp_size, cp_size * tp_parts)
+        self.cp_sharder = CPBatchSharder(
+            self.parallel_context, token_pad_values=token_pad_values,
+            required_global_alignment=alignment,
+        )
         self.tp_broadcaster = TPBatchBroadcaster(self.parallel_context, device)
 
     def __call__(
@@ -131,7 +135,8 @@ class OmniParallelBatch:
         if self.runtime_input_adapter is None:
             return {}
         runtime_inputs = self.runtime_input_adapter.build(
-            batch=batch, parallel_context=self.parallel_context
+            batch=batch, parallel_context=self.parallel_context,
+            options={"sequence_parallel": self.sequence_parallel},
         )
         collisions = set(batch).intersection(runtime_inputs)
         if collisions:

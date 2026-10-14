@@ -33,6 +33,7 @@ from hyper_parallel.components.quantization.config import (
     LowPrecisionConfig,
     LowPrecisionDtypeScheme,
 )
+from hyper_parallel.distributed.encoder_parallel.config import EncoderParallelConfig
 from hyper_parallel.models.replacement import (
     ModuleReplacementFactory,
     ModuleReplacementSpec,
@@ -54,6 +55,7 @@ class AcceleratorConfig:
     pp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
+    encoder_parallel: EncoderParallelConfig = field(default_factory=EncoderParallelConfig)
 
 
 @dataclass
@@ -77,6 +79,11 @@ class ActivationCheckpointSelection:
 
     def __post_init__(self) -> None:
         """Validate the mutually exclusive layer-count and layer-index selectors."""
+        self._validate_selector_choice()
+        self._validate_selector_values()
+
+    def _validate_selector_choice(self) -> None:
+        """Require one supported source and its matching selector form."""
         if self.source not in ("default", "model_adapter_safe_regions"):
             raise ValueError(
                 "activation_checkpoint.selection.source must be default or "
@@ -95,6 +102,9 @@ class ActivationCheckpointSelection:
                 "layer_count or layer_indices when "
                 "selection.source=model_adapter_safe_regions"
             )
+
+    def _validate_selector_values(self) -> None:
+        """Require non-negative, distinct layer numbers."""
         if self.layer_count is not None and (
             isinstance(self.layer_count, bool)
             or not isinstance(self.layer_count, int)
@@ -468,47 +478,22 @@ def entries_to_module_replacements(
     low_precision_enabled: bool = False,
     low_precision_config: Optional[LowPrecisionConfig] = None,
 ) -> tuple[ModuleReplacementSpec, ...]:
-    """Desugar replacement actions and bind their named dtype schemes."""
+    """Desugar replacement actions and bind their named dtype schemes.
+
+    Args:
+        entries: Raw planner override entries.
+        low_precision_enabled: Whether low-precision replacement is active.
+        low_precision_config: Named dtype schemes for active replacements.
+    """
 
     effective_config = low_precision_config if low_precision_enabled else None
     rules = []
     for entry in entries:
         if entry.replace_module is None:
             continue
-        if entry.when not in (None, "low_precision"):
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} uses replace_module and "
-                "does not support 'when' values other than 'low_precision' "
-                "(module replacements are not conditioned on parallel topology)"
-            )
         if entry.when == "low_precision" and not low_precision_enabled:
             continue
-        if entry.low_precision_dtype_scheme is not None and (
-            not isinstance(entry.low_precision_dtype_scheme, str)
-            or not entry.low_precision_dtype_scheme.strip()
-        ):
-            raise ValueError(
-                f"plan_overrides match={entry.match!r}: "
-                "low_precision_dtype_scheme must be a non-empty string"
-            )
-        if entry.low_precision_dtype_scheme is not None and entry.when != "low_precision":
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} sets "
-                "low_precision_dtype_scheme but is not a low-precision entry"
-            )
-        if entry.when == "low_precision" and effective_config is None:
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} enables a low-precision "
-                "replacement but training.low_precision is missing"
-            )
-        if entry.module_type is None:
-            raise ValueError(
-                f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
-            )
-        if not isinstance(entry.replace_module, Target):
-            raise TypeError(
-                f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
-            )
+        _validate_replacement_entry(entry, effective_config)
         patterns = (entry.match,) if isinstance(entry.match, str) else tuple(entry.match)
         policy = None
         if entry.when == "low_precision" and effective_config is not None:
@@ -522,6 +507,42 @@ def entries_to_module_replacements(
             )
         )
     return tuple(rules)
+
+
+def _validate_replacement_entry(entry: PlanOverride, effective_config: Optional[LowPrecisionConfig]) -> None:
+    """Validate one replacement before constructing its planner rule."""
+    if entry.when not in (None, "low_precision"):
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} uses replace_module and "
+            "does not support 'when' values other than 'low_precision' "
+            "(module replacements are not conditioned on parallel topology)"
+        )
+    if entry.low_precision_dtype_scheme is not None and (
+        not isinstance(entry.low_precision_dtype_scheme, str)
+        or not entry.low_precision_dtype_scheme.strip()
+    ):
+        raise ValueError(
+            f"plan_overrides match={entry.match!r}: "
+            "low_precision_dtype_scheme must be a non-empty string"
+        )
+    if entry.low_precision_dtype_scheme is not None and entry.when != "low_precision":
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} sets "
+            "low_precision_dtype_scheme but is not a low-precision entry"
+        )
+    if entry.when == "low_precision" and effective_config is None:
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} enables a low-precision "
+            "replacement but training.low_precision is missing"
+        )
+    if entry.module_type is None:
+        raise ValueError(
+            f"plan_overrides match={entry.match!r} uses replace_module but omits module_type"
+        )
+    if not isinstance(entry.replace_module, Target):
+        raise TypeError(
+            f"plan_overrides match={entry.match!r} replace_module must be a YAML Target"
+        )
 
 
 def _has_sharding_action(entry: PlanOverride) -> bool:
@@ -548,6 +569,13 @@ def entries_to_plan_overrides(
         low_precision_enabled: bool = False,
 ) -> "dict[str, Any]":
     """Desugar PlanOverride entries into a ``plan_overrides`` dict.
+
+    Args:
+        entries: Raw YAML planner override entries.
+        cp_size: Context-parallel degree.
+        ep_size: Expert-parallel degree.
+        sequence_parallel: Whether decoder sequence parallelism is active.
+        low_precision_enabled: Whether low-precision rules are active.
 
     - ``when`` filter: an entry whose declared condition is inactive
       (``when="cp"`` with cp_size==1 etc.) is SKIPPED with an INFO log —
@@ -613,6 +641,10 @@ def normalize_distributed_setup_overrides(
     config: "TrainerConfig",
 ) -> None:
     """Fill the normalized plan fields of a ``DistributedSetup`` (05 §15.2.6).
+
+    Args:
+        distributed_setup: Mutable setup receiving normalized planner rules.
+        config: Trainer configuration containing raw override entries.
 
     This is the single Trainer-side desugar point: raw YAML ``PlanOverride``
     entries (``TrainerConfig.plan_overrides``) are converted HERE —

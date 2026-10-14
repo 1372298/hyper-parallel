@@ -25,6 +25,8 @@ accelerator:
   pp_size: 1
   sequence_parallel: false
   loss_parallel: false
+  encoder_parallel:
+    enabled: false
 
 fsdp_config:
   dp_shard_size: 8
@@ -55,7 +57,6 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
-    encoder_dp: false
   sampler_type: single
   token_budget: 128
   min_buffered_samples: 1

@@ -28,6 +28,27 @@ from hyper_parallel.models.materialization import register_rebuildable_buffer
 from hyper_parallel.models.replacement import module_replacement
 
 
+def local_token_mask(token_mask: torch.Tensor | None, hidden_states: torch.Tensor,
+                     *, tp_rank: int, tp_size: int) -> torch.Tensor | None:
+    """Match a CP-local token mask to the current TP/SP hidden interval.
+
+    Args:
+        token_mask: CP-local mask replicated before the embedding boundary.
+        hidden_states: Current TP-local hidden tensor.
+        tp_rank: Local TP rank.
+        tp_size: Number of TP ranks.
+
+    Returns:
+        Mask aligned to the hidden sequence, or ``None``.
+    """
+    if token_mask is None or token_mask.shape[1] == hidden_states.shape[1]:
+        return token_mask
+    local_length = hidden_states.shape[1]
+    if token_mask.shape[1] != local_length * tp_size:
+        raise ValueError("Engram token mask is incompatible with TP/SP hidden")
+    return token_mask[:, tp_rank * local_length:(tp_rank + 1) * local_length]
+
+
 class NgramHashMapping(nn.Module):
     """Map token IDs to one Engram layer's disjoint n-gram hash rows."""
 
@@ -79,7 +100,13 @@ class NgramHashMapping(nn.Module):
         segment_starts: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return global flat-table rows shaped ``[batch, seq, hash_columns]``."""
+        """Return global flat-table rows shaped ``[batch, seq, hash_columns]``.
+
+        Args:
+            input_ids: Token IDs for hash lookup.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: Optional mask excluding image tokens.
+        """
         if input_ids.ndim != 2:
             raise ValueError(f"Engram expects input_ids [B,S], got {tuple(input_ids.shape)}")
         compressed = self.token_map[input_ids]
@@ -283,7 +310,14 @@ class EngramModule(nn.Module):
         segment_starts: torch.Tensor | None = None,
         token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run replicated single-card/EP1 Engram."""
+        """Run replicated single-card/EP1 Engram.
+
+        Args:
+            hidden_states: Current decoder hidden rows.
+            input_ids: CP-local token IDs for hash lookup.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: Optional mask selecting Engram updates.
+        """
         hash_ids = self._aligned_hash_ids(hidden_states, input_ids, segment_starts, token_mask)
         fused = self._fuse(hidden_states, self.embed(hash_ids))
         if token_mask is None:
@@ -306,7 +340,22 @@ class EngramModule(nn.Module):
         tp_rank: int = 0,
         tp_size: int = 1,
     ) -> torch.Tensor:
-        """Run CP/TP sequence alignment and sparse EP lookup."""
+        """Run CP/TP sequence alignment and sparse EP lookup.
+
+        Args:
+            hidden_states: Current decoder hidden rows.
+            input_ids: CP-local token IDs for hash construction.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: CP-local mask selecting Engram updates.
+            ep_group: Expert-parallel process group.
+            ep_rank: Local expert-parallel rank.
+            ep_size: Expert-parallel degree.
+            cp_group: Context-parallel process group.
+            cp_rank: Local context-parallel rank.
+            cp_size: Context-parallel degree.
+            tp_rank: Local tensor-parallel rank.
+            tp_size: Tensor-parallel degree.
+        """
         hash_ids = self._aligned_hash_ids(
             hidden_states,
             input_ids,
@@ -327,9 +376,10 @@ class EngramModule(nn.Module):
             padded_num_embeddings=self.padded_num_embeddings,
         )
         fused = self._fuse(hidden_states, embeddings)
+        token_mask = local_token_mask(token_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size)
         if token_mask is None:
             return fused
         return torch.where(token_mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states)
 
 
-__all__ = ["EngramModule", "NgramHashMapping"]
+__all__ = ["EngramModule", "NgramHashMapping", "local_token_mask"]

@@ -81,6 +81,11 @@ def instantiate_infrastructure(
 
     Following design doc 01 §8.2.
 
+    Args:
+        distributed_setup: Normalized topology and planner settings.
+        device: Device selected for later model materialization.
+        **kwargs: Reserved build options.
+
     Returns:
         (sharding_planner, fsdp2_manager) tuple.
     """

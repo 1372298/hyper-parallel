@@ -79,6 +79,12 @@ Registration makes providers available; the recipe selects module replacements
 and CP/EP behavior through `plan_overrides`. Sharding rules and model loss may be
 selected automatically. Put weight conversion associated with replacement in the
 replacement's `make_transforms()` result rather than an unused placeholder.
+For example, a ViT attention wrapper belongs behind a recipe entry with
+`match: "model.vision.blocks.*.attn"`, a concrete source `module_type`, and a
+model-owned `replace_module` factory. This match is an `fnmatch` glob, not a
+regular expression. The generic builder consumes the normalized replacement
+rules unchanged; the model adapter need not inject another rule list. Check the
+final module match count and retained projection parameter objects.
 
 ## Final-Model Boundary Coverage
 

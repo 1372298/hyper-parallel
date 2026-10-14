@@ -14,10 +14,10 @@
 # ============================================================================
 """Declare parameter sharding and FSDP wrapping policies."""
 
-from typing import Any
+from typing import Any, Union
 
 
-def build_parameter_sharding_rules() -> list[tuple[list[str] | str, Any]]:
+def build_parameter_sharding_rules() -> list[tuple[Union[list[str], str], Any]]:
     """Return V4.1 parameter-role overrides."""
     from hyper_parallel.distributed.tensor_parallel.param_role import (  # pylint: disable=C0415
         ParamRole,
@@ -56,7 +56,9 @@ def _get_visual_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:
         if module_by_fqn.get("model.aligner") is not None
         else ()
     )
-    return vision_blocks + aligner
+    if not vision_blocks:
+        return aligner
+    return ("model.vision.patch_embed",) + vision_blocks + ("model.vision.norm",) + aligner
 
 
 def get_fsdp_wrap_modules(model: Any) -> tuple[str, ...]:

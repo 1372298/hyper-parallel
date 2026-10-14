@@ -171,6 +171,10 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("pp_size", "1"),
                 ("sequence_parallel", "False"),
                 ("loss_parallel", "False"),
+                (
+                    "encoder_parallel",
+                    "<factory> EncoderParallelConfig(enabled=False, encoder_cp_size=1)",
+                ),
             ],
         )
 

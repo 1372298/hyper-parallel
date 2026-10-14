@@ -137,7 +137,12 @@ lazily created optimizer state expose one consistent logical global layout.
    adapter. If changing the framework contract is outside the authorized scope,
    stop with a concrete extension design and a `BLOCKED` handoff instead of
    hardcoding the model or hiding the behavior in a one-off runner. Keep
-   experiment choices in declarative recipes or manifests. Classify every
+   shared precision changes out of model bring-up: before proposing any change
+   to generic reduction dtype/order or cast policy, show the first divergent
+   intermediate, why the adapter or recipe cannot address it, and the expected
+   effects across models; obtain an explicit user decision before editing.
+   The proposed four-BF16-Partial FP32 sum for SP parity was rejected here.
+   Keep experiment choices in declarative recipes or manifests. Classify every
    registered buffer against the authoritative model's persistence contract. For
    deterministic non-persistent state invalidated by meta-device `to_empty()`,
    use the public rebuildable-buffer lifecycle described in the custom-model
@@ -174,6 +179,12 @@ lazily created optimizer state expose one consistent logical global layout.
    path for paired validation until the optimized implementation is accepted.
    Preserve forward/state-dict contracts or declare explicit weight transforms.
    Activate optional replacements and CP/EP behavior through recipe `plan_overrides`.
+   Before adding a model or feature-specific replacement hook to a generic builder,
+   check whether an existing `replace_module` entry can select the source module
+   by FQN glob and `module_type`. Keep rule selection in the recipe; put a
+   factory in the model adapter only when model semantics require it. Do not
+   append adapter-owned replacement lists to the generic builder. Test with
+   and without the recipe action, including match count and parameter identity.
    Inspect the final replaced model tree: a uniform glob may create boundaries
    only when it declares a concrete parameter or I/O contract. A later partial
    glob may merge behavior into those boundaries; it must not silently target an
@@ -237,4 +248,6 @@ handoff is ready for `hf-model-precision-validation`. Audit the final diff:
 generic framework behavior must not depend on new model-family identifiers,
 concrete family imports, or family-specific FQN branches. Any new framework API
 must be model-independent, optional when no adapter provides it, exercised by a
-generic contract test, and consumed through the model adapter.
+generic contract test, and consumed through the model adapter. Also reject a
+model/feature-specific mechanism when a declared YAML glob, existing provider,
+or generic replacement executor already expresses the same behavior.

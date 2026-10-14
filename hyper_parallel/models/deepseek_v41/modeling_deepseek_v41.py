@@ -129,7 +129,14 @@ class DeepseekV41Engram(nn.Module):
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply the released hash lookup and gated residual update."""
+        """Apply the released hash lookup and gated residual update.
+
+        Args:
+            hidden_states: Decoder hidden rows to update.
+            input_ids: Token IDs for Engram hash lookup.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: Optional mask excluding image tokens.
+        """
         hash_ids = self.hash_mapping(input_ids, segment_starts, token_mask)
         embeddings = self.embed(hash_ids)
         key_value = self.wkv(embeddings.flatten(start_dim=-2))
@@ -185,6 +192,10 @@ class DeepseekV41TopKRouter(nn.Module):
 
         ``bias`` and ``bias_vl`` select experts only; the gathered routing
         weights intentionally use the unbiased scores, matching V4.1.
+
+        Args:
+            hidden_states: Decoder hidden rows scored by the expert gate.
+            image_mask: Optional mask for image-aware routing bias.
         """
         flattened = hidden_states.reshape(-1, self.hidden_size)
         logits = functional.linear(  # pylint: disable=not-callable
@@ -285,7 +296,12 @@ class DeepseekV41Compressor(nn.Module):
             hidden_states: torch.Tensor,
             compress_position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return unrotated and RoPE-rotated compressed KV tensors."""
+        """Return unrotated and RoPE-rotated compressed KV tensors.
+
+        Args:
+            hidden_states: Decoder hidden rows to compress.
+            compress_position_embeddings: Rotary coefficients for compressed keys.
+        """
         batch_size, sequence_length, _ = hidden_states.shape
         if self.compress_ratio == 1:
             latent = self.norm(self.wkv(hidden_states))
@@ -396,7 +412,11 @@ class DeepseekV41PipelinedHyperConnection(nn.Module):
             self,
             hidden_streams: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute V4.1 pre, post, and residual mixing coefficients."""
+        """Compute V4.1 pre, post, and residual mixing coefficients.
+
+        Args:
+            hidden_streams: Hyper-connection streams entering the mixer.
+        """
         flattened = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         mix = functional.linear(flattened, self.fn.float())  # pylint: disable=not-callable
         num_stream = self.hc_mult
@@ -717,6 +737,55 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
         ).unsqueeze(0)
         return (local_positions == segment_start_positions).expand_as(input_ids)
 
+    def _prepare_image_embeddings(
+            self, *, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor | None,
+            token_types: torch.LongTensor | None, image_inputs: dict[str, Any],
+            image_sequence_start: int, encoder_parallel_plan: Any | None,
+    ) -> torch.Tensor:
+        """Encode images and merge only records owned by this decoder rank."""
+        if encoder_parallel_plan is None:
+            image_records = self._collect_image_records(
+                token_types, image_inputs["pixel_values"], image_inputs["image_patch_offsets"],
+                image_inputs["image_vit_grid_hw"], image_inputs["image_llm_grid_hw"],
+                image_inputs["image_batch_indices"], image_inputs["image_token_starts"],
+            )
+            vision_grad_anchor = None
+        else:
+            routed_records, vision_grad_anchor = encoder_parallel_plan.encode_and_route(image_inputs)
+            image_records = [
+                (item.batch_index, item.decoder_token_start, *item.metadata["llm_hw"], feature)
+                for item, feature in routed_records
+            ]
+        if token_types is not None and token_types.shape != input_ids.shape:
+            raise ValueError("token_types must have the same shape as input_ids")
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        merge_token_types = token_types
+        merge_start = image_sequence_start
+        if encoder_parallel_plan is not None:
+            encoder_parallel_plan.decoder_layout.validate_hidden(inputs_embeds)
+            if image_records:
+                merge_token_types = encoder_parallel_plan.decoder_layout.localize(token_types)
+                merge_start = encoder_parallel_plan.decoder_layout.global_start
+        elif token_types is not None and inputs_embeds.shape[1] != token_types.shape[1]:
+            # TP sequence parallelism has already reduced the embedding rows,
+            # while token_types still describes the complete CP-local input.
+            cp_length = token_types.shape[1]
+            local_length = inputs_embeds.shape[1]
+            local_offset = image_sequence_start % cp_length
+            if local_offset + local_length > cp_length:
+                raise ValueError("image sequence interval exceeds CP-local token types")
+            merge_token_types = token_types[:, local_offset:local_offset + local_length]
+        if image_records:
+            inputs_embeds = self._merge_image_embeddings(
+                inputs_embeds, merge_token_types, image_records, merge_start,
+            )
+        if encoder_parallel_plan is not None and encoder_parallel_plan.active:
+            anchor = (vision_grad_anchor + self.image_start.sum() + self.image_end.sum()
+                      + self.image_newline.sum())
+            inputs_embeds = inputs_embeds + anchor.to(inputs_embeds.dtype) * 0.0
+        return inputs_embeds
+
     def forward(
             self,
             input_ids: torch.LongTensor | None = None,
@@ -733,6 +802,7 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_batch_indices: torch.LongTensor | None = None,
             image_token_starts: torch.LongTensor | None = None,
             image_sequence_start: int = 0,
+            encoder_parallel_plan: Any | None = None,
             **kwargs: Any,
     ) -> MoeModelOutputWithPast:
         """Execute image injection, Engram, shared attention, and pipelined mHC.
@@ -751,7 +821,8 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             image_llm_grid_hw: Per-image LLM grid dimensions.
             image_batch_indices: Batch index for each image.
             image_token_starts: Global token start for each image span.
-            image_sequence_start: Global start of this CP sequence shard.
+            image_sequence_start: Global start of this decoder hidden shard.
+            encoder_parallel_plan: Derived visual work and feature route for this batch.
             **kwargs: Additional decoder-layer keyword arguments.
 
         Returns:
@@ -763,23 +834,18 @@ class DeepseekV41Model(DeepseekV4PreTrainedModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if input_ids is None:
             raise ValueError("input_ids are required while Engram is enabled")
-        image_records = self._collect_image_records(
-            token_types,
-            pixel_values,
-            image_patch_offsets,
-            image_vit_grid_hw,
-            image_llm_grid_hw,
-            image_batch_indices,
-            image_token_starts,
+        inputs_embeds = self._prepare_image_embeddings(
+            input_ids=input_ids, inputs_embeds=inputs_embeds, token_types=token_types,
+            image_inputs={
+                "pixel_values": pixel_values,
+                "image_patch_offsets": image_patch_offsets,
+                "image_vit_grid_hw": image_vit_grid_hw,
+                "image_llm_grid_hw": image_llm_grid_hw,
+                "image_batch_indices": image_batch_indices,
+                "image_token_starts": image_token_starts,
+            },
+            image_sequence_start=image_sequence_start, encoder_parallel_plan=encoder_parallel_plan,
         )
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
-        if image_records:
-            inputs_embeds = self._merge_image_embeddings(
-                inputs_embeds, token_types, image_records, image_sequence_start,
-            )
-        if token_types is not None and token_types.shape != input_ids.shape:
-            raise ValueError("token_types must have the same shape as input_ids")
         image_mask = None if token_types is None else token_types >= 0
         engram_token_mask = None if image_mask is None else ~image_mask
         if position_ids is None:
@@ -945,7 +1011,12 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
 
     @classmethod
     def from_config(cls, config: Any, **kwargs: Any) -> "DeepseekV41ForCausalLM":
-        """Construct the model from its translated V4.1 configuration."""
+        """Construct the model from its translated V4.1 configuration.
+
+        Args:
+            config: Translated DeepSeek-V4.1 model configuration.
+            **kwargs: Unused model construction options.
+        """
         del kwargs
         return cls(config)
 
