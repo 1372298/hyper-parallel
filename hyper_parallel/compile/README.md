@@ -122,6 +122,62 @@ trainer = GraphTrainer(
 trainer.train(dataloader, max_steps=1000)
 ```
 
+## Dynamic input shapes
+
+Static tracing remains the default. Enable symbolic user inputs with one option:
+
+```python
+compiler = GraphCompiler(model=model, train_fn=train_fn, dynamic=True)
+```
+
+For precise control, pass `dynamic_arg_dims` to `GraphCompiler` or `GraphTrainer`:
+
+```python
+compiler = GraphCompiler(
+    model=model,
+    train_fn=lambda m, x, y: ((m(x) - y) ** 2).mean(),
+    dynamic_arg_dims={"x": [0, 1], "y": [0, 1]},
+)
+# x: [batch, sequence, input_features]; y: [batch, sequence, output_features]
+loss, loss_dict = compiler.forward_backward(x=x, y=y)
+```
+
+The first call captures one symbolic forward/backward graph. Later batches with
+compatible batch/sequence lengths reuse it; gradients still accumulate into the
+live parameters. `GraphTrainer` exposes the same options and owns optimizer steps.
+Numerical and graph-reuse regressions live in
+[the CPU unit tests](../../tests/ut/compile/test_dynamic_shapes.py).
+
+For the existing **BaseTrainer + GraphCompiler** path, configure:
+
+```yaml
+compile:
+  enabled: true
+  use_joint_graph: true
+  dynamic_arg_dims:
+    model_inputs.input_ids: [0, 1]
+    labels: [0, 1]
+```
+
+Add paths for other tensors whose sizes vary, such as
+`model_inputs.attention_mask: [0, 1]`. Paths refer to the keyword arguments of
+`train_fn`; BaseTrainer supplies `model_inputs` and `labels`. Use `dynamic: true`
+instead of the mapping to automatically symbolize all user tensor dimensions.
+
+- `dynamic_arg_dims` overrides `dynamic`; unlisted dimensions stay static.
+  Nested input paths and negative dimension indices are supported.
+- Model parameters and buffers keep static shapes. Runtime guards reject
+  incompatible shapes, metadata and Python constants without recompiling.
+- Use a representative first batch with dynamic dimensions **greater than 1**;
+  sizes 0/1 and shape-dependent Python branches may specialize the graph.
+- Dynamic shapes support joint forward/backward graphs, gradient accumulation
+  and optimizer updates. Pipeline parallel and data-dependent output shapes
+  are not supported.
+
+The approach follows MagiCompiler's separation of dynamic and static dimensions
+and reuse of a general symbolic graph, adapted to HyperParallel's joint-graph
+tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
+
 ## Key Design Decisions
 
 1. **Static Inputs**: Parameters are graph inputs, not `get_attr`. This allows passes to split the graph by reshaping placeholders.
