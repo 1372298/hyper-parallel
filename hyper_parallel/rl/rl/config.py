@@ -41,8 +41,9 @@ import yaml
 from rl.agentic.core.types import InteractionMode
 from rl.agentic.envs.environment import ENVIRONMENTS, load_agentic_module
 from rl.algorithm.loss import RLAlgorithm
+from rl.distillation.config import parse_distillation_config
 from rl.consistency import CONSISTENCY_PROFILE_OFF, consistency_profile, validate_consistency_model_identity
-from rl.dataset.data_source import validate_row_adapter_config
+from rl.dataset.data_source import validate_chat_template_kwargs, validate_row_adapter_config
 from rl.roles.model_setup import (
     ModelRegistration,
     model_trust_remote_code,
@@ -90,6 +91,7 @@ _EXPECTED_TOP_LEVEL = frozenset(
         "logging",
         "consistency",
         "reward_model",
+        "distillation",
     )
 )
 
@@ -798,15 +800,35 @@ def _validate_critic(
             raise ValueError("PPO Critic requires a dense Qwen3 checkpoint")
 
 
+def _validate_distillation(config: Mapping[str, Any]) -> None:
+    """Validate distillation sampling and task-reward contracts."""
+    distillation = parse_distillation_config(config.get('distillation'))
+    if distillation.enabled:
+        if 'reward_model' in config and not distillation.use_task_rewards:
+            raise ValueError('Pure OPD cannot request task reward-model scoring')
+        rollout_settings = required_mapping(config, 'rollout')
+        if (float(rollout_settings.get('temperature', 1.0)) != 1.0
+                or float(rollout_settings.get('top_p', 1.0)) != 1.0
+                or int(rollout_settings.get('top_k', 0)) not in (0, -1)):
+            raise ValueError('Initial PG OPD requires temperature=1, top_p=1 and disabled top_k')
+        if required_mapping(rollout_settings, 'vllm').get('logprobs_mode') != 'raw_logprobs':
+            raise ValueError('PG OPD requires rollout.vllm.logprobs_mode=raw_logprobs')
+        if (required_mapping(config, 'agentic').get('runner', 'internal') != 'internal'
+                and not distillation.use_task_rewards):
+            raise ValueError('Pure OPD currently requires the internal runner; external agents retain episode GRPO')
+
+
 def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     """Validate Hyper-RL configuration before distributed startup."""
     unknown = set(config) - _EXPECTED_TOP_LEVEL
     if unknown:
         raise ValueError(f"Unsupported top-level configuration keys: {sorted(unknown)}")
+    _validate_distillation(config)
     consistency_profile(config)
     model = required_mapping(config, "model")
     data = required_mapping(config, "data")
     validate_row_adapter_config(data)
+    validate_chat_template_kwargs(data.get("chat_template_kwargs"))
     rollout = required_mapping(config, "rollout")
     agentic = required_mapping(config, "agentic")
     if agentic.get("runner") in {"codex", "deepseek"} and algorithm.name != "grpo":
@@ -815,8 +837,17 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     evaluation = required_mapping(config, "evaluation")
     train = required_mapping(config, "train")
     accelerator = required_mapping(train, "accelerator")
+    optimizer = required_mapping(train, "optimizer")
+    main_params = _optimizer_fp32_main_params(optimizer)
+    mixed_precision = required_mapping(train, "mixed_precision")
+    if main_params and (not mixed_precision.get("enabled", True) or
+                        _normalize_dtype_name(mixed_precision.get("reduce_dtype", "float32")) != "float32"):
+        raise ValueError("FP32 main parameters require enabled mixed precision and float32 gradient reduction")
     if algorithm.requirements.roles.critic:
         _validate_critic(train, rollout, model)
+        critic_optimizer = {**optimizer, **optional_mapping(optional_mapping(train, "critic"), "optimizer")}
+        if _optimizer_fp32_main_params(critic_optimizer) != main_params:
+            raise ValueError("Actor and Critic must use the same fp32_main_params policy")
     model_registration = build_model_registration(config)
     _validate_model_scope(config, model_registration)
     validate_consistency_model_identity(config, model_registration)
@@ -1389,7 +1420,10 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
             family=registration.family,
         ),
         plan_overrides=_model_plan_overrides(registration.family),
-        optimizer=OptimizerConfig(target=_build_optimizer_target(optimizer_config)),
+        optimizer=OptimizerConfig(
+            target=_build_optimizer_target(optimizer_config),
+            fp32_main_params=_optimizer_fp32_main_params(optimizer_config),
+        ),
         lr_scheduler=_build_lr_scheduler_target(optimizer_config),
         training=_build_training_config(
             train_config,
@@ -1408,6 +1442,14 @@ def build_runtime_config(config: Mapping[str, Any], *, critic: bool = False) -> 
         ),
         checkpoint=_build_checkpoint_config(checkpoint_config),
     )
+
+
+def _optimizer_fp32_main_params(optimizer_config: Mapping[str, Any]) -> bool:
+    """Select the existing main-parameter optimizer without accepting truthy strings."""
+    value = optimizer_config.get("fp32_main_params", False)
+    if not isinstance(value, bool):
+        raise ValueError("train.optimizer.fp32_main_params must be a boolean")
+    return value
 
 
 def _validate_vllm_hccl_ports(vllm: Mapping[str, Any]) -> None:

@@ -215,6 +215,18 @@ def _load_row_adapter(
     return adapter
 
 
+def validate_chat_template_kwargs(value: Optional[Mapping[str, Any]]) -> dict[str, Any]:
+    """Validate optional model template controls without changing tokenization contracts."""
+    if value is not None and not isinstance(value, Mapping):
+        raise ValueError("data.chat_template_kwargs must be a mapping")
+    options = dict(value or {})
+    protected = {"tokenize", "add_generation_prompt", "truncation", "max_length", "return_dict",
+                 "return_tensors", "tokenizer_kwargs"}
+    if set(options) & protected or any(not isinstance(key, str) for key in options):
+        raise ValueError("data.chat_template_kwargs cannot override tokenization or length controls")
+    return options
+
+
 class PromptDataset:
     """Read tokenized prompt records from supported text parquet layouts."""
 
@@ -229,8 +241,10 @@ class PromptDataset:
         prompt_instruction: Optional[str] = None,
         row_adapter: Optional[str] = None,
         metadata_columns: Optional[Sequence[str]] = None,
+        chat_template_kwargs: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Load and validate a tokenized prompt dataset from parquet."""
+        self._chat_template_kwargs = validate_chat_template_kwargs(chat_template_kwargs)
         path = Path(parquet_path)
         if not path.is_file():
             raise ValueError(f"Prompt parquet file does not exist: {path}")
@@ -295,6 +309,7 @@ class PromptDataset:
             max_length=self._max_prompt_length,
             return_dict=True,
             tokenizer_kwargs={"return_attention_mask": True},
+            **self._chat_template_kwargs,
         )
         input_ids = torch.tensor(encoded["input_ids"], dtype=torch.long)
         attention_mask = torch.tensor(

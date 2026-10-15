@@ -47,6 +47,9 @@ from rl.roles.model_setup import resolve_model
 import hyper_parallel.models._transformers.auto_model as auto_model_backend
 import hyper_parallel.models._transformers.checkpoint_loader as checkpoint_loader_backend
 from hyper_parallel.models import HyperAutoModelForCausalLM
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Shard
 
 
 class _Stateful:
@@ -67,6 +70,31 @@ class _Stateful:
     def named_modules(self) -> Any:
         """Expose a module-like iterator for checkpoint topology helpers."""
         return iter((("", self),))
+
+
+def test_rank_local_master_state_pickle_preserves_hidden_precision(tmp_path) -> None:
+    """Distributed FP32 master shards serialize locally without BF16 rounding."""
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1)
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        master = torch.tensor([0.9984, 1.0016], dtype=torch.float32, requires_grad=True)
+        distributed = DTensor.from_local(master, mesh, [Shard(0)])
+        state = {"_mixed_precision_optimizer": {"fp32_from_fp16_params": {"weight": distributed}},
+                 "nested": [(distributed,)], "step": 16}
+        restored = pickle.loads(pickle.dumps(checkpoint_backend._rank_local_optimizer_state(state)))
+        tensor = restored["_mixed_precision_optimizer"]["fp32_from_fp16_params"]["weight"]
+        assert tensor.__class__ is torch.Tensor
+        assert not tensor.requires_grad
+        assert torch.equal(tensor, master)
+        assert tensor.dtype is torch.float32
+        assert not torch.equal(tensor, tensor.bfloat16().float())
+        assert torch.equal(restored["nested"][0][0], master)
+        assert restored["step"] == 16
+    finally:
+        if created_group:
+            dist.destroy_process_group()
 
 
 def test_checkpoint_state_clones_tied_storage_without_dropping_alias() -> None:
@@ -119,6 +147,54 @@ def _manager(tmp_path: Path) -> tuple[RLCheckpointManager, Any]:
         lambda _operation, callback: callback(),
     )
     return manager, trainer
+
+
+@pytest.mark.parametrize("checkpoint_policy", [False, None, "true"])
+def test_resume_rejects_optimizer_precision_change(tmp_path, monkeypatch, checkpoint_policy) -> None:
+    """A BF16-only checkpoint cannot silently recreate lost FP32 master precision."""
+    manager, _ = _manager(tmp_path)
+    manager.resolved_config = {"train": {"optimizer": {"fp32_main_params": True}}}
+    directory = tmp_path / "step_1"
+    directory.mkdir()
+    manifest = {"world_size": 1, "critic": False, "distillation_fingerprint": None}
+    if checkpoint_policy is not None:
+        manifest["optimizer_fp32_main_params"] = checkpoint_policy
+    (directory / "checkpoint_complete.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 1)
+    with pytest.raises(RuntimeError, match="precision policy differs"):
+        manager.validate_resume()
+
+
+@pytest.mark.parametrize("topology", [None, {"dp_shard": 1, "tp": 2}])
+def test_resume_rejects_missing_or_changed_master_partition(tmp_path, monkeypatch, topology) -> None:
+    """Equal world sizes cannot make different rank-local optimizer partitions compatible."""
+    manager, _ = _manager(tmp_path)
+    manager.resolved_config = {"train": {"optimizer": {"fp32_main_params": True},
+                                         "accelerator": {"dp_shard": 2, "tp": 1}}}
+    directory = tmp_path / "step_1"
+    directory.mkdir()
+    manifest = {"world_size": 2, "critic": False, "distillation_fingerprint": None,
+                "optimizer_fp32_main_params": True, "optimizer_parallel_topology": topology}
+    (directory / "checkpoint_complete.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 2)
+    with pytest.raises(RuntimeError, match="parallel topology differs"):
+        manager.validate_resume()
+
+
+@pytest.mark.parametrize("recipe", [None, "off", "qwen3_ascend_consistency_v1"])
+def test_resume_rejects_changed_numerical_recipe(tmp_path, monkeypatch, recipe) -> None:
+    """A fused/off optimizer partition cannot be restored into the native 0.23 recipe."""
+    manager, _ = _manager(tmp_path)
+    directory = tmp_path / "step_1"
+    directory.mkdir()
+    manifest = {"world_size": 1, "critic": False, "distillation_fingerprint": None}
+    if recipe is not None:
+        manifest["training_consistency_profile"] = recipe
+    (directory / "checkpoint_complete.json").write_text(json.dumps(manifest))
+    monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(checkpoint_backend, "consistency_profile", lambda _config: "qwen3_ascend_consistency_v023")
+    with pytest.raises(RuntimeError, match="numerical consistency recipe differs"):
+        manager.validate_resume()
 
 
 def test_save_persists_distributed_and_device_rng_state(

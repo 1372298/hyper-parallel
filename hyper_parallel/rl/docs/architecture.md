@@ -55,6 +55,14 @@ GRPO、PPO 和 GSPO 共用 SyncTrainer。GSPO 在 Qwen3 dense 路径上使用分
 
 ### master 模型接入
 
+可选 OPD/MOPD 由 `rl/distillation/` 管理冻结外部教师客户端和按样本路由，复用同一个 SyncTrainer。
+Teacher 只对学生的原始 token 评分，不参与 optimizer 或学生权重发布。
+Batch 分别保留原始采样概率、更新前重算概率和教师概率；任务目标与 k1 PG 蒸馏分别计算。
+纯 OPD 不请求任务优势、Reference 或 Critic；MOPD 每条样本只选择一个 tokenizer 兼容的 Teacher。
+失败在 Actor 更新前跨 rank 传播；工具观察和 DP padding 无 loss。
+Checkpoint 绑定蒸馏目标与教师元数据身份。完整合同、配方和测试见
+[OPD/MOPD 示例](../examples/distillation/README.md)。
+
 当前代码文件清单、隔离适配边界、回退范围和验证状态见 [模块导航](../../../docs/rl-navigation.md)。
 
 `rl/config.py` 将既有 YAML 转换为 master 的 `TrainerConfig`、`OptimizerConfig` 和 FSDP 配置。

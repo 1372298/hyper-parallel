@@ -77,6 +77,23 @@ consistency:
 
 缺少依赖、版本不符、非 eager、非 Qwen3、非 Hyper-vLLM 或 TP degree 不匹配时 fail closed。
 
+### 0.23 概率归一化配方
+
+运行时自动选择固定版本配方；原有 0.22.1 / 0.22.1rc1 配方保持原合同。
+`qwen3_ascend_consistency_v023` 要求 vLLM 0.23.0、vLLM-Ascend 0.23.0.post1、
+Torch 2.10.0、torch-npu 2.10.0.post4、Transformers 5.5.4、
+flash-attn-npu 0.2.0b1 和 batch-invariant-ops 1.0.0；其他版本组合拒绝安装。
+
+0.23 配方让 Trainer 与 rollout 对原始二维 logits 使用显式 FP32 输出 log-softmax。
+Trainer 的非持久 RoPE 频率在 CPU 上重建后传到目标设备，与 Hyper-vLLM 的初始化保持相同；
+避免设备上的 FP32 幂运算微小差异在较大位置改变 BF16 cos/sin。
+此外，默认 `aten::sum` 重载桥接到批次无关轴归约，保留 mask 的整数类型和损失梯度。
+这些处理不会复制采样概率，也不会改变有效 token mask 或放宽 bit-exact 门禁。
+实际支持的拓扑和长度仍须由真实系统测试证明。
+
+Checkpoint 保存 `training_consistency_profile`，恢复时要求相同配方；不能直接将 off 配方的优化器状态
+载入一致性模型，因为两者的参数结构可能不同。
+
 ## 运行
 
 TP1 默认使用两张 NPU：

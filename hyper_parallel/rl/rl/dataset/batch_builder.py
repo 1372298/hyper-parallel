@@ -118,6 +118,7 @@ def build_experience_batch(
         action_mask=action_mask,
         rewards=rewards,
         old_log_probs=old_log_probs,
+        rollout_log_probs=_detached(old_log_probs),
         responses=responses,
         generation_seconds=generation_seconds,
         worker_policy_version=worker_versions.pop(),
@@ -170,6 +171,10 @@ def _append_padding_rows(rollout: ExperienceBatch, missing: int) -> ExperienceBa
         rewards=torch.cat((rollout.rewards, rollout.rewards.new_zeros(missing))),
         old_log_probs=(None if rollout.old_log_probs is None else torch.cat((
             rollout.old_log_probs, rollout.old_log_probs.new_zeros((missing, rollout.old_log_probs.shape[1])),
+        ))),
+        rollout_log_probs=(None if rollout.rollout_log_probs is None else torch.cat((
+            rollout.rollout_log_probs,
+            rollout.rollout_log_probs.new_zeros((missing, rollout.rollout_log_probs.shape[1])),
         ))),
         responses=rollout.responses + ("",) * missing,
         metadata={**rollout.metadata, "dp_padding_rows": rollout.metadata.get("dp_padding_rows", 0) + missing},

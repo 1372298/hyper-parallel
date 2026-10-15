@@ -53,8 +53,11 @@ def restore_tied_parameter(model: Any) -> None:
 
 
 def adapt_materialization(model: Any) -> Any:
-    """Preserve tied aliases only on this model instance's to_empty calls."""
+    """Register RL-owned derived buffers and preserve this instance's tied aliases."""
+    from rl.roles.materialization import register_qwen3_materialization  # pylint: disable=C0415
+
     _require_qwen3(model)
+    register_qwen3_materialization(model)
     if not model.config.tie_word_embeddings:
         return model
     original_to_empty = model.to_empty

@@ -33,6 +33,9 @@ HyperParallel-RL 是面向 LLM、VLM、世界模型、具身智能和 Agentic AI
 
 ## 🌟 Why HyperParallel-RL
 
+可选 [OPD/MOPD](examples/distillation/README.md) 复用同步训练链路，支持单教师、按样本路由的多教师、
+纯蒸馏或与任务 RL 联合优化；当前目标为 sampled k1 PG，要求 tokenizer 严格兼容。
+
 ### 🪶 极简易用
 
 减少部署依赖，保持训练流程易于理解和运行。

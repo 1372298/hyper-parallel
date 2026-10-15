@@ -107,6 +107,9 @@ class ExperienceBatch:
     metadata: dict[str, Any] = field(default_factory=dict)
     worker_policy_version: Optional[int] = None
     bootstrap_values: Optional[Any] = None
+    teacher_log_probs: Optional[Any] = None
+    teacher_keys: Optional[tuple[str, ...]] = None
+    rollout_log_probs: Optional[Any] = None
 
     def __post_init__(self) -> None:
         """Validate the shared token dimensions before algorithm code runs."""
@@ -127,12 +130,14 @@ class ExperienceBatch:
             raise ValueError(
                 "experience old_log_probs must align with next-token positions"
             )
+        self._validate_rollout_scores(log_prob_shape)
         for field_name in ("advantages", "returns", "values", "reference_log_probs"):
             value = getattr(self, field_name)
             if value is not None and tuple(value.shape) != log_prob_shape:
                 raise ValueError(
                     f"experience {field_name} must align with next-token positions"
                 )
+        self._validate_teacher_scores(log_prob_shape)
         if bool(self.action_mask[:, 0].any().item()):
             raise ValueError("the first sequence token cannot be a trainable action")
         if self.trajectories:
@@ -143,6 +148,36 @@ class ExperienceBatch:
                 raise ValueError(
                     "experience worker policy version must match every trajectory"
                 )
+
+    def _validate_rollout_scores(self, log_prob_shape: tuple[int, int]) -> None:
+        """Validate detached sampling probabilities on supervised actions."""
+        if self.rollout_log_probs is not None:
+            if tuple(self.rollout_log_probs.shape) != log_prob_shape:
+                raise ValueError("experience rollout_log_probs must align with next-token positions")
+            if self.rollout_log_probs.requires_grad:
+                raise ValueError("Rollout probabilities must be detached")
+            valid = self.rollout_log_probs.masked_select(self.loss_action_mask.bool())
+            if not bool(valid.isfinite().all().item()) or bool((valid > 1.0e-5).any().item()):
+                raise ValueError("Rollout action log probabilities must be finite and nonpositive")
+
+    def _validate_teacher_scores(self, log_prob_shape: tuple[int, int]) -> None:
+        """Validate frozen teacher scores and row routing identities."""
+        if self.teacher_log_probs is not None:
+            if tuple(self.teacher_log_probs.shape) != log_prob_shape:
+                raise ValueError('experience teacher_log_probs must align with next-token positions')
+            if self.teacher_keys is None or len(self.teacher_keys) != log_prob_shape[0]:
+                raise ValueError('experience teacher_keys must contain one identity per row')
+            active_rows = self.loss_action_mask.bool().any(dim=-1).tolist()
+            if any(not isinstance(key, str) or (active and not key)
+                   for key, active in zip(self.teacher_keys, active_rows)):
+                raise ValueError('Every supervised row must identify its teacher')
+            if self.teacher_log_probs.requires_grad:
+                raise ValueError('Teacher scores must be detached')
+            valid = self.teacher_log_probs.masked_select(self.loss_action_mask.bool())
+            if not bool(valid.isfinite().all().item()) or bool((valid > 1.0e-5).any().item()):
+                raise ValueError('Teacher action log probabilities must be finite and nonpositive')
+        elif self.teacher_keys is not None:
+            raise ValueError('teacher_keys require teacher_log_probs')
 
     @property
     def loss_action_mask(self) -> Any:

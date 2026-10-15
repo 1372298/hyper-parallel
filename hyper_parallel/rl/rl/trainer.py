@@ -19,7 +19,7 @@ import os
 import random
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 
 import torch
@@ -28,7 +28,11 @@ from transformers import AutoTokenizer
 
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
+from rl.algorithm.distillation import compose_training_algorithm
 from rl.algorithm.loss import build_algorithm
+from rl.distillation.monitoring import validate_probability_gate
+from rl.distillation.config import parse_distillation_config
+from rl.distillation.teacher import TeacherManager, attach_teacher_scores
 from rl.checkpoint import RLCheckpointManager
 from rl.config import (
     build_model_registration,
@@ -204,9 +208,11 @@ class SyncTrainer:
         """Validate configuration and build the complete distributed runtime."""
         self.resolved_config = resolve_vllm_automatic_limits(resolved_config)
         self._consistency_profile = configure_consistency_profile(self.resolved_config)
-        self.algorithm = build_algorithm(
-            required_mapping(self.resolved_config, "algorithm")
+        self.distillation_config = parse_distillation_config(self.resolved_config.get('distillation'))
+        self.algorithm = compose_training_algorithm(
+            build_algorithm(required_mapping(self.resolved_config, 'algorithm')), self.distillation_config,
         )
+        self.teacher_manager = None
         validate_config(self.resolved_config, self.algorithm)
         _configure_batch_invariant_communication(self.resolved_config)
         install_trainer_consistency_profile(self.resolved_config)
@@ -258,9 +264,10 @@ class SyncTrainer:
             self.runtime_config
         )
         normalize_distributed_setup_overrides(self.distributed_setup, self.runtime_config)
-        # Pure TP still needs a size-one FSDP domain to retain checkpoint
-        # layouts and reduce TP-replicated gradients, as in the RL source tree.
-        if self.runtime_config.accelerator.tp_size > 1 and self.distributed_setup.strategy_config is None:
+        # Size-one FSDP is also needed to honor requested CPU parameter/gradient offload.
+        needs_fsdp = (self.runtime_config.accelerator.tp_size > 1 or
+                      bool(getattr(self.runtime_config.fsdp_config, "enable_offload", False)))
+        if needs_fsdp and self.distributed_setup.strategy_config is None:
             self.distributed_setup.strategy_config = self.runtime_config.fsdp_config
         self.parallel_dims = self.distributed_setup.mesh_context
         self.mesh = self.parallel_dims.device_mesh
@@ -356,7 +363,7 @@ class SyncTrainer:
                 group_size=self.parallel_dims.dp_size,
                 operation="pre-update",
             )
-        if collect_diagnostics or consistency_gate_enabled:
+        if collect_diagnostics or consistency_gate_enabled or getattr(self, "teacher_manager", None) is not None:
             stage_started = time.perf_counter()
             actor_log_probs = self._run_rank_synchronized(
                 "pre-update Actor log-probabilities",
@@ -397,6 +404,10 @@ class SyncTrainer:
             )
             values = full_values[:, :-1]
             timings["values"] = time.perf_counter() - stage_started
+        if getattr(self, 'teacher_manager', None) is not None:
+            if rollout.rollout_log_probs is None:
+                raise ValueError("OPD requires independently retained rollout_log_probs")
+            rollout = replace(rollout, old_log_probs=actor_log_probs.detach())
         stage_started = time.perf_counter()
         prepare = functools.partial(
             self.experience_preparer.prepare, rollout,
@@ -466,6 +477,10 @@ class SyncTrainer:
         if rollout.old_log_probs is None:
             raise RuntimeError("Training rollout did not produce old_log_probs")
         rollout = pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
+        if getattr(self, 'teacher_manager', None) is not None:
+            stage_started = time.perf_counter()
+            rollout = self._score_teacher_rollout(prompt_records, rollout)
+            timings['teacher'] = time.perf_counter() - stage_started
         collect_diagnostics = next_step % self._log_steps == 0 or (
             self.evaluator is not None and self.checkpoints.will_save(next_step)
         )
@@ -474,11 +489,30 @@ class SyncTrainer:
             collect_diagnostics,
             timings,
         )
+        if getattr(self, "teacher_manager", None) is not None:
+            diagnostic_metrics.update(self._run_rank_synchronized(
+                "OPD pre-update probability gate",
+                lambda: validate_probability_gate(experience, self.distillation_config,
+                                                  group=self._dp_group_info.group,
+                                                  size=self.parallel_dims.dp_size),
+            ))
         # Detached inference targets no longer need the full role parameters.
         self._release_training_state_for_rollout()
         stage_started = time.perf_counter()
         actor_update = self.actor.update(experience)
         timings["update_actor"] = time.perf_counter() - stage_started
+        if getattr(self, 'teacher_manager', None) is not None:
+            diagnostic_metrics.update(self.actor.distillation_metrics())
+            counts = torch.tensor([
+                sum(key == teacher_key for key in experience.teacher_keys)
+                for teacher_key, _ in self.distillation_config.teachers
+            ], device=self.device, dtype=torch.int64)
+            if self.parallel_dims.dp_size > 1:
+                dist.all_reduce(counts, group=self._dp_group_info.group)
+            diagnostic_metrics.update({
+                f'distillation/teacher_samples/{key}': float(count)
+                for (key, _), count in zip(self.distillation_config.teachers, counts.tolist())
+            })
         if self._consistency_profile != CONSISTENCY_PROFILE_OFF:
             stage_started = time.perf_counter()
             diagnostic_metrics.update(self._post_update_mismatch(experience))
@@ -502,6 +536,23 @@ class SyncTrainer:
             critic_update=critic_update,
             diagnostic_metrics=diagnostic_metrics,
         )
+
+    def _score_teacher_rollout(self, prompt_records: Any, rollout: ExperienceBatch) -> ExperienceBatch:
+        """Only TP owners score; synchronize errors before sharing results with siblings."""
+        owner = self.parallel_dims.tp_size == 1 or self.parallel_dims.tp_rank == 0
+        result = self._run_rank_synchronized(
+            'teacher scoring',
+            lambda: self.teacher_manager.score_batch(rollout, prompt_records) if owner else None,
+        )
+        if self.parallel_dims.tp_size > 1:
+            group = self.parallel_dims.device_mesh['tp'].get_group()
+            source = dist.get_global_rank(group, 0)
+            shared = [result]
+            dist.broadcast_object_list(shared, src=source, group=group)
+            result = shared[0]
+        if result is None:
+            raise RuntimeError('Teacher scoring completed without a result')
+        return self._run_rank_synchronized('teacher score alignment', lambda: attach_teacher_scores(rollout, result))
 
     def _post_update_mismatch(self, experience: ExperienceBatch) -> dict[str, float]:
         """Collect synchronized post-update policy consistency diagnostics."""
@@ -655,6 +706,12 @@ class SyncTrainer:
         self._build_models_and_optimizers()
         self._build_rollout_runtime()
         self._build_reward_model_runtime()
+        if self.distillation_config.enabled:
+            self.teacher_manager = TeacherManager(self.distillation_config)
+            self._run_rank_synchronized(
+                'teacher startup validation',
+                lambda: self.teacher_manager.validate(self.model_registration.tokenizer_path),
+            )
         self.experience_preparer = ExperiencePreparer(self.algorithm, self._dp_group_info)
         checkpoint_config = required_mapping(
             required_mapping(self.resolved_config, "train"),
@@ -686,6 +743,7 @@ class SyncTrainer:
         dataset_kwargs = {
             "row_adapter": data_config.get("row_adapter"),
             "metadata_columns": data_config.get("metadata_columns"),
+            "chat_template_kwargs": data_config.get("chat_template_kwargs"),
             "tokenizer": self.tokenizer,
             "max_prompt_length": int(data_config["max_prompt_length"]),
             "prompt_column": (
@@ -785,6 +843,7 @@ class SyncTrainer:
             response_mini_batch_size=int(train_config["response_mini_batch_size"]),
             update_epochs=int(train_config["policy_update_epochs"]),
             max_grad_norm=float(optimizer_config.get("max_grad_norm", 1.0)),
+            distillation=self.distillation_config if self.distillation_config.enabled else None,
             **actor_kwargs,
         )
         self.reference_actor = (

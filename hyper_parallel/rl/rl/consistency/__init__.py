@@ -22,6 +22,7 @@ from rl.consistency.gates import (
 from rl.consistency.qwen3_dense import (
     CONSISTENCY_PROFILE_OFF,
     QWEN3_ASCEND_CONSISTENCY_V1,
+    QWEN3_ASCEND_CONSISTENCY_V023,
     configure_consistency_profile,
     consistency_profile,
     consistency_runtime_state,
@@ -35,6 +36,7 @@ from rl.consistency.qwen3_dense import (
 __all__ = [
     "CONSISTENCY_PROFILE_OFF",
     "QWEN3_ASCEND_CONSISTENCY_V1",
+    "QWEN3_ASCEND_CONSISTENCY_V023",
     "configure_consistency_profile",
     "consistency_profile",
     "consistency_runtime_state",

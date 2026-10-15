@@ -27,7 +27,7 @@ from rl.dataset.data_source import (
     build_padded_evaluation_batches,
     build_prompt_records,
 )
-from rl.dataset.episodes import episode_rows
+from rl.dataset.episodes import episode_rows, generation_finish_reason
 from rl.roles.rollout.worker import RolloutManager
 from rl.utils.monitoring.metrics import select_round_robin_samples
 
@@ -213,7 +213,7 @@ class Evaluator:
                         "reward": reward,
                         "reward_components": dict(trajectory.reward_components),
                         "status": trajectory.metadata.get("status"),
-                        "finish_reason": rollout.trajectories[rows[-1]].metadata.get("finish_reason"),
+                        "finish_reason": generation_finish_reason(rollout.trajectories[rows[-1]]),
                     }
                 )
         return record

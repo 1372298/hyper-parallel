@@ -16,6 +16,7 @@
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Awaitable, Optional, Union
 
 from rl.agentic.core.chat_template import CHAT_TEMPLATE_MESSAGES
@@ -32,8 +33,7 @@ from examples.gsm8k.tools import build_calculator_registry
 if TYPE_CHECKING:
     from rl.reward_model.client import RewardModelClient
 
-_ANSWER_PATTERN = re.compile(r"####\s*(\-?[0-9\.\,]+)")
-_NUMERIC_PATTERN = re.compile(r"^\s*(\-?[0-9\.\,]+)\s*$")
+_NUMERIC_PATTERN = re.compile(r"\s*\$?\s*([+-]?(?:[0-9]+(?:,[0-9]{3})*(?:\.[0-9]*)?|\.[0-9]+))\s*\$?\s*")
 _REWARD_WINDOW = 300
 PROMPT_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
 _MULTI_TURN_PROMPT = """Solve the math problem carefully. You may call the calculator.
@@ -45,15 +45,28 @@ def normalize_answer(value: str) -> str:
     """Remove display-only characters from a numeric GSM8K answer."""
     if "####" in value:
         value = value.rsplit("####", maxsplit=1)[-1]
-    return value.replace(",", "").replace("$", "").strip()
+    cleaned = value.replace(",", "").replace("$", "").strip()
+    try:
+        number = Decimal(cleaned)
+    except InvalidOperation:
+        return cleaned
+    if not number.is_finite():
+        return cleaned
+    if number == 0:
+        return "0"
+    normalized = format(number, "f")
+    return normalized.rstrip("0").rstrip(".") if "." in normalized else normalized
 
 
 def extract_answer(solution: str) -> Optional[str]:
     """Extract a strict final answer from a response or tool final-answer value."""
-    matches = _ANSWER_PATTERN.findall(solution[-_REWARD_WINDOW:])
-    if matches:
-        return normalize_answer(matches[-1])
-    direct = _NUMERIC_PATTERN.fullmatch(solution)
+    window = solution[-_REWARD_WINDOW:]
+    if "####" in window:
+        final = window.rsplit("####", maxsplit=1)[-1].lstrip().splitlines()
+        candidate = final[0] if final else ""
+    else:
+        candidate = solution
+    direct = _NUMERIC_PATTERN.fullmatch(candidate)
     return None if direct is None else normalize_answer(direct.group(1))
 
 

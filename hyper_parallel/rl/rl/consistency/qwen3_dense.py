@@ -17,6 +17,7 @@
 __all__ = [
     "CONSISTENCY_PROFILE_OFF",
     "QWEN3_ASCEND_CONSISTENCY_V1",
+    "QWEN3_ASCEND_CONSISTENCY_V023",
     "configure_consistency_profile",
     "consistency_runtime_state",
     "consistency_profile",
@@ -43,6 +44,8 @@ from rl.consistency.vllm_ascend import install_partial_prefill_rng_fix
 
 CONSISTENCY_PROFILE_OFF = "off"
 QWEN3_ASCEND_CONSISTENCY_V1 = "qwen3_ascend_consistency_v1"
+QWEN3_ASCEND_CONSISTENCY_V023 = "qwen3_ascend_consistency_v023"
+_SUPPORTED_PROFILES = (QWEN3_ASCEND_CONSISTENCY_V1, QWEN3_ASCEND_CONSISTENCY_V023)
 _TRAINER_ATTENTION_IMPLEMENTATION = "hyper_qwen3_npu_consistent_v1"
 _EXPECTED_PACKAGE_VERSIONS = {
     "batch-invariant-ops": "1.0.0",
@@ -50,6 +53,13 @@ _EXPECTED_PACKAGE_VERSIONS = {
     "transformers": "5.5.4",
     "vllm": "0.22.1",
     "vllm-ascend": "0.22.1rc1",
+}
+_EXPECTED_PACKAGE_VERSIONS_023 = {
+    **_EXPECTED_PACKAGE_VERSIONS,
+    "vllm": "0.23.0",
+    "vllm-ascend": "0.23.0.post1",
+    "torch": "2.10.0",
+    "torch-npu": "2.10.0.post4",
 }
 _ROLLOUT_PROFILE_SETTINGS = {
     "attention_backend": "FLASH_ATTN",
@@ -80,6 +90,29 @@ class _ConsistencyRuntime:
 
 
 _runtime = _ConsistencyRuntime()
+
+
+def _enable_batch_invariant_023(enable: Callable[[], None]) -> None:
+    """Adapt the 0.23 default aten sum overload while retaining invariant kernels."""
+    namespace = torch.ops.batch_invariant_ops
+    native_sum = namespace.npu_reduce_sum_batch_invariant
+
+    def sum_default_bridge(
+        tensor: Any, dim: Optional[int] = None, keepdim: bool = False, *, dtype: Any = None,
+    ) -> Any:
+        """Honor default-sum dtype and dimensions before calling the axis kernel."""
+        if dim is not None:
+            return native_sum(tensor, dim, keepdim)
+        target = tensor.dtype if dtype is None else dtype
+        if target not in (torch.float16, torch.bfloat16, torch.float32):
+            return torch.ops.aten.sum.dim_IntList(tensor, list(range(tensor.dim())), False, dtype=dtype)
+        return native_sum(tensor.to(dtype=target).reshape(-1), -1, False)
+
+    namespace.npu_reduce_sum_batch_invariant = sum_default_bridge
+    try:
+        enable()
+    finally:
+        namespace.npu_reduce_sum_batch_invariant = native_sum
 
 
 def consistency_runtime_state() -> dict[str, Any]:
@@ -201,7 +234,15 @@ def consistency_profile(config: Mapping[str, Any]) -> str:
     enabled = consistency.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("consistency.enabled must be a boolean")
-    return QWEN3_ASCEND_CONSISTENCY_V1 if enabled else CONSISTENCY_PROFILE_OFF
+    if not enabled:
+        return CONSISTENCY_PROFILE_OFF
+    try:
+        versions = tuple(package_version(name).split("+", maxsplit=1)[0] for name in ("vllm", "vllm-ascend"))
+    except PackageNotFoundError:
+        # Offline configuration remains usable; installation still checks every pin.
+        return QWEN3_ASCEND_CONSISTENCY_V1
+    return (QWEN3_ASCEND_CONSISTENCY_V023 if versions == ("0.23.0", "0.23.0.post1")
+            else QWEN3_ASCEND_CONSISTENCY_V1)
 
 
 def configure_consistency_profile(config: dict[str, Any]) -> str:
@@ -356,7 +397,7 @@ def trainer_sequence_log_probs(
     """
     if _runtime.installed_profile == CONSISTENCY_PROFILE_OFF:
         return None
-    if _runtime.installed_profile != QWEN3_ASCEND_CONSISTENCY_V1:
+    if _runtime.installed_profile not in _SUPPORTED_PROFILES:
         raise RuntimeError(f"Unsupported installed Trainer profile {_runtime.installed_profile!r}")
     if sequences.ndim != 2 or tuple(attention_mask.shape) != tuple(sequences.shape):
         raise ValueError("Packed Trainer inputs require aligned two-dimensional sequences and attention_mask")
@@ -372,7 +413,15 @@ def trainer_sequence_log_probs(
         packed_max_seqlen=max(lengths_cpu),
     )
     logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-    log_probs = logits.float().log_softmax(dim=-1)
+    if _runtime.installed_profile == QWEN3_ASCEND_CONSISTENCY_V023:
+        # vLLM 0.23 computes raw probabilities on uncast, two-dimensional
+        # logits with an explicit FP32 output dtype. Preserve that operator
+        # path instead of materializing FP32 logits before normalization.
+        log_probs = logits.reshape(-1, logits.shape[-1]).log_softmax(
+            dim=-1, dtype=torch.float32,
+        ).reshape(logits.shape)
+    else:
+        log_probs = logits.float().log_softmax(dim=-1)
 
     return _restore_trainer_log_probs(sequences, lengths_cpu, log_probs)
 
@@ -418,9 +467,11 @@ def _restore_trainer_log_probs(sequences: Any, lengths_cpu: list[int], log_probs
     return torch.cat(rows, dim=0)
 
 
-def _require_package_versions() -> None:
+def _require_package_versions(profile: str = QWEN3_ASCEND_CONSISTENCY_V1) -> None:
     """Fail closed unless every version-pinned profile dependency is installed."""
-    for distribution, expected in _EXPECTED_PACKAGE_VERSIONS.items():
+    versions = (_EXPECTED_PACKAGE_VERSIONS_023 if profile == QWEN3_ASCEND_CONSISTENCY_V023
+                else _EXPECTED_PACKAGE_VERSIONS)
+    for distribution, expected in versions.items():
         try:
             installed = package_version(distribution).split("+", maxsplit=1)[0]
         except PackageNotFoundError as error:
@@ -437,9 +488,9 @@ def validate_rollout_consistency_profile(profile: str) -> None:
     """Fail closed if an isolated rollout process cannot provide its profile."""
     if profile == CONSISTENCY_PROFILE_OFF:
         return
-    if profile != QWEN3_ASCEND_CONSISTENCY_V1:
+    if profile not in _SUPPORTED_PROFILES:
         raise ValueError(f"Unsupported rollout consistency profile {profile!r}")
-    _require_package_versions()
+    _require_package_versions(profile)
     try:
         # These optional packages are imported only by an explicitly profiled rollout.
         from flash_attn_npu_v3 import flash_attn_with_kvcache  # pylint: disable=C0415
@@ -496,7 +547,7 @@ def install_trainer_consistency_profile(config: Mapping[str, Any]) -> None:
     if (torch.accelerator.current_accelerator() or torch.device("cpu")).type != "npu":
         raise ValueError(f"Consistency profile {profile!r} requires the Torch NPU backend")
 
-    _require_package_versions()
+    _require_package_versions(profile)
     try:
         # These optional NPU packages must remain unloaded when the profile is off.
         from flash_attn_npu import (  # pylint: disable=C0415
@@ -531,7 +582,10 @@ def install_trainer_consistency_profile(config: Mapping[str, Any]) -> None:
     )
     os.environ["HCCL_DETERMINISTIC"] = "strict"
     os.environ["LCCL_DETERMINISTIC"] = "1"
-    enable_batch_invariant_mode()
+    if profile == QWEN3_ASCEND_CONSISTENCY_V023:
+        _enable_batch_invariant_023(enable_batch_invariant_mode)
+    else:
+        enable_batch_invariant_mode()
     _install_batch_invariant_sum_compatibility()
     _install_qwen3_npu_rms_norm()
     _runtime.installed_profile = profile
