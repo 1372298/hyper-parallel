@@ -43,6 +43,10 @@ training:
   seed: 42
   enable_full_determinism: true
 
+loss_fn:
+  _target_: hyper_parallel.components.losses.ChunkedCausalLMLoss
+  chunk_size: 1024
+
 accelerator:
   tp_size: 1
   cp_size: 1

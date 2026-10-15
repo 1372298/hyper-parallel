@@ -72,6 +72,13 @@ def _load_encoder_parallel_spec():
     return get_deepseek_v41_encoder_parallel_spec()
 
 
+def _load_loss():
+    """Return the V4.1 model-integrated output-loss adapter."""
+    from hyper_parallel.models.deepseek_v41.adapter import chunk_loss  # pylint: disable=C0415
+
+    return chunk_loss
+
+
 register_custom_model(
     "DeepseekV41ForCausalLM",
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
@@ -92,6 +99,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     recompute=build_recompute_policy,
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,
+    loss=_load_loss,
 )
 register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
 
