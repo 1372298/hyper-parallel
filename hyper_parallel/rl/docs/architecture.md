@@ -28,7 +28,7 @@ Agentic 的内部 runner 保留环境循环；Codex 与 DeepSeek Harness 使用�
 入口 `train_rl.py` 读取 YAML 和严格的 dot-path CLI overrides，然后构造 `SyncTrainer`。初始化分为三步：
 
 1. `rl/config.py` 校验模型、数据、算法、并行度、deployment、weight sync 和 consistency 组合。
-2. Actor 和按算法需求选择的冻结 Reference 调用 `rl.roles.qwen3_builder.build_causal_lm`。
+2. Actor 和按算法需求选择的冻结 Reference 通过共享模型构建入口加载；Qwen3 dense 使用 `rl.roles.qwen3_builder.build_causal_lm`，Qwen3-MoE 与 Qwen3.5 家族使用公共 text AutoModel。
    PPO 的 `roles/policy/critic.py::build_value_model` 在标准模型构建前后边界接入价值头，
    所有参数在 TP/FSDP 规划前存在，随后由同一 HyperParallel 加载器完成构建。
    FSDP/TP、optimizer、gradient clipping 与 checkpoint 复用 master 公共能力。
@@ -49,13 +49,13 @@ mesh、layout、FSDP、P2P 和 redistribution 缓存。P2P 缓存使用 native-c
 
 GRPO、PPO 和 GSPO 共用 SyncTrainer。GSPO 在 Qwen3 dense 路径上使用分组优势、序列级重要性比率和等权序列损失；默认零 KL，不创建 Reference 或 Critic。
 三种算法只在 `kl_coef > 0` 时请求 Reference；PPO 仍创建独立 Critic，固定 old values / returns 后更新两种角色，
-仅发布 Actor 权重。PPO 的配置、数据语义和实际验收范围见 [PPO](ppo.md)。
+仅发布 Actor 权重。PPO 的配置、数据语义和实际验收范围见 [PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)。
 
 可选共卡 RM 由 `rl/reward_model/` 持有冻结 vLLM 服务；业务评分函数位于 `examples/`。Trainer 仅在内部 Qwen3 Dense 的模型模式下安排 `rollout sleep → RM wake/score/sleep → Actor update`，并在评估、保存恢复和退出时核对服务状态。默认规则环境直接评分，不创建 RM。接口及验收边界见[共卡 RM 合同](reward_model.md)。
 
 ### master 模型接入
 
-当前代码文件清单、隔离适配边界、回退范围和验证状态见 [Qwen3-4B master 适配方案](qwen3_master_adaptation.md)。
+当前代码文件清单、隔离适配边界、回退范围和验证状态见 [模块导航](../../../docs/rl-navigation.md)。
 
 `rl/config.py` 将既有 YAML 转换为 master 的 `TrainerConfig`、`OptimizerConfig` 和 FSDP 配置。
 `rl/roles/model_setup.py` 只调用模型及优化器构建入口、冻结 Reference，不实现 Qwen3 的 forward 或并行切分。
@@ -74,7 +74,7 @@ RL 的 Qwen3 构建兼容集中于 `rl/roles/qwen3_builder.py`；主项目使用
 vLLM 的 `HyperQwen3ForCausalLM` 继续提供 paged attention/KV cache；Native-vLLM 选择保持不变。
 用于训推一致性的模型适配位于 `rl/roles/rollout/consistency_models/<family>/`；
 一致性校验仍由 `consistency.enabled` 控制。公共服务与生成生命周期保留在
-`rl/roles/rollout/`；目录职责及导入迁移见[代码与模型接入](qwen3_master_adaptation.md#5-rl-运行代码改动清单)。
+`rl/roles/rollout/`；目录职责及导入迁移见[模块归属](../../../.agent/rules/rl/module-map.md)。
 独立的 `hyper_parallel/rl/pyproject.toml` 声明 vLLM 插件入口。Docker 启动脚本通过
 `docker/install_runtime.sh` 在容器临时目录构建安装，源码仍从只读挂载的 checkout 导入。
 
@@ -118,7 +118,7 @@ returns / values     [batch, tokens - 1] when required
 - 将 observation/action 映射为 token-aligned turns；
 - 输出一个完整 episode 的 `Trajectory`，或带完整调用身份的逐调用 `Trajectory` 元组。
 
-`ProgramAgentRunner` 已通过内置 Codex / DeepSeek Harness 接入配置驱动的训练入口，复用同一轨迹与 batch 合同。任意自定义 runner 尚不能直接在 YAML 中接入，仍需适配 runtime、factory、manager 与配置校验；程序化路径的交付验收列入 [TODO](TODO.md)。
+`ProgramAgentRunner` 已通过内置 Codex / DeepSeek Harness 接入配置驱动的训练入口，复用同一轨迹与 batch 合同。任意自定义 runner 尚不能直接在 YAML 中接入，仍需适配 runtime、factory、manager 与配置校验；程序化路径的已验证范围见 [Agentic RL](agentic_rl.md) 和 [Code Agent](swe_smith.md)。
 
 ### Agentic Harness
 
@@ -213,7 +213,7 @@ Disjoint 不需要 training residency 切换，但 publication 期间仍会关�
 
 默认使用 packed full-gather：按稳定名称逐参数 materialize，只有 Trainer rank 0 打包完整参数，worker 通过 vLLM `load_weights()` 加载；每个 ACK 后释放当前 bucket，不物化整份模型。`bucket_size_mb` 是合桶阈值，单个超大参数可以超过该值。TP1/TP2 均可显式选择 direct-reshard，只传输 source/destination layout 的交集，并继续严格限制 fragment 大小。
 
-两种策略共用 Qwen3 dense 的 canonical adapter、DP/TP 布局与事务校验。专家参数布局和 MoE 专用发布分支已移除；Qwen3 的 colocated、disjoint 与适用的 Bit-Exact 路径保留。
+两种策略共用 Qwen3 dense 的 canonical adapter、DP/TP 布局与事务校验。Qwen3-MoE 通过同一同步边界处理专家参数；仅支持共卡 native vLLM，具体 TP/EP/EDP 组合见 [MoE 说明](moe_code_agent.md)。Qwen3 dense 保留 colocated、disjoint 与适用的 Bit-Exact 路径。
 
 共享 Qwen3 的融合 QKV 权重由 RL 的 `weight_sync/model_adapter.py` 描述为标准 HF 权重的行区间。
 full-gather 按物理融合参数合桶，接收方按元数据还原 Q/K/V 后调用 vLLM `load_weights()`；
@@ -269,7 +269,7 @@ Resume 后，如果 Trainer step 高于 rollout 初始版本，Trainer 会在第
 
 ## 演进边界（规划）
 
-长期能力目标见[设计原则](design.md)，目标模型与交付依赖见 [TODO](TODO.md)。本文维护演进所需的合同边界，不重复维护任务状态或验收数字。同步、异步与多模态应复用任务接口、算法组件和模型基础设施；不同执行模式可以采用独立的显式编排，不要求全部逻辑进入 SyncTrainer。
+长期能力目标见[设计原则](design.md)，当前模型与验证边界见 [支持范围](../README.md#支持范围)。本文维护演进所需的合同边界，不重复维护任务状态或验收数字。同步、异步与多模态应复用任务接口、算法组件和模型基础设施；不同执行模式可以采用独立的显式编排，不要求全部逻辑进入 SyncTrainer。
 
 | 方向 | 复用内容 | 必须新增或重新定义的合同 |
 | --- | --- | --- |
@@ -278,7 +278,7 @@ Resume 后，如果 Trainer step 高于 rollout 初始版本，Trainer 会在第
 | 多模态训练 | 轨迹、奖励、算法与训练编排 | 视觉模块及投影层的模型接入、可训练/冻结范围、权重发布与恢复；媒体/处理元数据和 token/动作位置对齐，两侧预处理一致 |
 | 多模态 Agent | 多模态训练与既有任务接口 | 环境反馈、工具输出及多轮媒体拼接；明确截断、取消、奖励归属与资源释放 |
 | 更大规模 / 多节点 | HyperParallel 并行与流式同步 | 完整目标模型适配、容量测算、必要的并行/offload；MoE 训练/采样资源部署、跨节点发布、失败传播与恢复 |
-| PPO 扩展组合 | 已接入独立 Critic 与双角色 checkpoint | 具体并行、恢复和学习证据见 [PPO](ppo.md)，未验收组合不能外推 |
+| PPO 扩展组合 | 已接入独立 Critic 与双角色 checkpoint | 具体并行、恢复和学习证据见 [PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)，未验收组合不能外推 |
 
 ### 学习与样本合同（规划）
 
@@ -302,9 +302,9 @@ Resume 后，如果 Trainer step 高于 rollout 初始版本，Trainer 会在第
 
 Partial rollout、请求中途换权重和 retry 分别设计、验证后再引入。重放已完成样本保留原 token 与身份；重新生成须记录新的尝试与实际策略，不能承诺相同 seed 必然生成相同 token。重复提交约束作用于持久化训练提交边界；有副作用的外部工具通过幂等标识或明确失败语义处理，不承诺调用恰好一次。
 
-CP/PP、更多 TP/EP 组合及动态专家重分配按实际任务需求推进；基础库存在某项并行能力不等于 RL 端到端已支持。当前 RL 模型适配仅使用 EP1，模型范围见[功能清单](current_feature_inventory.md)。
+CP/PP、更多 TP/EP 组合及动态专家重分配按实际任务需求推进；基础库存在某项并行能力不等于 RL 端到端已支持。当前 RL 模型与已验证 TP/EP/EDP 组合见[支持范围](../README.md#支持范围)。
 
 ## 阅读代码
 
-需要定位具体实现时，参阅 [代码文件与模型接入](qwen3_master_adaptation.md)、[PPO](ppo.md)
+需要定位具体实现时，参阅 [模块导航](../../../docs/rl-navigation.md)、[PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)
 和 [测试入口](../README.md#系统测试)。架构文档不重复维护函数级路径。

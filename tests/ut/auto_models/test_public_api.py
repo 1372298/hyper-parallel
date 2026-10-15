@@ -73,6 +73,7 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("_tp_local_attr_plan", "None"),
                 ("_deferred_bias_params", "()"),
                 ("is_boundary", "True"),
+                ("skip_source_lowering", "None"),
                 ("region_dispatch", "None"),
                 ("inner_target", "None"),
                 ("inner_wrapper", "None"),
@@ -170,6 +171,10 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("pp_size", "1"),
                 ("sequence_parallel", "False"),
                 ("loss_parallel", "False"),
+                (
+                    "encoder_parallel",
+                    "<factory> EncoderParallelConfig(enabled=False, encoder_cp_size=1)",
+                ),
             ],
         )
 
@@ -183,6 +188,7 @@ class TestTrainerConfigContracts(unittest.TestCase):
             _field_snapshot(CompileConfig),
             [
                 ("enabled", "False"),
+                ("use_joint_graph", "False"),
                 ("mode", "'default'"),
                 ("fullgraph", "False"),
                 ("dynamic", "False"),

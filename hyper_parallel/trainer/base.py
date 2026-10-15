@@ -47,6 +47,7 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import HSDPModule, SkipDTensorDispatch
+from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -71,6 +72,7 @@ from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
+from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.components.losses.model_output import ModelOutputLoss
 from hyper_parallel.core.optimizer import (
     ChainedOptimizer,
@@ -364,9 +366,15 @@ class BaseTrainer(Stateful, ABC):
             swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
             activation_swap=self.config.activation_swap,
             compile_config=self.config.compile,
+            codegen=self.config.codegen,
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
             model_init_dtype=self.config.model_init_dtype,
+            codegen_config=self.config,
+        )
+        _validate_optimize_dtype(
+            self.model,
+            fp32_main_params=self.config.optimizer.fp32_main_params,
         )
         self.model_config = self.model.config
         if self.global_rank == 0:
@@ -532,6 +540,42 @@ class BaseTrainer(Stateful, ABC):
         else:
             self.model_fwd_context = nullcontext()
         self.model_bwd_context = nullcontext()
+        self.graph_compiler: Optional[GraphCompiler] = None
+
+    def _build_graph_compiler(self) -> None:
+        """Build the optional joint-graph compiler for this trainer runtime."""
+        if not self.config.compile.selects_graph_compiler():
+            return
+        self.graph_compiler = GraphCompiler(
+            model=self.model,
+            train_fn=self._graph_train_fn,
+            trainer_config=self.config,
+            device=self.device,
+            mesh_context=self.mesh,
+        )
+
+    def _graph_train_fn(
+            self,
+            model: torch.nn.Module,
+            model_inputs: Dict[str, Any],
+            labels: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Wrap the BaseTrainer forward/loss logic for joint-graph capture."""
+        model_fwd_context = (
+            self.model_fwd_context()
+            if callable(self.model_fwd_context)
+            else self.model_fwd_context
+        )
+        with model_fwd_context:
+            outputs = model(**model_inputs, use_cache=False)
+        # postforward adds the token-weighted global aggregation used by the
+        # eager path; it embeds .item()/all_reduce, which the tracer must be
+        # able to capture for this to compile. Both the backward loss and the
+        # named per-key losses are returned: the tracer emits the loss_dict
+        # values as extra graph outputs (after the gradients), so
+        # multi-key losses keep per-key logging parity with the eager path.
+        loss, loss_dict = self.postforward(outputs, labels)
+        return loss, loss_dict
 
     def _init_callbacks(self):
         """Initialize callbacks."""
@@ -660,6 +704,17 @@ class BaseTrainer(Stateful, ABC):
             device_mesh=self.mesh,
         )
         loss = torch.stack(list(loss_dict.values())).sum()
+        # Model-declared extra metrics join the logged mapping only after
+        # the backward loss is fixed: log-only, never part of the loss.
+        extra_metrics = getattr(outputs, "extra_metrics", None)
+        if extra_metrics is None:
+            model_ref = getattr(self, "model", None)
+            extra_metrics = getattr(model_ref, "pending_extra_metrics", None)
+            if extra_metrics is not None:
+                model_ref.pending_extra_metrics = None
+        if extra_metrics:
+            for name, value in extra_metrics.items():
+                loss_dict[name] = value.detach().float()
         return loss, loss_dict
 
     def forward_backward_step(
@@ -710,26 +765,40 @@ class BaseTrainer(Stateful, ABC):
                 channel_loss_callback.strip_model_inputs(micro_batch)
             self.model_integration.record_batch(micro_batch, loss_inputs)
 
-            model_fwd_context = (
-                self.model_fwd_context()
-                if callable(self.model_fwd_context)
-                else self.model_fwd_context
-            )
-            with model_fwd_context:
-                outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
+            if self.graph_compiler is not None:
+                if self.config.training.empty_cache_before_backward:
+                    logger.warning(
+                        "training.empty_cache_before_backward is ignored in graph compiler mode "
+                        "because forward and backward execute in one joint graph"
+                    )
+                # The traced ``loss_dict`` values flow back as extra graph
+                # outputs (emitted after the gradients), so the logging
+                # metrics keep per-key parity with the eager path.
+                loss, loss_dict = self.graph_compiler.forward_backward(
+                    model_inputs=micro_batch,
+                    labels=labels,
+                )
+            else:
+                model_fwd_context = (
+                    self.model_fwd_context()
+                    if callable(self.model_fwd_context)
+                    else self.model_fwd_context
+                )
+                with model_fwd_context:
+                    outputs: ModelOutput = self.model(**micro_batch, use_cache=False)
 
-            # with use_parallel_state("base"):
-            loss, loss_dict = self.postforward(outputs, labels)
-            # The loss graph owns everything required for backward. Releasing
-            # the model output here avoids retaining large vocabulary logits
-            # until the whole backward pass finishes.
-            del outputs
-            if self.config.training.empty_cache_before_backward:
-                empty_cache()
+                # with use_parallel_state("base"):
+                loss, loss_dict = self.postforward(outputs, labels)
+                # The loss graph owns everything required for backward. Releasing
+                # the model output here avoids retaining large vocabulary logits
+                # until the whole backward pass finishes.
+                del outputs
+                if self.config.training.empty_cache_before_backward:
+                    empty_cache()
 
-            # Backward pass
-            with self.model_bwd_context:
-                loss.backward()
+                # Backward pass
+                with self.model_bwd_context:
+                    loss.backward()
 
             del micro_batch
             return loss, loss_dict
@@ -808,6 +877,7 @@ class BaseTrainer(Stateful, ABC):
         """Step every optimizer and scheduler, then expose the final state."""
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
         for optimizer in optimizers:
+            # Keep zeros_like dispatched so lazily created optimizer states retain DTensor metadata.
             with SkipDTensorDispatch(no_skip={torch.zeros_like}):
                 optimizer.step()
             optimizer.zero_grad()

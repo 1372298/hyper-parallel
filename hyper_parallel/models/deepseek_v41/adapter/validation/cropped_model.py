@@ -250,6 +250,44 @@ def _apply_v41_vision_fields(
     config.v41_image_token_id = int(source["image_token_id"])
 
 
+def _apply_v41_dspark_fields(
+        config: DeepseekV4Config,
+        source: dict[str, Any],
+        text: dict[str, Any],
+        released_hidden_layers: int,
+        resolved_routed_experts: int,
+        dspark_depth: int,
+        dspark_target_layer_ids: list[int] | None,
+        dspark_loss_coeff: float,
+        dspark_confidence_coeff: float,
+) -> None:
+    """Fill the DSpark drafter extension fields."""
+    config.v41_dspark_depth = int(dspark_depth)
+    if config.v41_dspark_depth <= 0:
+        config.v41_dspark_target_layer_ids = []
+        return
+    # The crop preserves depth, so the last three layers are the released
+    # dspark_target_layer_ids; they feed main_proj.
+    default_targets = list(range(max(0, released_hidden_layers - 3), released_hidden_layers))
+    config.v41_dspark_target_layer_ids = list(dspark_target_layer_ids or default_targets)
+    config.v41_dspark_block_size = int(text.get("dspark_block_size", 5))
+    config.v41_dspark_markov_rank = int(text.get("dspark_markov_rank", 256))
+    config.v41_dspark_noise_token_id = int(
+        text.get("dspark_noise_token_id", source["pad_token_id"]))
+    config.v41_dspark_n_routed_experts = min(
+        int(text.get("dspark_n_routed_experts", resolved_routed_experts)),
+        resolved_routed_experts,
+    )
+    config.v41_dspark_top_k = min(
+        int(text.get("dspark_num_experts_per_tok", 3)),
+        config.v41_dspark_n_routed_experts,
+    )
+    # Released drafter sliding window (technical report 2.4.3).
+    config.v41_dspark_window = 128
+    config.v41_dspark_loss_coeff = float(dspark_loss_coeff)
+    config.v41_dspark_confidence_coeff = float(dspark_confidence_coeff)
+
+
 def build_deepseek_v41_validation_config(
         config_path: str,
         engram_assets_path: str,
@@ -260,6 +298,10 @@ def build_deepseek_v41_validation_config(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        dspark_depth: int = 0,
+        dspark_target_layer_ids: list[int] | None = None,
+        dspark_loss_coeff: float = 1.0,
+        dspark_confidence_coeff: float = 0.1,
 ) -> DeepseekV4Config:
     """Translate the released config into a depth-preserving parameter crop.
 
@@ -282,6 +324,11 @@ def build_deepseek_v41_validation_config(
             exercises candidate selection before the released Reindex layers.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
             report does not disclose its production value.
+        dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
+        dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
+            to the last three, matching the released layout.
+        dspark_loss_coeff: Drafter objective weight.
+        dspark_confidence_coeff: Confidence-head BCE weight.
 
     Returns:
         A Transformers DeepSeek-V4 config carrying V4.1 extension fields.
@@ -308,7 +355,21 @@ def build_deepseek_v41_validation_config(
         indexer_loss_coeff,
     )
     _apply_v41_vision_fields(config, source, enable_vision, vision_parameter_divisor)
+    _apply_v41_dspark_fields(
+        config,
+        source,
+        text,
+        released_hidden_layers,
+        resolved_routed_experts,
+        dspark_depth,
+        dspark_target_layer_ids,
+        dspark_loss_coeff,
+        dspark_confidence_coeff,
+    )
     config._attn_implementation = "eager"  # pylint: disable=protected-access
+    # Record the source identity the way AutoConfig.from_pretrained does; the
+    # codegen from_config path resolves the modeling source from it.
+    config._name_or_path = str(Path(config_path).expanduser().resolve())  # pylint: disable=protected-access
     return config
 
 
@@ -321,6 +382,10 @@ def build_cropped_deepseek_v41(
         num_routed_experts: int = 16,
         exercise_post_training_indexer: bool = True,
         indexer_loss_coeff: float = 1.0e-3,
+        dspark_depth: int = 0,
+        dspark_target_layer_ids: list[int] | None = None,
+        dspark_loss_coeff: float = 1.0,
+        dspark_confidence_coeff: float = 0.1,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -328,8 +393,11 @@ def build_cropped_deepseek_v41(
         compile_config: CompileConfig | dict[str, Any] | None = None,
         activation_checkpoint: str | None = None,
         activation_checkpoint_selection: Any | None = None,
+        swap_inputs: bool = False,
         activation_swap: str = "none",
         model_init_dtype: str = "float32",
+        codegen: bool = False,
+        codegen_config: Any | None = None,
 ) -> PreTrainedModel:
     """Build and parallelize the depth-preserving V4.1 parameter crop.
 
@@ -343,6 +411,11 @@ def build_cropped_deepseek_v41(
         exercise_post_training_indexer: Exercise the released Full/Reindex
             hierarchy at its native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
+        dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
+        dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
+            to the last three, matching the released layout.
+        dspark_loss_coeff: Drafter objective weight.
+        dspark_confidence_coeff: Confidence-head BCE weight.
         torch_dtype: Forward dtype accepted by the model builder.
         validate_placement: Enable DTensor placement validation.
         distributed_setup: Trainer-provided parallel topology.
@@ -350,8 +423,11 @@ def build_cropped_deepseek_v41(
         compile_config: Optional compilation configuration.
         activation_checkpoint: Activation-checkpoint mode.
         activation_checkpoint_selection: Optional adapter-safe region selection.
+        swap_inputs: Trainer-injected activation-swap input flag.
         activation_swap: Activation-swap mode.
         model_init_dtype: Final parameter initialization dtype.
+        codegen: Select the codegen ``gen`` backend for this build.
+        codegen_config: Optional codegen backend configuration.
 
     Returns:
         Parallelized, randomly initialized V4.1 validation model.
@@ -365,6 +441,10 @@ def build_cropped_deepseek_v41(
         num_routed_experts=num_routed_experts,
         exercise_post_training_indexer=exercise_post_training_indexer,
         indexer_loss_coeff=indexer_loss_coeff,
+        dspark_depth=dspark_depth,
+        dspark_target_layer_ids=dspark_target_layer_ids,
+        dspark_loss_coeff=dspark_loss_coeff,
+        dspark_confidence_coeff=dspark_confidence_coeff,
     )
     return HyperAutoModelForCausalLM.from_config(
         config,
@@ -376,8 +456,11 @@ def build_cropped_deepseek_v41(
         compile_config=compile_config,
         activation_checkpoint=activation_checkpoint,
         activation_checkpoint_selection=activation_checkpoint_selection,
+        swap_inputs=swap_inputs,
         activation_swap=activation_swap,
         model_init_dtype=model_init_dtype,
+        codegen=codegen,
+        codegen_config=codegen_config,
     )
 
 

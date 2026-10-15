@@ -93,6 +93,38 @@ def _count_targets(gm: fx.GraphModule, needle: str) -> int:
     )
 
 
+def _reduce_ops(gm: fx.GraphModule, needle: str) -> list:
+    """Return the reduce-op arg (``args[1]``) of every matching collective node."""
+    return [
+        n.args[1]
+        for n in gm.graph.nodes
+        if n.op == "call_function" and needle in str(n.target)
+    ]
+
+
+def _waited_rs_ar_chain(gm: fx.GraphModule) -> int:
+    """Count ``all_reduce`` nodes whose input is a waited ``reduce_scatter``.
+
+    HSDP reduce-scatters on the ``fsdp`` group and all-reduces on the
+    ``dp_replicate`` group; those run on different process-group streams, so the
+    all_reduce must consume a *waited* reduce_scatter output, not the raw async
+    tensor (else it could read a partially written shard).
+    """
+    count = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or "all_reduce" not in str(node.target):
+            continue
+        inp = node.args[0]
+        if not (isinstance(inp, fx.Node) and "wait_tensor" in str(inp.target)):
+            continue
+        rs_node = inp.args[0]
+        if isinstance(rs_node, fx.Node) and "reduce_scatter_tensor" in str(
+            rs_node.target
+        ):
+            count += 1
+    return count
+
+
 def _linear_joint_graph() -> fx.GraphModule:
     """Build a minimal joint-graph stub for an ``nn.Linear(4, 4)`` model.
 
@@ -126,6 +158,38 @@ class _OddParam(nn.Module):
         """Initialize the non-divisible parameter ``odd``."""
         super().__init__()
         self.odd = nn.Parameter(torch.zeros(3, 4))
+
+
+class _FrozenParam(nn.Module):
+    """Model with one trainable and one frozen FSDP-eligible parameter."""
+
+    def __init__(self) -> None:
+        """Initialize the trainable and frozen parameters (both [4, 4])."""
+        super().__init__()
+        self.trainable = nn.Parameter(torch.zeros(4, 4))
+        self.frozen = nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+
+
+def _frozen_joint_graph() -> fx.GraphModule:
+    """Joint-graph stub for ``_FrozenParam``.
+
+    Both params lead as state placeholders and both are read by the forward,
+    but the frozen one has no gradient counterpart (the tracer only emits
+    grads for ``requires_grad`` params) — output is ``[loss, grad_trainable]``.
+    """
+    g = fx.Graph()
+    trainable = g.placeholder("trainable")
+    frozen = g.placeholder("frozen")
+    x = g.placeholder("x")
+    mm = g.call_function(torch.matmul, args=(trainable, x))
+    loss = g.call_function(torch.add, args=(mm, frozen))
+    grad_t = g.placeholder("grad_trainable")
+    g.output([loss, grad_t])
+    gm = fx.GraphModule({}, g)
+    gm.state_fqns = ["trainable", "frozen"]
+    gm.state_is_param = [True, True]
+    gm.num_state_inputs = 2
+    return gm
 
 
 def _odd_joint_graph() -> fx.GraphModule:
@@ -340,6 +404,53 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 f"got {_count_targets(gm, 'wait_tensor')}"
             ),
         )
+        # Gradient reduction averages over the FSDP axis, matching eager
+        # ``fully_shard`` (never sums).
+        self.assertEqual(
+            set(_reduce_ops(gm, "reduce_scatter_tensor")),
+            {"avg"},
+            "FSDP grads must reduce_scatter with 'avg', not 'sum'",
+        )
+
+    def test_run_skips_frozen_params(self):
+        """Test frozen params are not all-gathered or sharded.
+
+        The tracer omits frozen params from the gradient list and
+        ``_shard_live_model_params`` leaves them full-size, so
+        ``_identify_params_in_fsdp_modules`` must skip them too. Otherwise the
+        graph would all_gather a full tensor (treating it as a shard) while the
+        live model still holds the full shape.
+        """
+        cfg = PassConfig(fsdp_enabled=True, fsdp_degree=2)
+        pas = FSDPPass()
+        gm = _frozen_joint_graph()
+        model = _FrozenParam()
+        before_frozen = tuple(model.frozen.shape)
+
+        with _patch_dist(world_size=2, rank=0, initialized=True):
+            result = pas.run(gm, cfg, model=model, fsdp_group_name="fsdp")
+
+        self.assertIs(result, gm, "run() should return the same graph_module")
+        # Trainable param sharded, frozen param left full-size in the model.
+        self.assertEqual(tuple(model.trainable.shape), (2, 4))
+        self.assertEqual(
+            tuple(model.frozen.shape),
+            before_frozen,
+            (
+                f"frozen param must stay full-size, "
+                f"got {tuple(model.frozen.shape)} expected {before_frozen}"
+            ),
+        )
+        # Only the trainable param is gathered / reduced.
+        self.assertEqual(
+            _count_targets(gm, "all_gather_into_tensor"),
+            1,
+            (
+                f"only the trainable param should all_gather, "
+                f"got {_count_targets(gm, 'all_gather_into_tensor')}"
+            ),
+        )
+        self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 1)
 
     def test_run_skips_non_divisible_params(self):
         """Test params whose dim 0 is not divisible by ``fsdp_degree`` stay replicated.
@@ -469,6 +580,91 @@ class TestFSDPPassRunSharding(unittest.TestCase):
                 f"only lin.weight/lin.bias grads should reduce_scatter, "
                 f"got {_count_targets(gm, 'reduce_scatter_tensor')}"
             ),
+        )
+
+
+class TestFSDPPassDataParallelModes(unittest.TestCase):
+    """DDP (replicate) and HSDP (hybrid_shard) semantics.
+
+    Mirrors simplefsdp's ``data_parallel`` modes: DDP keeps parameters
+    replicated and all-reduces gradients; HSDP shards on the ``fsdp`` axis and
+    reduce-scatters then all-reduces (average across both axes).
+    """
+
+    def test_ddp_replicates_params_and_all_reduces_grads(self):
+        """Test DDP: no param sharding / all_gather, grads all-reduced."""
+        cfg = PassConfig(fsdp_enabled=True, dp_mode="ddp", dp_replicate_degree=2)
+        pas = FSDPPass()
+        gm = _linear_joint_graph()
+        model = nn.Linear(4, 4)
+
+        with _patch_dist(world_size=2, rank=0, initialized=True):
+            result = pas.run(
+                gm,
+                cfg,
+                model=model,
+                fsdp_group_name="fsdp",
+                dp_replicate_group_name="dp_replicate",
+            )
+
+        self.assertIs(result, gm, "run() should return the same graph_module")
+        # Parameters stay replicated (no shard axis under DDP).
+        self.assertEqual(tuple(model.weight.shape), (4, 4))
+        self.assertEqual(tuple(model.bias.shape), (4,))
+        self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 0)
+        self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 0)
+        # One all_reduce (+ wait) per gradient.
+        self.assertEqual(_count_targets(gm, "all_reduce"), 2)
+        self.assertEqual(_count_targets(gm, "wait_tensor"), 2)
+        # DDP grads average over the replicate axis (matching torch DDP).
+        self.assertEqual(
+            set(_reduce_ops(gm, "all_reduce")),
+            {"avg"},
+            "DDP grads must all_reduce with 'avg', not 'sum'",
+        )
+
+    def test_hsdp_shards_params_and_reduces_both_axes(self):
+        """Test HSDP: params shard on fsdp, grads reduce_scatter + all_reduce."""
+        cfg = PassConfig(
+            fsdp_enabled=True,
+            dp_mode="hsdp",
+            fsdp_degree=2,
+            dp_replicate_degree=2,
+        )
+        pas = FSDPPass()
+        gm = _linear_joint_graph()
+        model = nn.Linear(4, 4)
+
+        with _patch_dist(world_size=4, rank=0, initialized=True):
+            result = pas.run(
+                gm,
+                cfg,
+                model=model,
+                fsdp_group_name="fsdp",
+                dp_replicate_group_name="dp_replicate",
+            )
+
+        self.assertIs(result, gm, "run() should return the same graph_module")
+        # Sharded on the fsdp axis only (replicate axis keeps the same shard).
+        self.assertEqual(tuple(model.weight.shape), (2, 4))
+        self.assertEqual(tuple(model.bias.shape), (2,))
+        self.assertEqual(_count_targets(gm, "all_gather_into_tensor"), 2)
+        self.assertEqual(_count_targets(gm, "reduce_scatter_tensor"), 2)
+        # One all_reduce per gradient on top of the reduce_scatter.
+        self.assertEqual(_count_targets(gm, "all_reduce"), 2)
+        # 2 all_gather waits + 2 reduce_scatter waits + 2 all_reduce waits.
+        self.assertEqual(_count_targets(gm, "wait_tensor"), 6)
+        # Both axes average, so the step gradient is the mean over
+        # fsdp_degree * dp_replicate_degree ranks.
+        self.assertEqual(set(_reduce_ops(gm, "reduce_scatter_tensor")), {"avg"})
+        self.assertEqual(set(_reduce_ops(gm, "all_reduce")), {"avg"})
+        # HSDP's reduce_scatter (fsdp) and all_reduce (dp_replicate) run on
+        # different streams: the all_reduce must consume a waited reduce_scatter
+        # output, otherwise it can race the still-in-flight shard.
+        self.assertEqual(
+            _waited_rs_ar_chain(gm),
+            2,
+            "HSDP all_reduce must consume a waited reduce_scatter output",
         )
 
 

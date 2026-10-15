@@ -20,7 +20,11 @@ from collections import defaultdict
 from typing import Any, Dict
 
 from hyper_parallel.data.batching import calculate_num_micro_batches
+from hyper_parallel.data.batching.get_batch import OmniParallelBatch
 from hyper_parallel.data.omni import OmniDataTransform
+from hyper_parallel.distributed.encoder_parallel import build_encoder_parallel_runtime
+from hyper_parallel.distributed.encoder_parallel.batch_input import EncoderParallelInputAdapter
+from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.logging import create_logger
 from hyper_parallel.trainer.runtime.memory import print_device_mem_info
@@ -124,12 +128,32 @@ class VLMTrainer:
         config = self.base.config
         if config.dataloader.get_batch is None:
             raise ValueError("dataloader.get_batch must define a batching runtime target")
+        if getattr(config.dataloader.get_batch, "encoder_parallel", None) is not None:
+            raise ValueError("encoder_parallel belongs under accelerator, not dataloader.get_batch")
+        encoder_runtime = build_encoder_parallel_runtime(
+            config=config.accelerator.encoder_parallel,
+            mesh_context=self.base.mesh,
+            model=self.base.model,
+            model_adapter_spec=resolve_model_adapter(self.base.model),
+            execution_options={
+                "micro_batch_size": int(config.training.micro_batch_size),
+                "compile_enabled": bool(config.compile.enabled),
+                "validate_placement": bool(getattr(config.model, "validate_placement", False)),
+            },
+        )
         get_batch = config.dataloader.get_batch.build(
             mesh_context=self.base.mesh,
             device=self.base.device,
             data_config=getattr(config.dataset, "data_config", {}),
             pp_shared_data=bool(getattr(config.dataloader, "pp_shared_data", False)),
         )
+        if encoder_runtime is not None:
+            if not isinstance(get_batch, OmniParallelBatch):
+                raise ValueError("[HP-ENCODER-001] encoder parallel requires OmniParallelBatch")
+            get_batch.runtime_input_adapter = EncoderParallelInputAdapter(
+                runtime=encoder_runtime,
+                inner=get_batch.runtime_input_adapter,
+            )
         self.base.get_batch = get_batch
 
     @property
@@ -164,7 +188,11 @@ class VLMTrainer:
         self.base.on_epoch_end()
 
     def on_step_begin(self, micro_batches: Any = None) -> None:
-        """Dispatch the step-begin lifecycle hook."""
+        """Dispatch the step-begin lifecycle hook.
+
+        Args:
+            micro_batches: Prepared model inputs for this optimizer step.
+        """
         self.base.on_step_begin(micro_batches=micro_batches)
 
     def on_step_end(
@@ -173,7 +201,13 @@ class VLMTrainer:
             loss_dict: Any = None,
             grad_norm: Any = None,
     ) -> None:
-        """Dispatch the step-end lifecycle hook."""
+        """Dispatch the step-end lifecycle hook.
+
+        Args:
+            loss: Aggregate step loss.
+            loss_dict: Named step losses.
+            grad_norm: Measured gradient norm.
+        """
         self.base.on_step_end(
             loss=loss,
             loss_dict=loss_dict,
@@ -215,7 +249,11 @@ class VLMTrainer:
         return total_loss, total_loss_dict
 
     def train_step(self, data_iterator: Any) -> Dict[str, float]:
-        """Execute one VLM training step."""
+        """Execute one VLM training step.
+
+        Args:
+            data_iterator: Iterator supplying packed Omni batches.
+        """
         first_training_batch = self.base.get_batch(data_iterator)
         num_micro_steps = self.base.num_micro_batches
         training_batches = [first_training_batch]

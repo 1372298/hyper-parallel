@@ -235,7 +235,7 @@ def build_model_weight_adapter(
     model: VLLMModelRegistration,
 ) -> ModelWeightAdapter:
     """Return the adapter owned by one registered model family."""
-    if model.family in ("qwen3", "qwen3_moe"):
+    if model.family in ("qwen3", "qwen3_moe", "qwen3_5"):
         return ModelWeightAdapter(model)
     raise ValueError(f"Unsupported weight-sync model family: {model.family!r}")
 
@@ -247,7 +247,8 @@ def alias_tied_embeddings(
     """Expose both tied checkpoint names without allocating another tensor."""
     if not model.model.tie_word_embeddings:
         return state_dict
-    embedding_name = "model.embed_tokens.weight"
+    embedding_name = ("model.language_model.embed_tokens.weight" if model.family == "qwen3_5"
+                      else "model.embed_tokens.weight")
     lm_head_name = "lm_head.weight"
     if embedding_name in state_dict and lm_head_name not in state_dict:
         state_dict[lm_head_name] = state_dict[embedding_name]
@@ -547,8 +548,8 @@ def _native_expert_descriptions(name: str, parameter: Any, layer: Any, config: A
     return descriptions
 
 
-def _hyper_tp_placement(model: Any, name: str, tp_size: int) -> tuple[str, Optional[int]]:
-    """Read the public apply pass's parameter placement for the Hyper Qwen3 model."""
+def _adapted_tp_placement(model: Any, name: str, tp_size: int) -> tuple[str, Optional[int]]:
+    """Read the public apply pass's parameter placement for the adapted Qwen3 model."""
     placements = tuple(getattr(model, "_tp_placements", {}).get(name, ()))
     if tp_size == 1 and not placements:
         return "replicate", None
@@ -563,18 +564,18 @@ def _hyper_tp_placement(model: Any, name: str, tp_size: int) -> tuple[str, Optio
 
 
 def rollout_tensor_descriptions(
-    model: Any, hf_config: Any, *, is_hyper: bool, tp_rank: int, tp_size: int,
+    model: Any, hf_config: Any, *, is_adapted: bool, tp_rank: int, tp_size: int,
 ) -> list[dict[str, Any]]:
-    """Describe Native fused storage or public Hyper TP placements."""
-    if not is_hyper:
+    """Describe Native fused storage or public adapter TP placements."""
+    if not is_adapted:
         if hf_config is None:
             raise ValueError("Native Qwen3 direct reshard requires an HF config")
         return _native_qwen3_direct_tensors(model, hf_config, tp_rank, tp_size)
     if not hasattr(model, "_tp_placements"):
-        raise ValueError("Hyper direct reshard requires public TP placements")
+        raise ValueError("Adapted direct reshard requires public TP placements")
     tensors = []
     for name, parameter in sorted(model.named_parameters()):
-        placement, shard_dim = _hyper_tp_placement(model, name, tp_size)
+        placement, shard_dim = _adapted_tp_placement(model, name, tp_size)
         tensors.append({
             "name": name,
             "dtype_name": str(parameter.dtype).rsplit(".", maxsplit=1)[-1],

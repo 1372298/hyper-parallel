@@ -861,7 +861,7 @@ class VLLMGenerationEngine:
             "--weight-transfer-config",
             json.dumps({"backend": weight_transfer_backend}),
         ]
-        if self._rollout_model.is_hyper:
+        if self._rollout_model.is_adapted:
             command.extend(
                 (
                     "--hf-overrides",
@@ -872,6 +872,8 @@ class VLLMGenerationEngine:
                     ),
                 )
             )
+        if self._rollout_model.family == "qwen3_5":
+            command.append("--language-model-only")
         for key, default in (
             ("trust_remote_code", True),
             ("enable_expert_parallel", False),
@@ -917,6 +919,8 @@ class VLLMGenerationEngine:
         profiler_config = self._config.get("profiler_config")
         if profiler_config is not None:
             command.extend(("--profiler-config", json.dumps(profiler_config)))
+        if self._config.get("compilation_config") is not None:
+            command.extend(("--compilation-config", json.dumps(self._config["compilation_config"])))
         return command
 
     def _server_environment(self, visible_devices: str) -> dict[str, str]:

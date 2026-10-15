@@ -21,20 +21,52 @@ after passing through PostBackwardFunction.apply.
 # pylint: disable=W0212
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
 # pylint: disable=C0413
 import torch
 from torch import nn
+from hyper_parallel.core.fully_shard.hsdp_param import AllGatherCommCtx, HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
+from hyper_parallel.core.fully_shard.param_group import AllGatherResult
 
 
 def _make_scheduler_stub() -> HSDPSchedulerV2:
     """Create a minimal HSDPSchedulerV2 stub that can call _register_post_backward_hook."""
     scheduler = object.__new__(HSDPSchedulerV2)
     scheduler.scheduler_ctx = HSDPSchedulerContext()
+    return scheduler
+
+
+def _make_prefetch_param(fqn: str, handle=None) -> HSDPParamV2:
+    """Create a named parameter wrapper without initializing distributed state."""
+    param = object.__new__(HSDPParamV2)
+    param._param_fqn = fqn
+    param.allgather_comm_ctx = AllGatherCommCtx(allgather_handle=handle)
+    return param
+
+
+def _make_prefetch_scheduler(hsdp_params=(), all_gather_buckets=None, scheduler_ctx=None) -> HSDPSchedulerV2:
+    """Create a scheduler sharing a tree context with mocked backward reductions."""
+    scheduler = _make_scheduler_stub()
+    if scheduler_ctx is not None:
+        scheduler.scheduler_ctx = scheduler_ctx
+    scheduler.scheduler_ctx.all_hsdp_schedulers.append(scheduler)
+    scheduler.hsdp_state = SimpleNamespace(
+        hsdp_params=list(hsdp_params),
+        param_group=(
+            SimpleNamespace(all_gather_buckets=all_gather_buckets)
+            if all_gather_buckets is not None else None
+        ),
+        module_name="root",
+    )
+    scheduler._backward_hook = MagicMock()
+    scheduler._finalize_comm_fusion_reductions = MagicMock()
+    scheduler._finalize_per_param_reductions = MagicMock()
+    scheduler.launch_tp_replicate_reduce_and_apply = MagicMock()
     return scheduler
 
 
@@ -347,6 +379,146 @@ class TestRootBackwardCallback(unittest.TestCase):
         self.assertIs(result, grad)
         mock_variable._execution_engine.queue_callback.assert_not_called()
         scheduler._hsdp_backward_pre_hook.assert_not_called()
+
+    def test_check_state_prefetch_handles_consumed_accepts_consumed_and_empty_states(self) -> None:
+        """Cleared handles and fused results pass even for empty or absent states.
+
+        Feature: Module-tree prefetch consumption validation.
+        Description: Check consumed per-parameter and fused work alongside empty states.
+        Expectation: No exception is raised.
+        """
+        param = _make_prefetch_param("root.weight")
+        buckets = [
+            SimpleNamespace(hsdp_params=[param], all_gather_result=None),
+            SimpleNamespace(hsdp_params=[param], all_gather_result=AllGatherResult(None, None, None)),
+        ]
+        scheduler = _make_prefetch_scheduler([param], buckets)
+        _make_prefetch_scheduler(scheduler_ctx=scheduler.scheduler_ctx)
+        scheduler.scheduler_ctx.all_hsdp_schedulers.append(SimpleNamespace(hsdp_state=None))
+
+        self.assertIsNone(scheduler.check_state_prefetch_handles_consumed())
+
+    def test_check_state_prefetch_handles_consumed_reports_all_parameter_fqns(self) -> None:
+        """Report pending parameters from the root and every child together.
+
+        Feature: Per-parameter prefetch diagnostics.
+        Description: Leave handles on parameters in several states of the same tree.
+        Expectation: The error lists every pending FQN and explains the required order.
+        """
+        root_param = _make_prefetch_param("root.weight", MagicMock())
+        child_param = _make_prefetch_param("layers.0.weight", MagicMock())
+        last_param = _make_prefetch_param("layers.1.bias", MagicMock())
+        consumed_param = _make_prefetch_param("layers.1.weight")
+        scheduler = _make_prefetch_scheduler([root_param])
+        _make_prefetch_scheduler([child_param], scheduler_ctx=scheduler.scheduler_ctx)
+        _make_prefetch_scheduler([consumed_param, last_param], scheduler_ctx=scheduler.scheduler_ctx)
+
+        with self.assertRaises(RuntimeError) as raised:
+            scheduler.check_state_prefetch_handles_consumed()
+
+        message = str(raised.exception)
+        for param in (root_param, child_param, last_param):
+            self.assertIn(param._param_fqn, message)
+            param.allgather_comm_ctx.allgather_handle.wait.assert_not_called()
+        self.assertNotIn(consumed_param._param_fqn, message)
+        self.assertIn("prefetch order", message)
+        self.assertIn("model's actual execution order", message)
+
+    def test_check_state_prefetch_handles_consumed_reports_fused_bucket_fqns(self) -> None:
+        """Fused bucket handles identify all affected parameters in a child state.
+
+        Feature: Fused prefetch diagnostics.
+        Description: Leave one child bucket pending while another bucket is consumed.
+        Expectation: Only the pending bucket's parameter FQNs are reported.
+        """
+        weight = _make_prefetch_param("layers.0.weight")
+        bias = _make_prefetch_param("layers.0.bias")
+        consumed_param = _make_prefetch_param("layers.1.weight")
+        handle = MagicMock()
+        pending_result = AllGatherResult(None, None, handle)
+        buckets = [
+            SimpleNamespace(hsdp_params=[weight, bias], all_gather_result=pending_result),
+            SimpleNamespace(hsdp_params=[consumed_param], all_gather_result=None),
+        ]
+        scheduler = _make_prefetch_scheduler()
+        _make_prefetch_scheduler([weight, bias, consumed_param], buckets, scheduler.scheduler_ctx)
+
+        with self.assertRaises(RuntimeError) as raised:
+            scheduler.check_state_prefetch_handles_consumed()
+
+        message = str(raised.exception)
+        self.assertIn(weight._param_fqn, message)
+        self.assertIn(bias._param_fqn, message)
+        self.assertNotIn(consumed_param._param_fqn, message)
+        handle.wait.assert_not_called()
+        self.assertIs(pending_result.handle, handle)
+
+    def test_completed_work_is_still_unconsumed_until_handle_is_cleared(self) -> None:
+        """Completed or false-valued work still fails when its handle is retained.
+
+        Feature: Prefetch handle lifecycle validation.
+        Description: Check retained work that reports completion and has a false boolean value.
+        Expectation: The parameter is reported without waiting on or clearing its work.
+        """
+        handle = MagicMock()
+        handle.is_completed.return_value = True
+        handle.__bool__.return_value = False
+        scheduler = _make_prefetch_scheduler([_make_prefetch_param("root.weight", handle)])
+
+        with self.assertRaisesRegex(RuntimeError, "root.weight"):
+            scheduler.check_state_prefetch_handles_consumed()
+
+        handle.wait.assert_not_called()
+
+    def test_root_backward_rejects_pending_prefetch_before_finalization(self) -> None:
+        """The root backward callback validates both paths before reducing gradients.
+
+        Feature: Root backward prefetch validation.
+        Description: Run root backward with pending per-parameter or fused prefetch work.
+        Expectation: An FQN-bearing error is raised before backward finalization runs.
+        """
+        for comm_fusion in (False, True):
+            with self.subTest(comm_fusion=comm_fusion):
+                handle = MagicMock()
+                param = _make_prefetch_param("layers.0.weight", None if comm_fusion else handle)
+                buckets = [
+                    SimpleNamespace(
+                        hsdp_params=[param],
+                        all_gather_result=AllGatherResult(None, None, handle),
+                    ),
+                ] if comm_fusion else None
+                scheduler = _make_prefetch_scheduler()
+                child = _make_prefetch_scheduler([param], buckets, scheduler.scheduler_ctx)
+
+                with self.assertRaisesRegex(RuntimeError, "layers.0.weight"):
+                    scheduler._root_backward_hook()
+
+                scheduler._backward_hook.assert_not_called()
+                child._backward_hook.assert_not_called()
+                scheduler._finalize_comm_fusion_reductions.assert_not_called()
+                scheduler._finalize_per_param_reductions.assert_not_called()
+                scheduler.launch_tp_replicate_reduce_and_apply.assert_not_called()
+                handle.wait.assert_not_called()
+
+    def test_root_backward_finalizes_normally_after_prefetch_is_consumed(self) -> None:
+        """Consumed prefetch work lets every state's backward and reductions finish.
+
+        Feature: Root backward finalization with valid prefetch order.
+        Description: Run root backward with consumed handles in both root and child states.
+        Expectation: All backward and reduction callbacks run and the backward flag resets.
+        """
+        scheduler = _make_prefetch_scheduler([_make_prefetch_param("root.weight")])
+        child = _make_prefetch_scheduler([_make_prefetch_param("layers.0.weight")], scheduler_ctx=scheduler.scheduler_ctx)
+        scheduler.scheduler_ctx.root_bp_state = True
+
+        scheduler._root_backward_hook()
+
+        self.assertFalse(scheduler.scheduler_ctx.root_bp_state)
+        scheduler._backward_hook.assert_called_once_with()
+        child._backward_hook.assert_called_once_with()
+        scheduler._finalize_comm_fusion_reductions.assert_called_once_with()
+        scheduler._finalize_per_param_reductions.assert_called_once_with()
+        scheduler.launch_tp_replicate_reduce_and_apply.assert_called_once_with()
 
 
 class TestRecomputeForwardPrefetchGuard(unittest.TestCase):

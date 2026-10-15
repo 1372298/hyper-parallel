@@ -59,7 +59,14 @@ logger = logging.getLogger(__name__)
 
 
 IS_CUDA_AVAILABLE = torch.cuda.is_available()
-IS_NPU_AVAILABLE = torch_npu is not None and torch.npu.is_available()
+# ``torch_npu`` can be importable yet leave ``torch.npu`` unregistered
+# (an x86 CI host with the wheel installed but no CANN runtime), so probe
+# the attribute before touching it.
+IS_NPU_AVAILABLE = (
+    torch_npu is not None
+    and getattr(torch, "npu", None) is not None
+    and torch.npu.is_available()
+)
 
 if IS_NPU_AVAILABLE:
     torch.npu.config.allow_internal_format = False
@@ -108,6 +115,7 @@ class CompileConfig:
     """Decoder-layer ``torch.compile`` options exposed by the Trainer."""
 
     enabled: bool = False
+    use_joint_graph: bool = False
     mode: str = "default"
     fullgraph: bool = False
     dynamic: bool = False
@@ -115,9 +123,13 @@ class CompileConfig:
     options: Optional[dict[str, Any]] = None
     dynamo_cache_size_limit: int = 256
 
+    def selects_graph_compiler(self) -> bool:
+        """Return whether this config selects the graph-compiler trainer path."""
+        return self.enabled and self.use_joint_graph
+
     def __post_init__(self) -> None:
         """Validate values that the YAML resolver cannot express precisely."""
-        for name in ("enabled", "fullgraph", "dynamic"):
+        for name in ("enabled", "use_joint_graph", "fullgraph", "dynamic"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"compile.{name} must be a bool")
         if not isinstance(self.mode, str) or not self.mode.strip():
@@ -128,7 +140,7 @@ class CompileConfig:
             raise ValueError("compile.backend must be None or a non-empty string")
         if self.options is not None and not isinstance(self.options, dict):
             raise TypeError("compile.options must be a mapping or None")
-        if self.options and self.mode != "default":
+        if self.options and self.mode != "default" and not self.selects_graph_compiler():
             raise ValueError(
                 "compile.options cannot be combined with a non-default compile.mode"
             )

@@ -125,8 +125,8 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
                 ),
                 _check_weight_transfer_engine=lambda: None,
                 _weight_update_active=False,
-                _hyper_loaded_policy_version=0,
-                _hyper_pending_policy_version=None,
+                _rl_loaded_policy_version=0,
+                _rl_pending_policy_version=None,
                 tp_rank=rank,
             ))
 
@@ -163,7 +163,7 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
         self.events.append("start")
         for worker in self.workers:
             worker._weight_update_active = True
-            worker._hyper_pending_policy_version = None
+            worker._rl_pending_policy_version = None
 
     def finish_weight_update(self):
         self.events.append("finish")
@@ -209,7 +209,7 @@ class LocalWorkers(VLLMWeightSyncClientMixin):
             metadata,
             transport="CPU test",
         )
-        worker._hyper_pending_policy_version = version
+        worker._rl_pending_policy_version = version
 
 
 class TensorTransport:
@@ -250,7 +250,7 @@ class TensorTransport:
                 transport="CPU packed test",
             )
             vllm_worker._load_packed_weights(worker, packed, metadata)
-            worker._hyper_pending_policy_version = version
+            worker._rl_pending_policy_version = version
         if self.fail:
             raise RuntimeError("full-gather transfer failed")
         return PackedWeightAck(index, total_bytes, len(client.workers))
@@ -349,6 +349,27 @@ def test_resume_failure_propagates_without_compensation(deployment):
         controller.prepare_for_rollout()
     assert controller.policy_version == 0
     assert client.events[-1] == "resume"
+
+
+def test_graph_refresh_failure_during_kv_wake_cannot_expose_transferred_policy():
+    """Worker recapture failure leaves admission closed and the controller version unchanged."""
+    unused_publisher, unused_wire, client, controller, state = _publication("colocated", "full_gather")
+    controller.prepare_for_training()
+    controller.update_weights(PolicySnapshot(1, "qwen", state))
+    original_wake = client.wake_up
+
+    def fail_capture(tags):
+        original_wake(tags)
+        if "kv_cache" in tags:
+            raise RuntimeError("worker graph recapture failed")
+
+    client.wake_up = fail_capture
+    with pytest.raises(RuntimeError, match="graph recapture failed"):
+        controller.prepare_for_rollout()
+    assert controller.policy_version == 0, (
+        f"Unexpected published version: actual={controller.policy_version}, expected=0")
+    assert client.paused, f"Admission reopened after graph failure: actual={client.paused}, expected=True"
+    assert "resume" not in client.events, f"Unexpected resume after graph failure: actual={client.events}"
 
 
 def test_strategies_cache_plans_and_reject_missing_sources():

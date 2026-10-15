@@ -16,15 +16,20 @@
 
 import gc
 import inspect
+import weakref
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
+from hyper_parallel.components.optim.mixed_precision_optimizer import Float16OptimizerWithFloat16Params
 from hyper_parallel.core.optimizer import SwapOptimizerConfig, swap_optimizer
 from hyper_parallel.core.optimizer.adamw import AdamW as NewAdamW
+from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.trainer.base import _attach_optimizer_swap
+from hyper_parallel.trainer.config.optimization import OptimizerSwapConfig
 from tests.torch.utils import init_dist
 
 
@@ -719,6 +724,77 @@ def test_torch_adam_swap_optimizer_multi_param_group_align() -> None:
     _assert_parameters_align(base_params, swap_params)
     _assert_swap_slots_offloaded(swap_optimizer_inst, _DEFAULT_STATE_COUNT)
     _assert_peak_memory_reduced(base_peak_memory, swap_peak_memory)
+
+
+def _train_fp32_main_adamw(mesh, reduce_dtype, swap_config):
+    """Exercise FSDP gradient ownership with the Trainer's FP32-main/swap composition."""
+    torch.manual_seed(1234)
+    model = torch.nn.Sequential(
+        torch.nn.Linear(256, 256, bias=False),
+        torch.nn.Linear(256, 256, bias=False),
+    ).to(device="npu", dtype=torch.bfloat16)
+    fully_shard(model, mesh=mesh, mp_policy=MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=reduce_dtype,
+        apply_grad_on_fp32_main_grad=True,
+    ))
+    optimizer = Float16OptimizerWithFloat16Params(
+        ChainedOptimizer(model, {"adamw": NewAdamW(model.parameters(), lr=0.01)}), model,
+    )
+    if swap_config is not None:
+        _attach_optimizer_swap(optimizer, swap_config)
+    leaf_optimizer = optimizer.chained_optimizers[0]
+    losses = []
+    for _ in range(_TRAIN_STEPS):
+        loss = model(torch.ones(2, 256, device="npu", dtype=torch.bfloat16)).float().square().mean()
+        loss.backward()
+        source_refs = [weakref.ref(parameter.main_grad.to_local()) for parameter in model.parameters()]
+        source_bytes = sum(parameter.main_grad.to_local().nbytes for parameter in model.parameters())
+        torch.npu.synchronize()
+        memory_before = torch.npu.memory_allocated()
+        with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+            optimizer.prepare_grads()
+            torch.npu.synchronize()
+            if reduce_dtype == torch.bfloat16:
+                assert all(source_ref() is None for source_ref in source_refs)
+                # FP32 needs twice the BF16 bytes; only the net increase may stay live.
+                assert torch.npu.memory_allocated() <= memory_before + source_bytes
+            for parameter in model.parameters():
+                assert parameter.grad is None
+                assert parameter.main_param.grad.to_local().device == parameter.main_param.to_local().device
+                assert parameter.main_param.grad.dtype == torch.float32
+            optimizer.step_with_ready_grads()
+            optimizer.zero_grad()
+        losses.append(_to_cpu_tensor(loss))
+        if swap_config is not None:
+            _assert_swap_slots_offloaded(leaf_optimizer, _DEFAULT_STATE_COUNT, expected_param_count=2)
+    return (
+        {name: _to_cpu_tensor(parameter.main_param) for name, parameter in model.named_parameters()},
+        _optimizer_state_on_cpu(leaf_optimizer),
+        losses,
+    )
+
+
+def test_fp32_main_gradient_cast_with_swap_optimizer() -> None:
+    """Check dtype-only preparation with real state offload in both swap modes.
+
+    Feature: FP32 main optimizer composed with FSDP and optimizer-state swap.
+    Description: Compare baseline, per-tensor and packed swap with BF16/FP32 reductions.
+    Expectation: Losses, FP32 main parameters and Adam moments align; converted BF16
+        gradients are released before updates while gradient devices stay unchanged.
+    """
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(1,), mesh_dim_names=("dp",))
+    for reduce_dtype in (torch.bfloat16, torch.float32):
+        base_params, base_state, base_losses = _train_fp32_main_adamw(mesh, reduce_dtype, None)
+        for packed_swap in (False, True):
+            params, state, losses = _train_fp32_main_adamw(
+                mesh, reduce_dtype,
+                OptimizerSwapConfig(enabled=True, swap_times=2, min_numel=1, packed_swap=packed_swap),
+            )
+            _assert_parameters_align(base_params, params)
+            _assert_optimizer_state_align(base_state, state)
+            _assert_losses_align(base_losses, losses)
 
 
 def test_fully_shard_adamw_mixed_precision_swap_optimizer_parameter_align() -> None:

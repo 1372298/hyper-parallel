@@ -13,36 +13,40 @@
 # limitations under the License.
 # ============================================================================
 """
-FSDP Pass - Fully Sharded Data Parallel Partitioning Pass
+FSDP / DDP / HSDP Pass - Data Parallel Partitioning Pass
 
 Operates on the joint fwd+bwd graph produced by the tracer, where
 parameters/buffers are **static inputs** (leading placeholders), not get_attr
-nodes.
+nodes. The data-parallel mode comes from ``PassConfig.dp_mode`` and mirrors
+simplefsdp's ``data_parallel`` modes:
+
+- ``"fsdp"`` (fully_shard): parameters sharded on dim 0; forward all_gather,
+  backward reduce_scatter.
+- ``"ddp"`` (replicate): parameters stay replicated; no all_gather, gradients
+  are all-reduced on the ``dp_replicate`` axis.
+- ``"hsdp"`` (hybrid_shard): parameters replicated on ``dp_replicate`` and
+  sharded on ``fsdp``; forward all_gather on ``fsdp``, backward reduce_scatter
+  on ``fsdp`` then all_reduce on ``dp_replicate``.
 
 Responsibilities:
-1. Identify parameter placeholders belonging to FSDP-wrapped modules
+1. Identify parameter placeholders belonging to DP-wrapped modules
    (via GraphParallelPlan, exact FQN or pattern)
 2. Insert AllGather after each such placeholder (Shard -> Replicate), so the
    computation body operates on full parameters while the graph input stays
-   sharded
-3. Insert ReduceScatter on the gradient outputs of FSDP parameters
-   (Replicate -> Shard); gradients of non-FSDP parameters stay full
+   sharded (skipped for ``"ddp"``)
+3. Insert gradient reduction on the gradient outputs of DP parameters —
+   reduce_scatter (FSDP/HSDP) and/or all_reduce (DDP/HSDP)
 4. Physically shard the *live model's* parameters in place (dim 0, by FSDP
-   rank), so ``model.parameters()`` already holds the local shard and the
-   trainer / optimizer need no FSDP awareness at all
+   rank) for FSDP/HSDP, so ``model.parameters()`` already holds the local
+   shard and the trainer / optimizer need no DP awareness at all
 5. Reshard (``fsdp_reshard_after_forward``): sink each AllGather to its first
    forward use, free the replicated parameter after its last forward read,
    and, for parameters the backward still needs, re-gather plus rematerialize
    the saved view chain just before the first backward consumer. Peak memory
    tracks the forward working set instead of every replicated parameter.
 
-All FSDP logic (which parameters, the collectives, and the sharding itself)
+All DP logic (which parameters, the collectives, and the sharding itself)
 lives in this pass; the trainer simply feeds ``model.parameters()``.
-
-Partitioning:
-- Parameters sharded on dim 0
-- Forward: all_gather parameters on first use, compute, free after last use
-- Backward: re-gather the parameters the backward needs, reduce_scatter grads
 """
 
 __all__ = ["FSDPPass"]
@@ -60,13 +64,21 @@ from torch.distributed.distributed_c10d import _resolve_process_group
 from torch.fx.node import _side_effectful_functions
 from torch.ops import _c10d_functional
 
-from ...pass_config import PassConfig
+from ...pass_config import PassConfig, normalize_dp_mode
 from ..base import GraphPass
 from ...graph_parallel_plan import GraphParallelPlan
 
 _LOG = logging.getLogger(__name__)
 
 _GETITEM = operator.getitem
+
+# Gradient reduction op for every DP axis. Mirrors eager ``fully_shard``'s
+# default (``core/fully_shard/hsdp_state.py``: ``set_reduce_op_type("avg")``):
+# the backward produces the full (replicated) gradient on every rank, so each
+# axis must be AVERAGED (not summed) to keep the step gradient at the
+# DP-world-mean scale. HSDP applies it on both axes, yielding the mean over the
+# shard times the mean over the replicate axis.
+_GRAD_REDUCE_OP = "avg"
 
 
 def _free_tensor_storage(tensor: torch.Tensor) -> None:
@@ -175,6 +187,11 @@ class FSDPPass(GraphPass):
         # ``run`` entry; left as ``None`` here so a stray access before
         # ``run`` fails loudly instead of silently using a wrong default.
         self._fsdp_degree: Optional[int] = None
+        # Data-parallel mode ("fsdp" | "ddp" | "hsdp") and the replicate-axis
+        # group/degree used by DDP / HSDP gradient reduction.
+        self._dp_mode = "fsdp"
+        self._dp_replicate_group_name = "dp_replicate"
+        self._dp_replicate_degree: Optional[int] = None
         self._processed_params: Set[str] = set()
         self._fsdp_modules: Set[str] = set()
         # Per-param forward all_gather record (the unsharded parameter),
@@ -206,13 +223,27 @@ class FSDPPass(GraphPass):
             _LOG.info("Skipped: distributed not initialized or world_size=1")
             return graph_module
 
-        # FSDP group size: use the explicitly configured degree when present
-        # (required for TP+FSDP, where the FSDP group is a proper sub-group
-        # of the world — using world_size would over-shard along the TP
-        # axis).
+        self._dp_mode = normalize_dp_mode(getattr(pass_config, "dp_mode", "fsdp"))
+        # FSDP shard-axis group size: use the explicitly configured degree when
+        # present (required for TP+FSDP / HSDP, where the FSDP group is a
+        # proper sub-group of the world — using world_size would over-shard
+        # along the TP axis).
         configured = pass_config.fsdp_degree
         self._fsdp_degree = configured if configured else dist.get_world_size()
         self._fsdp_group_name = kwargs.get("fsdp_group_name", self._fsdp_group_name)
+        self._dp_replicate_group_name = kwargs.get(
+            "dp_replicate_group_name", self._dp_replicate_group_name
+        )
+        # Replicate-axis degree used by DDP / HSDP gradient reduction.
+        replicate_degree = getattr(pass_config, "dp_replicate_degree", None)
+        if self._dp_mode == "ddp":
+            self._dp_replicate_degree = replicate_degree or dist.get_world_size()
+        elif self._dp_mode == "hsdp":
+            self._dp_replicate_degree = replicate_degree or (
+                dist.get_world_size() // self._fsdp_degree
+            )
+        else:
+            self._dp_replicate_degree = replicate_degree
         self._parallel_plan = kwargs.get("parallel_plan", self._parallel_plan)
         model = kwargs.get("model")
         if model is None:
@@ -223,17 +254,20 @@ class FSDPPass(GraphPass):
             )
 
         _LOG.info(
-            "Running with fsdp_degree=%s, world_size=%s",
+            "Running dp_mode=%s fsdp_degree=%s dp_replicate_degree=%s world_size=%s",
+            self._dp_mode,
             self._fsdp_degree,
+            self._dp_replicate_degree,
             dist.get_world_size(),
         )
 
-        # Identify FSDP parameter placeholders. The joint graph's
+        # Identify DP parameter placeholders. The joint graph's
         # parameters/buffers are static inputs (leading placeholders, not
         # get_attr nodes): locate them by position via the state layout the
-        # tracer attached, then keep only those in FSDP-marked modules whose
-        # leading dim is divisible by the FSDP degree (non-divisible params
-        # stay replicated, in both graph and live model).
+        # tracer attached, then keep only those in DP-marked modules. For
+        # FSDP/HSDP the leading dim must also be divisible by the shard degree
+        # (non-divisible params stay replicated, in both graph and live model);
+        # DDP has no shard axis so every marked parameter is reduced.
         state_fqns = getattr(graph_module, "state_fqns", [])
         num_state_inputs = getattr(graph_module, "num_state_inputs", 0)
         # Param-vs-buffer flag per leading state input. Absent on graphs
@@ -245,46 +279,58 @@ class FSDPPass(GraphPass):
         )
 
         _LOG.info(
-            "Identified %d FSDP parameter nodes out of %d total state inputs",
+            "Identified %d DP parameter nodes out of %d total state inputs",
             len(param_nodes),
             num_state_inputs,
         )
 
         if not param_nodes:
             _LOG.warning(
-                "No FSDP parameters found, check GraphParallelPlan or model structure"
+                "No DP parameters found, check GraphParallelPlan or model structure"
             )
             return graph_module
 
+        # Per-run state: reset so a reused FSDPPass instance does not carry
+        # parameter names from a previous graph (which would skip their gather).
+        self._processed_params = set()
+        self._fsdp_modules = set()
         self._unsharded_params = {}
-        graph_module = self._insert_all_gather_for_params(
-            graph_module, param_nodes, pass_config
-        )
+        # DDP replicates parameters: no all_gather, no live-model sharding and
+        # no reshard. Only the gradient all-reduce path below runs.
+        if self._dp_mode != "ddp":
+            graph_module = self._insert_all_gather_for_params(
+                graph_module, param_nodes, pass_config
+            )
 
-        sharded_param_indices = frozenset(
-            node.meta["state_idx"] for node in param_nodes
-        )
-        graph_module = self._insert_reduce_scatter_for_grads(
+        reduce_param_indices = frozenset(node.meta["state_idx"] for node in param_nodes)
+        graph_module = self._insert_grad_reduction(
             graph_module,
-            sharded_param_indices,
+            reduce_param_indices,
             state_fqns,
             num_state_inputs,
             state_is_param,
             model,
         )
-        # Reshard: free each replicated parameter once forward is done and
-        # re-gather + rematerialize it for the backward. Runs after reduce
-        # scatter so the grad path is untouched; a no-op when disabled.
-        graph_module = self._insert_reshard_logic(
-            graph_module, param_nodes, pass_config
-        )
 
-        # Shard the live model's parameters in place (dim 0, by this rank's
-        # index in the FSDP group). ``model.parameters()`` then yields the
-        # shards, so the trainer's optimizer / grad accumulation stay
-        # FSDP-agnostic; the graph re-gathers each step.
-        self._shard_live_model_params(model)
-        _LOG.info("Completed, sharded %d parameters", len(param_nodes))
+        if self._dp_mode != "ddp":
+            # Reshard: free each replicated parameter once forward is done and
+            # re-gather + rematerialize it for the backward. Runs after the
+            # grad reduction so the grad path is untouched; no-op when disabled.
+            graph_module = self._insert_reshard_logic(
+                graph_module, param_nodes, pass_config
+            )
+
+            # Shard the live model's parameters in place (dim 0, by this rank's
+            # index in the FSDP group). ``model.parameters()`` then yields the
+            # shards, so the trainer's optimizer / grad accumulation stay
+            # DP-agnostic; the graph re-gathers each step.
+            self._shard_live_model_params(model)
+
+        _LOG.info(
+            "Completed dp_mode=%s, processed %d parameters",
+            self._dp_mode,
+            len(param_nodes),
+        )
 
         graph_module.recompile()
         return graph_module
@@ -311,6 +357,10 @@ class FSDPPass(GraphPass):
         they are skipped using the ``state_is_param`` flag the tracer attaches
         to the graph. When the flag is unavailable, every state input is
         treated as a parameter (previous behaviour).
+
+        Frozen parameters (``requires_grad=False``) are skipped too: the tracer
+        omits them from the gradient list and the live-model sharder leaves them
+        full-size, so sharding them here would desync the graph from the model.
 
         The dim-0 divisibility gate mirrors ``_shard_live_model_params``: a
         parameter that is 0-dim (scalar) or whose leading dim is not divisible
@@ -350,13 +400,26 @@ class FSDPPass(GraphPass):
             ):
                 continue
 
+            # Frozen params are not trainable: the tracer omits them from the
+            # gradient list and ``_shard_live_model_params`` leaves them
+            # full-size. Inserting an all_gather here would make the graph
+            # expect a sharded input while the live model still holds the full
+            # tensor (shape mismatch at ``run_traced_graph`` time), so skip them
+            # with the same gate the live-model sharder uses.
+            param = param_lookup.get(fqn)
+            if param is not None and not param.requires_grad:
+                _LOG.info("Skip %s: requires_grad=False (frozen)", fqn)
+                continue
+
             # Same gate as ``_shard_live_model_params``: scalar params
             # (empty shape) and non-divisible dim-0 params stay replicated,
             # so the graph and the live model agree on which parameters are
-            # sharded.
-            param = param_lookup.get(fqn)
-            if param is not None and (
-                not param.shape or param.shape[0] % self._fsdp_degree != 0
+            # sharded. DDP has no shard axis, so every marked parameter is
+            # reduced regardless of divisibility.
+            if (
+                self._dp_mode != "ddp"
+                and param is not None
+                and (not param.shape or param.shape[0] % self._fsdp_degree != 0)
             ):
                 _LOG.info(
                     "Skip %s: dim 0 (%s) not divisible by fsdp_degree (%s)",
@@ -469,12 +532,13 @@ class FSDPPass(GraphPass):
         pass_config: PassConfig,
     ) -> fx.GraphModule:
         """
-        Insert AllGather after each FSDP parameter placeholder.
+        Insert AllGather for each FSDP parameter placeholder.
 
         Parameter state: Shard -> Replicate. All subsequent uses of the
         placeholder are rewired to the unsharded (replicated) tensor, so the
         computation body keeps operating on full parameters while the graph
-        input stays sharded.
+        input stays sharded. The gather is placed after the placeholder, or
+        sunk to just before the first consumer when reshard is enabled.
 
         When reshard is enabled the gather is **sunk** to just before the
         parameter's first consumer instead of sitting next to the placeholder.
@@ -556,33 +620,39 @@ class FSDPPass(GraphPass):
         order = {n: i for i, n in enumerate(param_node.graph.nodes)}
         return min(candidates, key=lambda u: order.get(u, len(order)))
 
-    def _insert_reduce_scatter_for_grads(  # pylint: disable=too-many-locals
+    def _insert_grad_reduction(  # pylint: disable=too-many-locals
         self,
         graph_module: fx.GraphModule,
-        sharded_param_indices: Set[int],
+        reduce_param_indices: Set[int],
         state_fqns: List[str],
         num_state_inputs: int,
         state_is_param: Optional[List[bool]] = None,
         model: Optional[nn.Module] = None,
     ) -> fx.GraphModule:
         """
-        Insert ReduceScatter on the gradient outputs of FSDP-sharded parameters.
+        Insert gradient reduction on the gradient outputs of DP parameters.
 
         The joint graph returns ``[loss, grad0, grad1, ...]`` from the fwd+bwd
         function; gradient ``i`` (output index ``i+1``) corresponds to the
-        ``i``-th trainable parameter. Gradients of FSDP-sharded parameters are
-        reduce-scattered (Replicate -> Shard); gradients of parameters outside
-        FSDP modules stay full. Only a subset of parameters is typically
-        wrapped, so this is a per-parameter decision rather than
-        scatter-everything.
+        ``i``-th trainable parameter. For each parameter in
+        ``reduce_param_indices`` the mode decides the collective chain:
+
+        - ``"fsdp"``: reduce_scatter on the ``fsdp`` group (Replicate -> Shard).
+        - ``"ddp"``: all_reduce on the ``dp_replicate`` group (gradients of
+          replicated parameters are averaged across the replicate axis).
+        - ``"hsdp"``: reduce_scatter on ``fsdp`` then all_reduce on
+          ``dp_replicate`` (average across both axes; the shard axis first, so
+          the cross-axis message is already sharded).
+
+        Gradients of parameters outside the DP modules stay full. Only a subset
+        of parameters is typically wrapped, so this is a per-parameter decision
+        rather than scatter/reduce-everything.
 
         The tracer emits gradients in ``state_fqns`` order, skipping buffers
         and frozen (``requires_grad=False``) parameters.
         ``_build_trainable_state_indices`` mirrors that filter so gradient
         ``i`` maps to the correct ``state_idx`` even when the model has buffers
-        or frozen params; the previous ``param_idx = i - 1`` only held for the
-        all-trainable, no-buffer case and silently misaligned reduce_scatter
-        otherwise.
+        or frozen params.
         """
         graph = graph_module.graph
 
@@ -600,48 +670,97 @@ class FSDPPass(GraphPass):
         )
 
         new_returned = list(returned)
-        num_grads = len(new_returned) - 1  # index 0 is the loss
+        # ``train_fn`` may append the traced ``loss_dict`` outputs AFTER the
+        # gradients (see ``trace_model_graph``); those are not gradients and
+        # must stay outside the reduce_scatter range.
+        num_loss_outputs = len(getattr(graph_module, "loss_dict_keys", []))
+        num_grads = len(new_returned) - 1 - num_loss_outputs  # index 0 is the loss
         if num_grads != len(trainable_state_indices):
             raise ValueError(
                 f"Gradient count ({num_grads}) does not match trainable "
                 f"parameter count ({len(trainable_state_indices)}). The "
                 f"traced graph and the live model disagree on which "
-                f"parameters are trainable; refusing to insert "
-                f"reduce_scatter to avoid silent gradient/state misalignment."
+                f"parameters are trainable; refusing to insert gradient "
+                f"reduction to avoid silent gradient/state misalignment."
             )
 
         # Index 0 is the loss; gradients start at index 1. Gradient i+1
         # corresponds to trainable parameter i, whose state_idx is
-        # trainable_state_indices[i].
-        for i in range(1, len(new_returned)):
+        # trainable_state_indices[i]. The trailing loss_dict outputs are
+        # named loss values, not gradients.
+        for i in range(1, len(new_returned) - num_loss_outputs):
             grad_node = new_returned[i]
             if not isinstance(grad_node, fx.Node):
                 continue
 
             state_idx = trainable_state_indices[i - 1]
-            if state_idx not in sharded_param_indices:
+            if state_idx not in reduce_param_indices:
                 continue
 
             with graph.inserting_before(output_node):
-                rs_node = graph.call_function(
-                    _c10d_functional.reduce_scatter_tensor,
-                    args=(grad_node, "sum", self._fsdp_degree, self._fsdp_group_name),
-                )
-                rs_node.meta["comm_type"] = "fsdp_reduce_scatter"
-                rs_node.meta["comm_group"] = self._fsdp_group_name
-                rs_node.meta["fsdp_degree"] = self._fsdp_degree
-
-                wait_node = graph.call_function(
-                    _c10d_functional.wait_tensor,
-                    args=(rs_node,),
-                )
-                wait_node.meta["wait_for"] = rs_node.name
-
-            new_returned[i] = wait_node
+                new_returned[i] = self._build_grad_reduction_nodes(graph, grad_node)
 
         output_node.args = (type(returned)(new_returned),) + tuple(output_node.args[1:])
 
         return graph_module
+
+    def _build_grad_reduction_nodes(
+        self, graph: fx.Graph, grad_node: fx.Node
+    ) -> fx.Node:
+        """Build and return the waited gradient-reduction node for ``grad_node``.
+
+        The returned (wait) node replaces ``grad_node`` in the graph output.
+        Emits the mode-specific chain (see ``_insert_grad_reduction``).
+
+        Every collective is waited on before its result is consumed. A chained
+        collective runs on a different process-group stream (HSDP's
+        reduce_scatter is on ``fsdp`` while the all_reduce is on
+        ``dp_replicate``), so without the intermediate wait the all_reduce could
+        read a partially written shard. This mirrors eager ``fully_shard``,
+        which orders the all_reduce stream after the reduce_scatter stream.
+        """
+        reduced = grad_node
+        if self._dp_mode in ("fsdp", "hsdp"):
+            rs_node = graph.call_function(
+                _c10d_functional.reduce_scatter_tensor,
+                args=(
+                    reduced,
+                    _GRAD_REDUCE_OP,
+                    self._fsdp_degree,
+                    self._fsdp_group_name,
+                ),
+            )
+            rs_node.meta["comm_type"] = "fsdp_reduce_scatter"
+            rs_node.meta["comm_group"] = self._fsdp_group_name
+            rs_node.meta["fsdp_degree"] = self._fsdp_degree
+            reduced = rs_node
+            # HSDP chains all_reduce (a different process-group stream) after
+            # the reduce_scatter, so wait first; plain FSDP waits on the final
+            # node only.
+            if self._dp_mode == "hsdp":
+                reduced = self._insert_wait(graph, reduced)
+
+        if self._dp_mode in ("ddp", "hsdp"):
+            ar_node = graph.call_function(
+                _c10d_functional.all_reduce,
+                args=(reduced, _GRAD_REDUCE_OP, self._dp_replicate_group_name),
+            )
+            ar_node.meta["comm_type"] = "dp_all_reduce"
+            ar_node.meta["comm_group"] = self._dp_replicate_group_name
+            ar_node.meta["dp_replicate_degree"] = self._dp_replicate_degree
+            reduced = ar_node
+
+        return self._insert_wait(graph, reduced)
+
+    @staticmethod
+    def _insert_wait(graph: fx.Graph, tensor_node: fx.Node) -> fx.Node:
+        """Append ``wait_tensor(tensor_node)`` and return the waited node."""
+        wait_node = graph.call_function(
+            _c10d_functional.wait_tensor,
+            args=(tensor_node,),
+        )
+        wait_node.meta["wait_for"] = tensor_node.name
+        return wait_node
 
     def _build_trainable_state_indices(
         self,
@@ -803,11 +922,17 @@ class FSDPPass(GraphPass):
             ag_node.meta["param_node"] = record.param_node.name
             ag_node.meta["param_name"] = record.param_node.meta.get("param_name")
             ag_node.meta["fsdp_degree"] = self._fsdp_degree
+            # This gather lives in the backward half; tag it so downstream
+            # passes (e.g. PpPass phase classification) do not mistake it and
+            # its remat clones for forward nodes — their only arg is a forward
+            # state placeholder, which would otherwise imply the forward phase.
+            ag_node.meta["autograd_backward"] = True
         with graph.inserting_before(anchor):
             wait_node = graph.call_function(
                 _c10d_functional.wait_tensor, args=(ag_node,)
             )
             wait_node.meta["wait_for"] = ag_node.name
+            wait_node.meta["autograd_backward"] = True
         return wait_node
 
     def _clone_with_remap(
@@ -827,6 +952,9 @@ class FSDPPass(GraphPass):
         with graph.inserting_after(insert_after):
             clone = graph.call_function(node.target, args=args, kwargs=kwargs)
         self._copy_recreated_meta(node, clone)
+        # Rematerialized views serve the backward half, so they carry the
+        # backward phase (see ``_insert_backward_gather``).
+        clone.meta["autograd_backward"] = True
         recreate[node] = clone
         return clone
 
@@ -855,6 +983,8 @@ class FSDPPass(GraphPass):
             free_node = graph.call_function(_free_tensor_storage, args=(tensor,))
             free_node.meta["comm_type"] = comm_type
             free_node.meta["param_name"] = record.param_node.meta.get("param_name")
+            if backward:
+                free_node.meta["autograd_backward"] = True
 
     def _alias_descendants(self, root: fx.Node) -> Set[fx.Node]:
         """Forward view descendants of ``root`` (nodes aliasing its storage).

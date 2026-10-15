@@ -49,7 +49,7 @@ def _gradient_for_param(
         optimizer_param: nn.Parameter,
         gradient: torch.Tensor,
 ) -> torch.Tensor:
-    """Return a validated gradient matching an optimizer parameter.
+    """Validate gradient layout and cast dtype on the gradient's existing device.
 
     DTensor optimizer parameters keep a DTensor gradient so lazily-created
     optimizer state inherits its complete global layout. FSDP ``main_grad`` is
@@ -66,6 +66,11 @@ def _gradient_for_param(
 
     optimizer_local = to_local_if_dtensor(optimizer_param)
     gradient_local = to_local_if_dtensor(gradient)
+    if gradient_local.device != optimizer_local.device:
+        raise ValueError(
+            "Optimizer gradient must already be on its parameter's device: "
+            f"got {gradient_local.device} and {optimizer_local.device}"
+        )
     if tuple(gradient_local.shape) != tuple(optimizer_local.shape):
         raise ValueError(
             "Optimizer gradient local shape must match its parameter shard: "
@@ -91,14 +96,8 @@ def _gradient_for_param(
         prepared_gradient = gradient
     else:
         prepared_gradient = gradient_local.detach()
-    if (
-        gradient_local.device != optimizer_local.device
-        or gradient_local.dtype != optimizer_local.dtype
-    ):
-        prepared_gradient = prepared_gradient.to(
-            device=optimizer_local.device,
-            dtype=optimizer_local.dtype,
-        )
+    if gradient_local.dtype != optimizer_local.dtype:
+        prepared_gradient = prepared_gradient.to(dtype=optimizer_local.dtype)
     return prepared_gradient
 
 
@@ -210,7 +209,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 self.fp32_from_fp32_groups.append(fp32_from_fp32_group)
 
     def _copy_model_grads_to_main_grads(self) -> None:
-        """Move model ``grad`` or ``main_grad`` into optimizer fp32 grads."""
+        """Transfer model gradients to fp32 optimizer params, casting dtype only.
+
+        The producer must supply the optimizer parameter's device and layout.
+        Rebind existing ``main_grad`` buffers to the prepared gradient and clear
+        model ``grad``. The local source reference is overwritten before the
+        next conversion or released on return, so reference counting reclaims
+        converted source buffers before the optimizer step.
+        External owners of shared gradient storage remain responsible for it.
+        """
         for model_group, main_group in zip(
                 self.float16_groups,
                 self.fp32_from_float16_groups,
@@ -220,20 +227,19 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 if model_gradient is None:
                     model_gradient = model_param.grad
                 main_param.grad = (
-                    None
-                    if model_gradient is None
-                    else _gradient_for_param(main_param, model_gradient)
+                    _gradient_for_param(main_param, model_gradient)
+                    if model_gradient is not None else None
                 )
+                if model_param.main_grad is not None:
+                    model_param.main_grad = main_param.grad
                 model_param.grad = None
 
         for fp32_group in self.fp32_from_fp32_groups:
             for model_param in fp32_group:
                 model_gradient = model_param.main_grad
                 if model_gradient is not None:
-                    model_param.grad = _gradient_for_param(
-                        model_param,
-                        model_gradient,
-                    )
+                    model_param.grad = _gradient_for_param(model_param, model_gradient)
+                    model_param.main_grad = model_param.grad
 
     @torch.no_grad()
     def _copy_main_params_to_model_params(self) -> None:

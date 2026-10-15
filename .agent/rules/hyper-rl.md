@@ -43,6 +43,14 @@ Load the affected product contract rather than every RL document.
   publication. The CPU contract is implemented; real NPU acceptance remains pending.
 - Weight synchronization selects `full_gather` or `direct_reshard`, with IPC for colocated and HCCL for disjoint.
   Publication errors propagate; there is no automatic fallback. Preserve this contract when fixing failures.
+- Qwen3.5-9B and Qwen3.8-27B use the existing `qwen3_5` text model and public AutoModel builder.
+  Model probability/recomputation adapters belong in `hyper_parallel/models/qwen3_5/`; RL owns identity,
+  configuration and publication glue under the current `rl/weight_sync/` boundary. The initial scope is
+  text GRPO, FSDP with training TP=CP=1, colocated native vLLM, consistency off and streamed full_gather.
+  Eager is the baseline; pinned 0.23.0.post1 also supports explicit single-DP FULL_DECODE_ONLY capture
+  and publication refresh. Numerical differences are diagnostics, not an uncalibrated acceptance gate.
+  See the [repository recipes](../../hyper_parallel/rl/examples/swe_smith/README.md#模型配方) and
+  [validation procedure and scope](../../hyper_parallel/rl/examples/swe_smith/README.md#图执行与验证范围).
 - Single-turn Python stdio tasks use `examples.code.agent` / `code_stdio` with the internal runner.
   Keep private test cases in structured `PromptRecord.ground_truth`; `data.row_adapter` preserves messages and task identity.
   Only the TP request owner executes the environment. Judge every declared test before assigning binary success;
@@ -51,9 +59,15 @@ Load the affected product contract rather than every RL document.
 - External Codex and DeepSeek programs train each call under its actual prompt with episode-level GRPO.
   Complete call identities, shared rewards and policy versions are required. DP padding has zero loss and is excluded
   from episode reporting; segmented PPO is rejected. Legacy continuous builders require exact sampled-action prefixes.
-  External tool attribution uses the pinned Hermes parser evidence: infrastructure or unknown failures reject the update,
+  External tool attribution uses pinned model-family parser evidence: Hermes for Qwen3 and Qwen3Coder XML for
+  Qwen3.5-family text. Infrastructure or unknown failures reject the update,
   while verified malformed model actions remain in the episode. See the
   [agent contract](../../hyper_parallel/rl/docs/agentic_rl.md) for budgets, shutdown and support boundaries.
+- Repository Code Agent uses isolated candidate/grader workspaces, authenticated controller management,
+  a session-bound relay and independent frozen-artifact grading. Keep existing text gateway defaults and
+  mainline diagnostics. See the
+  [repository contract](../../hyper_parallel/rl/examples/swe_smith/README.md); CPU contracts belong in
+  `tests/ut/rl/agentic/swe_smith/`. Do not migrate historical logs, checkpoints or one-off observers.
 - Shared HyperParallel modules retain their own rules. For Qwen3 integration, also follow applicable model and
   distributed rules; do not apply RL policy to unrelated code or change shared contracts without examining other callers.
 
@@ -101,7 +115,7 @@ plans, temporary validation results, or facts already owned elsewhere.
   SandboxFusion, and explicit MoE/code/agent training workers. Missing runtime resources are not a passing result.
   The existing `test_rl_st.py` dense/consistency/PPO recipes remain independent. See the
   [feature validation guide](../../hyper_parallel/rl/docs/moe_code_agent.md) for configuration and evidence boundaries.
-- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch or HyperParallel during collection. Use the [UT guide](../../hyper_parallel/rl/docs/hyper_rl_ut.md) and
+- Follow the repository [testing rules](testing.md) and [UT rules](unit-test.md). ST launchers must not import Torch or HyperParallel during collection. Use the [UT guide](../skills/add-unit-test/SKILL.md) and
   [ST guide](../../hyper_parallel/rl/README.md#系统测试) for execution commands and resources.
 - For docs and agent rules, run `python3 .agent/scripts/check_agents_catalog.py`, Markdown lint, and checks for changed
   relative links and referenced paths. The catalog script only compares Skills/Agents tables against disk; it does not

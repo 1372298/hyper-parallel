@@ -17,16 +17,65 @@
 from __future__ import annotations
 
 import inspect
+from types import MethodType
 from typing import Any, Callable
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.modules.engram import local_token_mask
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
     require_attrs,
 )
 from hyper_parallel.distributed.recipe_spec import local_compute
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
+
+
+def _deepseek_v41_unclamped_gate(gate_up: torch.Tensor) -> torch.Tensor:
+    """Apply native FP32 SwiGLU when a nonpositive limit disables clamping."""
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    return deepseek_v41_swiglu(gate, up, 0.0).to(gate_up.dtype)
+
+
+def _deepseek_v41_grouped_expert_forward(
+        experts: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Run FP32 clamped SwiGLU between two grouped GEMMs.
+
+    The generic EP path has already sorted ``hidden_states`` into expert-major
+    order. Routed and shared experts reuse the native FP32 clamp and SwiGLU
+    implementation. Nonpositive limits disable clamping; the down projection
+    still receives the original hidden-state dtype.
+    """
+    # The shared primitive imports optional torch_npu; keep CPU/GPU imports lazy.
+    from hyper_parallel.components.functional import grouped_matmul  # pylint: disable=C0415
+
+    group_list = torch.cumsum(
+        tokens_per_expert.to(device=hidden_states.device, dtype=torch.int64),
+        dim=0,
+    )
+    gate_up = grouped_matmul(  # pylint: disable=not-callable
+        hidden_states,
+        experts.gate_up_proj.transpose(1, 2),
+        bias=None,
+        group_list=group_list,
+        group_type=0,
+        group_list_type=0,
+    )
+    # Cast the packed projections once; the shared helper's casts are then no-ops.
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    intermediate = deepseek_v41_swiglu(gate, up, experts.limit)
+    return grouped_matmul(  # pylint: disable=not-callable
+        intermediate.to(hidden_states.dtype),
+        experts.down_proj.transpose(1, 2),
+        bias=None,
+        group_list=group_list,
+        group_type=0,
+        group_list_type=0,
+    )
 
 
 def _router(
@@ -73,19 +122,29 @@ def deepseek_v41_ep_compute_fn(
         use_grouped_gemm: bool = False,
 ) -> Callable:
     """Build the complete V4.1 routed-plus-shared expert forward."""
-    del mesh, tp_mesh, cp_mesh
+    del mesh, cp_mesh
     require_attrs(module, "gate", "experts", "shared_experts", owner="DeepSeek-V4.1 EP")
     if ep_mesh is None:
         raise ValueError("DeepSeek-V4.1 EP forward requires an active ep_mesh")
     if module.is_hash:
         raise ValueError("DeepSeek-V4.1 validation layers must use learned routing")
+    apply_gate = (
+        module.experts._apply_gate  # pylint: disable=protected-access
+        if module.experts.limit > 0 else _deepseek_v41_unclamped_gate
+    )
     if use_grouped_gemm:
-        raise ValueError("DeepSeek-V4.1 clamp semantics currently require use_grouped_gemm=false")
+        module.experts.forward_expert_major = MethodType(
+            _deepseek_v41_grouped_expert_forward,
+            module.experts,
+        )
     ep_group = ep_mesh.get_group("ep")
+    tp_size = 1 if tp_mesh is None else tp_mesh.size()
+    tp_rank = 0 if tp_mesh is None else tp_mesh.get_local_rank()
     bind_local_expert_forward(
         module,
         ep_mesh["ep"].size(),
-        apply_gate=module.experts._apply_gate,  # pylint: disable=protected-access
+        use_grouped_gemm=use_grouped_gemm,
+        apply_gate=None if use_grouped_gemm else apply_gate,
     )
 
     if "image_mask" not in inspect.signature(module.forward).parameters:
@@ -94,7 +153,13 @@ def deepseek_v41_ep_compute_fn(
                 hidden_states: torch.Tensor,
                 input_ids: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            """Run the text-only source contract without visual routing state."""
+            """Run the text-only source contract without visual routing state.
+
+            Args:
+                module: Routed and shared expert module.
+                hidden_states: Current decoder hidden rows.
+                input_ids: Unused token IDs from the local compute contract.
+            """
             del input_ids
             return _routed_and_shared_forward(module, hidden_states, None, ep_group)
 
@@ -106,9 +171,19 @@ def deepseek_v41_ep_compute_fn(
             input_ids: torch.Tensor | None = None,
             image_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the multimodal source contract with optional visual routing state."""
+        """Run the multimodal source contract with optional visual routing state.
+
+        Args:
+            module: Routed and shared expert module.
+            hidden_states: TP-local decoder hidden rows.
+            input_ids: Unused token IDs from the local compute contract.
+            image_mask: CP-local mask identifying image tokens.
+        """
         del input_ids
-        return _routed_and_shared_forward(module, hidden_states, image_mask, ep_group)
+        local_image_mask = local_token_mask(
+            image_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size,
+        )
+        return _routed_and_shared_forward(module, hidden_states, local_image_mask, ep_group)
 
     return multimodal_compute_fn
 
@@ -131,11 +206,9 @@ def deepseek_v41_engram_compute_fn(
         "parallel_forward",
         owner="DeepSeek-V4.1 Engram EP",
     )
-    if ep_mesh is None:
-        raise ValueError("DeepSeek-V4.1 Engram EP requires an active ep_mesh")
-    ep_group = ep_mesh.get_group("ep")
-    ep_size = ep_mesh["ep"].size()
-    ep_rank = ep_mesh.get_local_rank("ep")
+    ep_group = None if ep_mesh is None else ep_mesh.get_group("ep")
+    ep_size = 1 if ep_mesh is None else ep_mesh["ep"].size()
+    ep_rank = 0 if ep_mesh is None else ep_mesh.get_local_rank("ep")
     cp_group = None if cp_mesh is None else cp_mesh.get_group()
     cp_size = 1 if cp_mesh is None else cp_mesh.size()
     cp_rank = 0 if cp_mesh is None else cp_mesh.get_local_rank()
@@ -149,20 +222,31 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: torch.Tensor | None = None,
             token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Route hash-row requests and run the exact V4.1 fusion."""
-        return module.parallel_forward(
-            hidden_states,
-            input_ids,
-            segment_starts,
-            token_mask,
-            ep_group=ep_group,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            cp_group=cp_group,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+        """Route hash-row requests and run the exact V4.1 fusion.
+
+        Args:
+            module: Active Engram module.
+            hidden_states: TP-local decoder hidden rows.
+            input_ids: CP-local token IDs.
+            segment_starts: Optional packed sequence boundaries.
+            token_mask: CP-local mask selecting Engram updates.
+        """
+        if ep_size > 1:
+            return module.parallel_forward(
+                hidden_states, input_ids, segment_starts, token_mask,
+                ep_group=ep_group, ep_rank=ep_rank, ep_size=ep_size,
+                cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+                tp_rank=tp_rank, tp_size=tp_size,
+            )
+        hash_ids = module._aligned_hash_ids(  # pylint: disable=protected-access
+            hidden_states, input_ids, segment_starts, token_mask,
+            cp_group=cp_group, cp_rank=cp_rank, cp_size=cp_size,
+            tp_rank=tp_rank, tp_size=tp_size,
+        )
+        fused = module._fuse(hidden_states, module.embed(hash_ids))  # pylint: disable=protected-access
+        mask = local_token_mask(token_mask, hidden_states, tp_rank=tp_rank, tp_size=tp_size)
+        return fused if mask is None else torch.where(
+            mask.to(torch.bool).unsqueeze(-1).unsqueeze(-1), fused, hidden_states,
         )
 
     return compute_fn

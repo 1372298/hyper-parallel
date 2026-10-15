@@ -237,10 +237,11 @@ Currently validated on **single-node Ascend 910B3**; see the [runtime image](doc
 | **Colocated Reward Model** | 🧪 | Optional frozen vLLM RM and task-owned [Qwen3 Dense scorer](examples/gsm8k/agent.py) are integrated; real NPU acceptance has not been run. The example Qwen3-4B is a generative judge for flow validation, not a preference-trained RM |
 | **Single-turn and multi-turn tool tasks** | ✅ | Python environments, tools, and rewards share token-first trajectories; environment observations are excluded from loss |
 | **Programmatic agents** | ◐ | Codex / DeepSeek harnesses integrated; custom programs require adaptation. See [Agentic RL](docs/agentic_rl.md) |
+| **Repository Code Agent** | ◐ | SWE-Smith isolated workspaces, independent grading and per-call GRPO; 9B short-budget RL/recovery and reference-budget inference validated. Long-trajectory learning and full-dataset scale remain unverified. See [usage](examples/swe_smith/README.md) |
 | **Sampling and deployment** | ✅ | Hyper/Native-vLLM; Qwen3 dense supports colocated and disjoint deployment, MoE is colocated only. See [vLLM Rollout](docs/vllm_rollout.md) for DP/TP/EP combinations |
 | **Weight synchronization and runtime support** | ✅ | Streaming full-gather / explicit direct-reshard, IPC/HCCL, publication checks, checkpoint recovery, and console / W&B metrics. See [architecture contracts](docs/architecture.md) |
 | **Bit-Exact checks** | ✅ | Optional pre-update logprob checks, limited to Qwen3 dense + Hyper-vLLM matched TP1/TP2. See [full conditions](docs/qwen3_training_inference_consistency.md) |
-| **PPO / GAE / Critic** | ✅ | Mathematical and role components exist; no end-to-end training path yet |
+| **PPO / GAE / Critic** | ✅ | Dense Qwen3 internal runner validated with two-device Actor/Critic updates and publication; segmented external-agent trajectories and MoE PPO are unsupported |
 | **Asynchronous and multi-node training** | ○ | Ray-based sampling/learning overlap, policy lag, and recovery; extensions to multiple nodes and long-running agents |
 | **Multimodal training and interaction** | ○ | Visual RL, media/action alignment, and multimodal agents |
 
@@ -249,12 +250,13 @@ Currently validated on **single-node Ascend 910B3**; see the [runtime image](doc
 | Model | Status | Validation scope or target |
 | :--- | :---: | :--- |
 | **Qwen3 dense** | ✅ | Single-node GRPO; Hyper/Native-vLLM TP1/TP2, with Trainer TP1, pure TP2, or FSDP-shard×TP2 |
-| **Qwen3-30B-A3B** | ✅ | Native/Hyper two-step loops and controlled nonzero updates; four-device TP2/EP4 weight publication validated |
+| **Qwen3-30B-A3B** | ✅ | Colocated native vLLM GRPO; four-device TP2/EP2/EDP2 full-gather and direct-reshard validated independently. Hyper rollout and MoE PPO are unsupported |
+| **Qwen3.5-9B / Qwen3.8-27B** | ◐ | Shared text AutoModel, FSDP with training TP=CP=1, colocated native vLLM GRPO and streamed full-gather. 9B short-budget remote loop validated; 27B not revalidated after migration. No bit-exact claim. See [scope](docs/swe_smith.md) |
 | **Moonlight-16B-A3B-Instruct** | ◐ | Hyper passes two-step nonzero learning; Native publication passes, but sustained nonzero learning has not passed acceptance |
 | **Qwen2.5-VL-7B-Instruct** | ○ | Image-based math questions and multimodal agents |
 | **Full DeepSeek-V3 model** | ○ | Multi-node synchronous baseline and asynchronous comparison using the full checkpoint |
 
-See [MoE Models](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md) for detailed configurations and acceptance results, [TODO](docs/TODO.md) for planned dependencies and quantitative criteria, and [current limitations](#current-limitations) for usage boundaries.
+See [MoE and agent validation](docs/moe_code_agent.md), [Code Agent scope](docs/swe_smith.md), and [current limitations](#current-limitations) for supported combinations and remaining work.
 
 ---
 
@@ -267,7 +269,7 @@ See [MoE Models](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c63
 - **Multimodal training:** Establish visual RL with Qwen2.5-VL-7B-Instruct on image-based math questions, then validate multimodal agent interactions.
 - **Agent learning and asynchronous execution:** Refine existing multi-turn environments and programmatic integration, validate learning on tool and stateful code tasks, and extend asynchronous execution to long-running tasks.
 
-Each direction requires complete recipes, learning results, and resource-cost comparisons. Models, dependencies, and quantitative criteria are maintained in [TODO](docs/TODO.md). World models and embodied intelligence remain long-term directions with concrete delivery scope yet to be defined.
+Each direction requires complete recipes, learning results, and resource-cost comparisons. Architecture boundaries and remaining work are maintained in [Architecture](docs/architecture.md#演进边界规划) and [Code Agent scope](docs/swe_smith.md). World models and embodied intelligence remain long-term directions with concrete delivery scope yet to be defined.
 
 ---
 
@@ -276,7 +278,7 @@ Each direction requires complete recipes, learning results, and resource-cost co
 
 ## 📌 Current limitations
 
-- **Runtime scope:** Current execution is single-node Ascend synchronous GRPO, limited to the models and topologies in [supported capabilities](#supported-capabilities). Dense GSPO has CPU coverage and an NPU acceptance recipe; real NPU acceptance has not been run. MoE does not yet support disjoint deployment or intra-expert TP. PPO / Critic components do not yet provide end-to-end training.
+- **Runtime scope:** Current execution is single-node Ascend synchronous GRPO, limited to the models and topologies in [supported capabilities](#supported-capabilities). Dense GSPO has CPU coverage and an NPU acceptance recipe; real NPU acceptance has not been run. MoE does not yet support disjoint deployment or intra-expert TP. Dense internal-runner PPO has two-device acceptance; other combinations require independent validation.
 - **Validation scope:** Functional success does not establish long-term learning gains. Bit-Exact covers pre-update logprobs only in specified Qwen3 dense + Hyper-vLLM configurations; it does not guarantee gradients, updated parameters, or convergence. See [consistency documentation](docs/qwen3_training_inference_consistency.md).
 - **Recovery and counters:** Checkpoint recovery is implemented, but sample/token consumption counters are not yet incremented during training steps and must not be used to measure actual training volume. See [state and recovery boundaries](docs/architecture.md#状态所有权).
 - **Deployment requirements:** vLLM RLHF/refit development endpoints are intended only for trusted, isolated training networks. See the [runtime image](docker/README.md) for environment and driver requirements.
@@ -318,6 +320,7 @@ Linked product documentation is currently primarily in Chinese. Both README edit
 | --- | --- |
 | [Runtime Image](docker/README.md) | Image download, verification, pinned dependencies, and host requirements |
 | [Agentic RL](docs/agentic_rl.md) | Internal environments, Codex / DeepSeek harness configuration, trajectories, and integration boundaries |
+| [Code Agent](examples/swe_smith/README.md) | SWE-Smith data, task images, inference and training |
 | [MoE Models](https://atomgit.com/mindspore/hyper-parallel/blob/f9f2696341c631327524ea37b6b2ca328076980a/hyper_parallel/rl/docs/moe_models.md) | Models, TP/EP configurations, component ownership, and validation boundaries |
 | [Qwen3 Training–Inference Consistency](docs/qwen3_training_inference_consistency.md) | Bit-Exact definitions, recipes, and acceptance gates |
 
@@ -328,7 +331,7 @@ Linked product documentation is currently primarily in Chinese. Both README edit
 | [Design Goals and Principles](docs/design.md) | Infrastructure choices, module boundaries, and extension tradeoffs |
 | [HyperParallel-RL Architecture](docs/architecture.md) | Components, data contracts, training lifecycle, and boundaries |
 | [vLLM Rollout](docs/vllm_rollout.md) | Resource ownership, sampling admission, weight transactions, and failure semantics |
-| [Delivery Plan](docs/TODO.md) | Milestones, dependencies, and acceptance criteria |
+| [Code Agent scope](docs/swe_smith.md) | Validated behavior, sampling limits, and remaining development |
 
 ### Development and code navigation
 

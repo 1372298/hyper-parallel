@@ -225,11 +225,11 @@ def test_partial_prefill_rng_restores_discarded_request_offsets() -> None:
     assert runner._bookkeeping_sync() == "bookkept"
     assert runner.generators[0].offset == 12
     assert runner.generators[1].offset == 0
-    assert getattr(FakeModelRunner, "_hyper_rl_partial_prefill_rng_patched")
+    assert getattr(FakeModelRunner, "_rl_partial_prefill_rng_patched")
 
 
 def test_consistency_configures_complete_qwen3_recipe() -> None:
-    """Production configuration applies the paired Trainer and Hyper-vLLM recipe."""
+    """Production configuration applies the paired Trainer and adapted vLLM recipe."""
     config = {
         "consistency": {"enabled": True},
         "model": {"name": "qwen3"},
@@ -555,7 +555,7 @@ def test_consistency_validates_model_identity_versions_and_installs_rng_fix(
     """A supported checkpoint and pinned dependency set install the rollout RNG hook."""
     config = {"consistency": {"enabled": True}}
     registration = SimpleNamespace(
-        hyper_model_name="qwen3",
+        builder_model_name="qwen3",
         hf_architecture="Qwen3ForCausalLM",
         model_type="qwen3",
         text_model_type="qwen3",
@@ -583,4 +583,4 @@ def test_consistency_validates_model_identity_versions_and_installs_rng_fix(
     )
     install_partial_prefill_rng_fix()
 
-    assert getattr(Runner, "_hyper_rl_partial_prefill_rng_patched")
+    assert getattr(Runner, "_rl_partial_prefill_rng_patched")

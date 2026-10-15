@@ -13,10 +13,28 @@
 # limitations under the License.
 # ============================================================================
 """test swap optimizer"""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.distributed_launcher import torchrun_case
 from tests.common.parallel_case import parallel_run, TorchCase
 
 SWAP_OPTIMIZER = "swap_optimizer.py"
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+def test_fp32_main_gradient_cast_with_swap_optimizer() -> None:
+    """Validate gradient lifetime and FP32-main training with both swap modes.
+
+    Feature: Mixed-precision optimizer-state swap.
+    Description: Run the FP32-main/FSDP integration on one NPU.
+    Expectation: Swap preserves results without relying on gradient device migration.
+    """
+    torchrun_case(
+        str(Path(__file__).with_name(SWAP_OPTIMIZER)),
+        "test_fp32_main_gradient_cast_with_swap_optimizer",
+        num_proc=1,
+    )
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -58,7 +76,7 @@ def test_swap_optimizer_2():
 def test_swap_optimizer_3():
     """
     Feature: Eight-card fully_shard packed/per swap optimizer.
-    Description: 
+    Description:
         1. test_torch_adam_swap_optimizer_parameter_align
         2. test_torch_adamw_swap_optimizer_parameter_align
         3. test_torch_adam_amsgrad_swap_optimizer_parameter_align

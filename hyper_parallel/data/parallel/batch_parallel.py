@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header,forbidden-backend-import
 
 """data.parallel.batch_parallel: CP-aware batch sharding.
 
@@ -81,6 +82,10 @@ def shard_batch_for_cp(batch: dict[str, Any], cp_mesh: DeviceMesh) -> dict[str, 
     Sharding strategy: pad to a multiple of 2*cp, then slice the token
     interval [cp_rank*chunk, (cp_rank+1)*chunk); the seq_lens family is
     recomputed separately (_shard_seq_lens_for_cp).
+
+    Args:
+        batch: Canonical token batch to shard.
+        cp_mesh: Context-parallel process mesh.
     """
     cp_size = cp_mesh.size()
     if cp_size <= 1:
@@ -190,6 +195,7 @@ class CPBatchSharder:
             self,
             parallel_context: DataLoaderParallelContext,
             token_pad_values: Mapping[str, int] | None = None,
+            required_global_alignment: int | None = None,
     ) -> None:
         """Initialize context-parallel batch sharding.
 
@@ -200,6 +206,9 @@ class CPBatchSharder:
         """
         self.parallel_context = parallel_context
         self.token_pad_values = token_pad_values
+        if required_global_alignment is not None and required_global_alignment < 1:
+            raise ValueError("required_global_alignment must be positive")
+        self.required_global_alignment = required_global_alignment
 
     def shard(
             self,
@@ -241,27 +250,33 @@ class CPBatchSharder:
 
         return cp_batch
 
+    @staticmethod
+    def _extend_cu_seq_lens(cp_batch: dict[str, Any], sequence_length: int, pad_length: int) -> None:
+        """Keep packed sequence boundaries aligned with token padding."""
+        if "cu_seq_lens" not in cp_batch:
+            return
+        boundaries = cp_batch["cu_seq_lens"].reshape(-1)
+        if int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
+            raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+        if pad_length:
+            boundaries = torch.cat((boundaries, boundaries[-1:] + pad_length))
+        cp_batch["cu_seq_lens"] = boundaries
+
     def _shard_configured_fields(self, canonical_batch: Mapping[str, Any]) -> dict[str, Any]:
         """Shard configured token fields and preserve all modality metadata."""
         cp_batch = dict(canonical_batch)
         cp_size = self.parallel_context.cp_world_size
-        if cp_size == 1:
-            return cp_batch
         input_ids = cp_batch["input_ids"]
         if not torch.is_tensor(input_ids) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("Configured CP sharding requires input_ids with shape [1, sequence]")
 
         sequence_length = input_ids.shape[1]
-        pad_length = (-sequence_length) % (2 * cp_size)
-        if "cu_seq_lens" in cp_batch:
-            boundaries = cp_batch["cu_seq_lens"].reshape(-1)
-            if int(boundaries[0]) != 0 or int(boundaries[-1]) != sequence_length:
-                raise ValueError("cu_seq_lens must cover the complete CP input sequence")
+        alignment = self.required_global_alignment or 2 * cp_size
+        pad_length = (-sequence_length) % alignment
+        self._extend_cu_seq_lens(cp_batch, sequence_length, pad_length)
 
-            if pad_length:
-                boundaries = torch.cat((boundaries, boundaries[-1:] + pad_length))
-            cp_batch["cu_seq_lens"] = boundaries
-
+        if cp_size == 1 and pad_length == 0:
+            return cp_batch
         chunk_length = (sequence_length + pad_length) // cp_size
         local_start = self.parallel_context.cp_rank * chunk_length
         local_end = local_start + chunk_length

@@ -27,6 +27,8 @@ global gradient norm across supported execution modes.
    improve performance.
 5. Read [references/matrix-acceptance.md](references/matrix-acceptance.md) before
    launching distributed cases or deciding PASS/FAIL.
+   For a VLM, also read
+   [references/vlm-matrix-and-tolerances.md](references/vlm-matrix-and-tolerances.md).
 6. Read [references/diagnosis-report.md](references/diagnosis-report.md) only when
    diagnosing divergence or producing the final report.
 
@@ -72,6 +74,10 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
   before fetching any weight payload.
 - Missing or incomplete assets produce a clear `BLOCKED` result.
 - Compare both loss and norm. Loss-only agreement is not a PASS.
+- For VLM cross-layout self-consistency, gate ten-step numerical acceptance on
+  loss and pre-clip global norm. Parameter and main-gradient probes diagnose
+  scalar divergence; their numeric mismatch alone does not fail an aligned
+  curve. Keep checkpoint, input, and finite-state checks mandatory.
 - Keep learned MoE routing for formal cases. Forced routing is diagnostic only.
 - Compare optimized/custom modules with the authoritative native implementation
   before using end-to-end loss to judge them.
@@ -91,6 +97,16 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
   to the model adapter. A new generic framework capability must be optional and
   model-independent; a framework-side family/model-type/class/FQN special case is
   a structural failure even when numerical tests pass.
+- Do not directly change shared framework precision behavior to make a model's
+  loss or norm pass. This includes collective accumulation dtype/reduction order,
+  TP/DTensor/FSDP casts, and shared module precision. First locate the earliest
+  divergent logical tensor with rank-indexed intermediate values, explain why
+  the model adapter or declared recipe cannot resolve it, describe the impact on
+  forward/backward and other models, and present the proposed change and A/B
+  evidence to the user for an explicit decision. SP/non-SP agreement after
+  upcasting four BF16 Partial terms to FP32 is insufficient justification by
+  itself; that generic upcast was rejected for this integration. Preserve the
+  existing BF16 framework path unless a later explicit decision authorizes it.
 
 ## Workflow
 
@@ -131,6 +147,13 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
    requested TP/CP/EP combinations, adapter-safe `layer_count` and/or
    `layer_indices` recomputation selections,
    Production/Validate when requested, and explicit resume cases.
+   For a VLM, the generic TP/CP/EP/FSDP matrix is only the decoder portion.
+   Add the vision/projector and modality-routing overlay from the VLM reference;
+   an Encoder-Parallel on/off pair or two ECP degrees alone is not a complete
+   VLM matrix. If the launcher cannot express an overlay dimension, record a
+   separate, machine-readable VLM case ledger and launch it with the same Trainer
+   runtime-evidence contract. Do not count unlaunched or reused old-revision cases
+   as executed in the current matrix.
    Before accepting the generated cases, write a coverage ledger from the final
    model and adapter capabilities. Give every supported parallel axis, meaningful
    hybrid topology, recomputation depth, resume mode, execution mode, and
@@ -161,6 +184,12 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
    layout, shared-state contracts, activation-checkpoint wrappers, step time,
    throughput, and peak allocated/reserved memory. It compares JSON evidence rather
    than parsing Trainer logs.
+   A VLM case requires ten **measured optimizer updates** by default. When
+   restoring a step-1 warm-start, set the final global step to 11 and compare
+   steps 2–11; `train_iters=10` would provide only nine measured updates.
+   Compare every enabled Encoder-Parallel case to the encoder-disabled case
+   with the same decoder topology, input, and checkpoint. Compare changes in
+   decoder topology to the declared decoder baseline separately.
 
    ```bash
    python -m hyper_parallel.tools.model_integration validate \
