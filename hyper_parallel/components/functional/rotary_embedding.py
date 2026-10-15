@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch  # pylint: disable=forbidden-backend-import
 import torch_npu
 
@@ -151,3 +152,127 @@ def apply_rotary_pos_emb_interleave(
         _apply_interleaved_rope(q_rot, q_pass, cos, sin, unsqueeze_dim),
         _apply_interleaved_rope(k_rot, k_pass, cos, sin, unsqueeze_dim),
     )
+
+
+def _rotate_half(
+    x: torch.Tensor,
+    rotary_interleaved: bool = False,
+) -> torch.Tensor:
+    """Rotate the last dimension of ``x`` for rotary position embedding.
+
+    Args:
+        x: Input tensor whose last dimension is the rotary dimension.
+        rotary_interleaved: If ``True``, rotate adjacent even/odd pairs
+            (interleaved layout). If ``False``, split the last dimension
+            into two halves and rotate across them (half layout).
+
+    Returns:
+        A tensor with the same shape and dtype as ``x``.
+    """
+    if not rotary_interleaved:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    dim = x.shape[-1]
+    index1 = np.ones(dim)
+    index1[::2] = 0
+    index2 = np.zeros(dim)
+    index2[::2] = -1
+    rotation_matrix = np.eye(dim, k=1) * index1 + np.eye(dim, k=-1) * index2
+    rotation_matrix = torch.from_numpy(rotation_matrix[None, None, :, :]).to(x.dtype).to(x.device)
+    return torch.matmul(x, rotation_matrix)
+
+
+def apply_rotary_pos_emb_single(
+    t: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_interleaved: bool = False,
+    use_fused_rotary_pos_emb: bool = False,
+) -> torch.Tensor:
+    """Apply interleaved RoPE and append dimensions that bypass rotation.
+
+    Args:
+        tensor: Tensor slice to rotate (the rotary part of Q or K).
+        pass_through: Tensor slice that bypasses rotation, concatenated
+            back after the rotated part.
+        cos: Cosine tensor for the interleaved rotary mode.
+        sin: Sine tensor for the interleaved rotary mode.
+        unsqueeze_dim: Dimension used to make ``cos`` and ``sin``
+            broadcastable to ``tensor``. Must be 1 or 2.
+
+    Returns:
+        A tensor of shape ``..., rotary_dim + pass_through_dim`` formed by
+        concatenating the rotated part and ``pass_through`` along the last
+        dimension.
+    """
+    rot_dim = cos.shape[-1]
+    t_dim = t.shape[-1]
+    t_pass = None
+    if rot_dim != t_dim:
+        t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+
+    cos = cos.to(t.dtype)
+    sin = sin.to(t.dtype)
+
+    while cos.ndim < t.ndim:
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+
+    if use_fused_rotary_pos_emb and t.device.type != "cpu":
+        rotary_mode = "interleave" if rotary_interleaved else "half"
+        sequence_length, batch_size, num_heads, head_dim = t.shape
+        if rotary_interleaved and batch_size > 1 and sequence_length > 1:
+            t = torch_npu.npu_rotary_mul(
+                t.reshape(batch_size * sequence_length, 1, num_heads, head_dim),
+                cos.reshape(batch_size * sequence_length, 1, cos.shape[-2], cos.shape[-1]),
+                sin.reshape(batch_size * sequence_length, 1, sin.shape[-2], sin.shape[-1]),
+                rotary_mode=rotary_mode,
+            ).reshape(sequence_length, batch_size, num_heads, head_dim)
+        else:
+            t = torch_npu.npu_rotary_mul(t.clone(), cos, sin, rotary_mode=rotary_mode)
+    else:
+        t = (t * cos) + (_rotate_half(t, rotary_interleaved) * sin)
+
+    if rot_dim != t_dim:
+        return torch.cat((t, t_pass), dim=-1)
+    return t
+
+
+def apply_rotary_pos_emb_single_freqs(
+    t: torch.Tensor,
+    freqs: torch.Tensor,
+    rotary_interleaved: bool = False,
+) -> torch.Tensor:
+    """Apply rotary embeddings from raw frequency values.
+
+    Args:
+        t: Input tensor to rotate.
+        freqs: Frequency tensor whose last dimension is the rotary
+            dimension. ``cos(freqs)`` and ``sin(freqs)`` are used
+            internally.
+        rotary_interleaved: If ``True``, use interleaved rotary mode;
+            otherwise use half rotary mode.
+
+    Returns:
+        A tensor with the same shape as ``t``. If ``freqs.shape[-1]`` is
+        smaller than ``t.shape[-1]``, the remaining dimensions of ``t``
+        are passed through unchanged and concatenated back.
+    """
+    rot_dim = freqs.shape[-1]
+    t_dim = t.shape[-1]
+    t_pass = None
+    if rot_dim != t_dim:
+        t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+
+    rotary_mode = "interleave" if rotary_interleaved else "half"
+    t_copy = t.clone()
+    t = torch_npu.npu_rotary_mul(t_copy, cos_, sin_, rotary_mode=rotary_mode)
+    t_copy.untyped_storage().resize_(0)
+
+    if t_pass is not None:
+        return torch.cat((t, t_pass), dim=-1)
+    return t
