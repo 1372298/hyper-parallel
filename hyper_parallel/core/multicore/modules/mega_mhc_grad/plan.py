@@ -118,6 +118,7 @@ def build_mega_mhc_grad_plan(
         tensor_factory=tensor_factory,
         profile_tensor_factory=_enable_runtime_config_tensor,
         rank=0,
+        device=npu_device,
         device_id=device_id,
     )
     return MegaMhcGradPlan(

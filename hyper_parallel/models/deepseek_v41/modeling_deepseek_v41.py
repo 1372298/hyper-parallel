@@ -43,6 +43,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     apply_rotary_pos_emb,
 )
 
+from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.components.modules.engram import EngramModule, NgramHashMapping
@@ -445,7 +446,7 @@ def _initialize_v41_owned_module(module: nn.Module, std: float) -> None:
     if isinstance(module, (DeepseekV41Engram, EngramModule)):
         module.q_weight.fill_(1.0)
         module.k_weight.fill_(1.0)
-    elif isinstance(module, DeepseekV41TopKRouter):
+    elif isinstance(module, (DeepseekV41TopKRouter, MegaGate)):
         nn.init.normal_(module.weight, mean=0.0, std=std)
         module.bias.zero_()
         if module.bias_vl is not None:

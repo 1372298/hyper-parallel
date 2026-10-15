@@ -46,6 +46,7 @@ class TestMulticoreNative(unittest.TestCase):
         )
         adapter.parent.mkdir(parents=True)
         adapter.write_bytes(b"adapter")
+        (adapter.parent / "libhyper_parallel_mega_gate_torch.so").write_bytes(b"adapter")
         self.shmem_root = self.native_root.parent / "shmem" / "lib"
         (self.shmem_root / "shmem").mkdir(parents=True)
 
@@ -64,12 +65,16 @@ class TestMulticoreNative(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True), patch.object(
             _loader, "_component_root", return_value=self.native_root
         ), patch.object(_loader, "sys", SimpleNamespace(modules={})):
-            vendor_root, adapter = _loader.get_multicore_paths()
+            vendor_root, default_adapter = _loader.get_multicore_paths()
+            _, gate_adapter = _loader.get_multicore_adapter_path(
+                "hyper_parallel_mega_gate_torch"
+            )
             opp_value = os.environ["ASCEND_CUSTOM_OPP_PATH"]
             library_value = os.environ["LD_LIBRARY_PATH"]
 
         self.assertEqual(vendor_root, self.vendor_root.resolve())
-        self.assertEqual(adapter.name, "libhyper_parallel_mega_moe_torch.so")
+        self.assertEqual(default_adapter.name, "libhyper_parallel_mega_moe_torch.so")
+        self.assertEqual(gate_adapter.name, "libhyper_parallel_mega_gate_torch.so")
         self.assertEqual(opp_value, environment["ASCEND_CUSTOM_OPP_PATH"])
         self.assertEqual(library_value, environment["LD_LIBRARY_PATH"])
 
