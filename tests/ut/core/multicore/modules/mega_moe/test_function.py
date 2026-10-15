@@ -23,17 +23,26 @@ import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
+from tests.common.mark_utils import arg_mark
 
 
+# The private autograd bridge and saved execution buffers are the contracts under test.
 class TestMegaMoeFunction(unittest.TestCase):
     """Exercise real autograd contexts with mocked communication and kernels."""
+
+    # pylint: disable=protected-access
 
     def test_backward_unpacks_saved_tensors_once(self) -> None:
         """Checkpoint unpack hooks must only be consumed once per backward call."""
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
         gradient = torch.ones(1)
-        execution = Mock()
+        context.plan.spec.dispatch_mode = "push"
+        execution = function_module._BackwardExecution(
+            dispatch=torch.ones(1), grad_x=torch.ones(1), profile_call=Mock(),
+            gmm_workspace=None, swiglu_workspace=None,
+            intermediates=function_module._BackwardIntermediates(*(torch.ones(1) for _ in range(5))),
+        )
         with (
             patch.object(type(context), "saved_tensors", create=True,
                          new_callable=PropertyMock, side_effect=[tensors, RuntimeError("duplicate unpack")]) as unpack,
@@ -50,23 +59,38 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertIs(result[2], execution.intermediates.grad_weight2)
         context.workspace.release.assert_called_once_with()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_deferred_backward_keeps_local_owned_storage_after_workspace_reuse(self) -> None:
-        """Retain each route's data and capacity across grow/shrink and reverse backward."""
+        """Feature: Deferred backward storage.
+        Description: Reuse the workspace between deferred forward and backward.
+        Expectation: Backward retains its own local tensors.
+        """
         self._check_deferred_backward(permuted=False)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_permutation_gradient_consumes_workspace_before_release(self) -> None:
-        """Keep token gradients intact when release immediately poisons shared rows."""
+        """Feature: Deferred backward storage.
+        Description: Run the permutation gradient while tracking workspace release.
+        Expectation: Consume the receive buffer before releasing its lease.
+        """
         self._check_deferred_backward(permuted=True)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_frozen_tokens_do_not_launch_a_permutation_gradient(self) -> None:
-        """Compute expert weight gradients without an unused token reduction."""
+        """Feature: Deferred backward storage.
+        Description: Backpropagate with frozen token activations.
+        Expectation: Skip the token permutation gradient.
+        """
         self._check_deferred_backward(permuted=True, input_grad=False)
 
     def _check_deferred_backward(self, *, permuted: bool, input_grad: bool = True) -> None:
         """Exercise delayed backward with an optional input permutation boundary."""
         spec = SimpleNamespace(hidden_size=4, intermediate_size=2, rank_id=0,
-                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2)
-        plan = SimpleNamespace(spec=spec)
+                               ep_size=2, num_experts=4, local_num_tokens=2, top_k=2, dispatch_mode="push")
+        plan = SimpleNamespace(spec=spec, reuse_backward_dispatch=False)
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
@@ -94,11 +118,10 @@ class TestMegaMoeFunction(unittest.TestCase):
 
         workspace.release.side_effect = release_workspace
 
-        def permutation_gradient(grad: Any, mapping: Any, token_rows: int, dtype: Any, top_k: int) -> Any:
+        def permutation_gradient(grad: Any, mapping: Any, token_rows: int, top_k: int) -> Any:
             """Require direct consumption of shared rows and return owned token rows."""
             self.assertEqual(grad.data_ptr(), workspace.routed_buffer.data_ptr())
             self.assertEqual((token_rows, top_k), (2, 2))
-            self.assertEqual(dtype, torch.float32)
             self.assertEqual(mapping.tolist(), [0, 2, 1, 3])
             self.assertTrue(torch.isfinite(grad).all())
             return grad.reshape(token_rows, top_k, 4).sum(dim=1)
@@ -151,7 +174,7 @@ class TestMegaMoeFunction(unittest.TestCase):
                 "mega_moe_grad_with_profile_buffer",
                 side_effect=backward_kernel,
             ),
-            patch.object(function_module.torch_npu, "npu_moe_token_permute_grad_v2",
+            patch.object(function_module.multicore_ops, "moe_token_permute_grad",
                          side_effect=permutation_gradient) as mock_permutation,
         ):
             for tag, capacity in enumerate(capacities, start=1):

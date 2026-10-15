@@ -117,6 +117,8 @@ def _patch_gmm_dims(csv: str, dim_map: dict, num_groups: int,
 
 def _make_swiglu(row_len, col_len, base_row_len, base_col_len):
     """Build a SwiGluTilingDataC for SwiGLU-grad with the given tile dimensions."""
+    # These member names match the CANN tiling ABI and must retain their native spellings.
+    # pylint: disable=invalid-name
     td = SwiGluTilingDataC()
     td.is32BAligned         = 1
     td.isDoubleBuffer       = 1

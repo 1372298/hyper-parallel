@@ -14,6 +14,8 @@
 # ============================================================================
 """Unit tests for MegaKernel Host profiling metadata and buffer planning."""
 
+from __future__ import annotations
+
 import struct
 from types import SimpleNamespace
 from typing import Any
@@ -117,7 +119,8 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
         for task_id in range(3):
             runtime_config.all_tasks[task_id].task_index = task_id
 
-        def resolve_owner(_, task_desc, context):
+        def resolve_owner(_: OperatorNode, task_desc: TaskDescC, context: int) -> int:
+            """Resolve each task owner relative to its context."""
             return context + task_desc.task_index
 
         _apply_mega_kernel_profile_graph(
@@ -330,8 +333,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.buffer_size, 53760)
         self.assertLess(layout.buffer_size, MAX_PROFILE_BUFFER_BYTES)
 
-    def test_layout_caps_each_worker_at_256_records(self):
-        """Bound Device memory when a long schedule needs more records."""
+    def test_layout_preserves_records_beyond_legacy_capacity(self):
+        """Allocate the complete trace when a long schedule exceeds 256 records."""
         runtime_config = _runtime_config(2048)
         runtime_config.num_workers = 48
         runtime_config.all_tasks[0] = _three_record_task()
@@ -340,7 +343,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         layout = _calculate_profile_layout(runtime_config)
 
         self.assertEqual(layout.aic_required_records, 258)
-        self.assertEqual(layout.aic_record_capacity, 256)
+        self.assertEqual(layout.aic_record_capacity, 272)
 
     def test_mega_gate_pipeline_runtime_configs(self):
         """Validate forward, ordinary-grad and K=1 descriptor streams."""
@@ -425,7 +428,8 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         runtime_config.num_workers = 48
         created_profile_tensors = []
 
-        def profile_tensor_factory(tensor):
+        def profile_tensor_factory(tensor: bytes) -> bytes:
+            """Enable profiling in a copy without changing the normal runtime."""
             enabled = bytearray(tensor)
             struct.pack_into(
                 "<I",
