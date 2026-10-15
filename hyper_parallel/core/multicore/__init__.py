@@ -14,8 +14,39 @@
 # ============================================================================
 """Torch-only Multicore APIs, separate from the HyperParallel root exports."""
 
-from hyper_parallel.core.multicore import profiler
-from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
-from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+from typing import TYPE_CHECKING, Any
 
-__all__ = ["HyperMegaMhc", "MegaMoeExperts", "profiler"]
+from hyper_parallel.core.multicore import profiler
+
+if TYPE_CHECKING:
+    from hyper_parallel.core.multicore.modules.mega_gate.module import MegaGate
+    from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
+    from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
+
+__all__ = ["HyperMegaMhc", "MegaGate", "MegaMoeExperts", "profiler"]
+
+
+def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
+    """Load optional multicore modules only when their public API is requested."""
+    if name == "HyperMegaMhc":
+        from hyper_parallel.core.multicore.modules.mega_mhc.module import (  # pylint: disable=import-outside-toplevel
+            HyperMegaMhc as hyper_mega_mhc,
+        )
+
+        globals()[name] = hyper_mega_mhc
+        return hyper_mega_mhc
+    if name == "MegaGate":
+        from hyper_parallel.core.multicore.modules.mega_gate.module import (  # pylint: disable=import-outside-toplevel
+            MegaGate as mega_gate,
+        )
+
+        globals()[name] = mega_gate
+        return mega_gate
+    if name == "MegaMoeExperts":
+        from hyper_parallel.core.multicore.modules.mega_moe.module import (  # pylint: disable=import-outside-toplevel
+            MegaMoeExperts as mega_moe_experts,
+        )
+
+        globals()[name] = mega_moe_experts
+        return mega_moe_experts
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

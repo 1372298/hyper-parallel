@@ -11,6 +11,8 @@
 #ifndef HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_RUNTIME_CONFIG_HPP_
 #define HYPER_PARALLEL_CORE_MULTICORE_OPS_RUNTIME_RUNTIME_CONFIG_HPP_
 
+#include <cstddef>
+
 namespace MulticoreRuntime {
 
 constexpr uint32_t MAX_TENSOR_DIMS = 4;
@@ -78,6 +80,27 @@ enum class TaskType : uint32_t {
   TASK_MHC_GRAD_PREV_X_AND_POST = 117,
   TASK_MHC_POST_GRAD = 118,
   TASK_MHC_GRAD_PREV_A_AND_MAPPING = 119,
+  TASK_GATE_SOFTPLUS = 120,
+  TASK_GATE_SQRT = 121,
+  TASK_GATE_ADD_BIAS = 122,
+  TASK_GATE_TOPK = 123,
+  TASK_GATE_GATHER = 124,
+  TASK_GATE_REDUCE_SUM = 125,
+  TASK_GATE_ADD_EPSILON = 126,
+  TASK_GATE_DIV = 127,
+  TASK_GATE_MUL_SCALE = 128,
+  TASK_GATE_CAST_INDEX = 129,
+  TASK_GATE_GRAD_MULS_SCALE = 130,
+  TASK_GATE_GRAD_BROADCAST_DENOMINATOR = 131,
+  TASK_GATE_GRAD_NEG = 132,
+  TASK_GATE_GRAD_DIV_SELECTED = 133,
+  TASK_GATE_GRAD_DIV_SELECTED_RATIO = 134,
+  TASK_GATE_GRAD_MUL_CROSS = 135,
+  TASK_GATE_GRAD_DIV_DIRECT = 136,
+  TASK_GATE_GRAD_REDUCE_SUM = 137,
+  TASK_GATE_GRAD_BROADCAST_ROW_SUM = 138,
+  TASK_GATE_GRAD_ADD_SELECTED = 139,
+  TASK_GATE_GRAD_ZEROS = 140,
 };
 
 enum class EventType : uint32_t {
@@ -299,6 +322,16 @@ __aicore__ inline uint32_t getTaskProfileOwnerId(__gm__ uint8_t *tiling, uint32_
                             MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
   uint32_t size = getAllTasksOffset(tiling) + (index_size + 1) * task_desc_size - UINT32_T_SIZE;
   return (*(__gm__ uint32_t *)(tiling + size));
+}
+
+__aicore__ inline TaskType getTaskType(__gm__ uint8_t *tiling, uint32_t task_id) {
+  return *reinterpret_cast<__gm__ TaskType *>(tiling + getAllTasksOffset(tiling) + task_id * sizeof(TaskDesc));
+}
+
+__aicore__ inline uint32_t getTaskTilingDataOffset(__gm__ uint8_t *tiling, uint32_t task_id) {
+  constexpr uint32_t field_offset = offsetof(TaskDesc, tiling_data_offset);
+  return *reinterpret_cast<__gm__ uint32_t *>(tiling + getAllTasksOffset(tiling) + task_id * sizeof(TaskDesc) +
+                                              field_offset);
 }
 
 __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingData, uint32_t index_size) {

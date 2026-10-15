@@ -15,13 +15,29 @@
 """Unit tests for MegaKernel Host profiling metadata and buffer planning."""
 
 import struct
+from types import SimpleNamespace
+from typing import Any
 import unittest
+from unittest.mock import patch
 
 from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 from hyper_parallel.core.multicore.modules.mega_moe.profiling import (
     MEGA_MOE_PROFILE_OWNER_LABEL,
     _configure_mega_moe_profile_metadata,
+)
+from hyper_parallel.core.multicore.modules.mega_gate.plan import (
+    MEGA_GATE_AIV_WORKER_CAPACITY,
+    MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES,
+    MEGA_GATE_ROUTE_GRAD_TASK_TYPES,
+    MEGA_GATE_ROUTE_TASK_TYPES,
+    _build_pipeline_runtime_config,
+    build_mega_gate_plan,
+)
+from hyper_parallel.core.multicore.modules.mega_gate.profiling import (
+    MEGA_GATE_ROUTE_GRAD_K1_STAGE_NAMES,
+    MEGA_GATE_ROUTE_GRAD_STAGE_NAMES,
+    MEGA_GATE_ROUTE_STAGE_NAMES,
 )
 from hyper_parallel.core.multicore.profiler.profiling import (
     GRAPH_STAGE_DESC_BASE,
@@ -35,6 +51,7 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     _set_mega_kernel_profile_metadata,
 )
 from hyper_parallel.core.multicore.scheduler.config import (
+    EVENT_INVALID_ID,
     INVALID_PROFILE_OWNER_ID,
     RuntimeConfigC,
     TaskDescC,
@@ -195,6 +212,7 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
             tensor_factory=bytes,
             profile_tensor_factory=lambda tensor: tensor,
             rank=0,
+            device="npu:0",
             device_id=0,
         )
         backward_runtime = _prepare_mega_kernel_runtime_config(
@@ -202,6 +220,7 @@ class TestMegaKernelProfilingMetadata(unittest.TestCase):
             tensor_factory=bytes,
             profile_tensor_factory=lambda tensor: tensor,
             rank=0,
+            device="npu:0",
             device_id=0,
         )
 
@@ -323,6 +342,83 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(layout.aic_required_records, 258)
         self.assertEqual(layout.aic_record_capacity, 256)
 
+    def test_mega_gate_pipeline_runtime_configs(self):
+        """Validate forward, ordinary-grad and K=1 descriptor streams."""
+        active_task_types = (*MEGA_GATE_ROUTE_TASK_TYPES, *MEGA_GATE_ROUTE_GRAD_TASK_TYPES)
+        self.assertEqual([int(task_type) for task_type in active_task_types], list(range(120, 141)))
+        cases = (
+            (MEGA_GATE_ROUTE_TASK_TYPES, MEGA_GATE_ROUTE_STAGE_NAMES, "HyperMegaGateRoute"),
+            (MEGA_GATE_ROUTE_GRAD_TASK_TYPES, MEGA_GATE_ROUTE_GRAD_STAGE_NAMES, "HyperMegaGateRouteGrad"),
+            (MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES, MEGA_GATE_ROUTE_GRAD_K1_STAGE_NAMES,
+             "HyperMegaGateRouteGrad"),
+        )
+        for task_types, stage_names, kernel_name in cases:
+            expected_count = len(task_types)
+            with self.subTest(kernel_name=kernel_name, stage_count=expected_count):
+                runtime_config = _build_pipeline_runtime_config(
+                    task_types,
+                    stage_names,
+                    kernel_name=kernel_name,
+                )
+                layout = _calculate_profile_layout(runtime_config)
+                tasks = [runtime_config.all_tasks[task_id] for task_id in range(expected_count)]
+                metadata = _get_mega_kernel_profile_metadata(runtime_config)
+
+                self.assertEqual(runtime_config.task_num, expected_count)
+                self.assertEqual(runtime_config.task_index_num[:2], [0, expected_count])
+                self.assertEqual(runtime_config.num_workers, MEGA_GATE_AIV_WORKER_CAPACITY)
+                self.assertEqual(layout.aic_required_records, 0)
+                self.assertEqual(layout.aic_record_capacity, 0)
+                self.assertEqual(layout.aiv_required_records, expected_count)
+                self.assertEqual(layout.aiv_record_capacity, 16)
+                self.assertEqual([task.task_type for task in tasks], list(task_types))
+                self.assertEqual([task.tiling_data_offset for task in tasks], list(range(expected_count)))
+                self.assertTrue(all(task.trigger_event == EVENT_INVALID_ID for task in tasks))
+                self.assertTrue(all(task.dependent_event == EVENT_INVALID_ID for task in tasks))
+                self.assertEqual(
+                    [metadata.task_stage_names[task_id] for task_id in range(expected_count)],
+                    list(stage_names),
+                )
+
+    def test_mega_gate_plan_uses_the_distributed_rank(self):
+        """Use the global process rank for cycle-trace ownership."""
+        prepared_ranks = []
+        for initialized, expected_rank in ((False, 0), (True, 3)):
+            with self.subTest(initialized=initialized):
+                prepared_ranks.clear()
+
+                def prepare_runtime(*args: Any, **kwargs: Any) -> object:
+                    """Record the rank passed to each prepared runtime."""
+                    del args
+                    prepared_ranks.append(kwargs["rank"])
+                    return object()
+
+                with (
+                    patch(
+                        "hyper_parallel.core.multicore.modules.mega_gate.plan.dist.is_initialized",
+                        return_value=initialized,
+                    ),
+                    patch(
+                        "hyper_parallel.core.multicore.modules.mega_gate.plan.dist.get_rank",
+                        return_value=3,
+                    ) as get_rank,
+                    patch(
+                        "hyper_parallel.core.multicore.modules.mega_gate.plan._prepare_mega_kernel_runtime_config",
+                        side_effect=prepare_runtime,
+                    ),
+                    patch(
+                        "hyper_parallel.core.multicore.modules.mega_gate.plan.torch.zeros",
+                        return_value=object(),
+                    ),
+                ):
+                    build_mega_gate_plan(SimpleNamespace(type="npu", index=0))
+
+                self.assertEqual(prepared_ranks, [expected_rank] * 3)
+                if initialized:
+                    get_rank.assert_called_once_with()
+                else:
+                    get_rank.assert_not_called()
+
     def test_prepared_runtime_serializes_disabled_config_and_lazily_profiles(self):
         """Keep the normal tensor disabled and create the enabled tensor on demand."""
         runtime_config = _runtime_config()
@@ -340,11 +436,13 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
             created_profile_tensors.append(bytes(enabled))
             return created_profile_tensors[-1]
 
+        device = object()
         runtime = _prepare_mega_kernel_runtime_config(
             runtime_config,
             tensor_factory=bytes,
             profile_tensor_factory=profile_tensor_factory,
             rank=3,
+            device=device,
             device_id=7,
         )
 
@@ -364,6 +462,7 @@ class TestMegaKernelProfileLayout(unittest.TestCase):
         self.assertEqual(len(created_profile_tensors), 1)
         self.assertIs(runtime.profile_tensor, created_profile_tensors[0])
         self.assertEqual(runtime.rank, 3)
+        self.assertIs(runtime.device, device)
         self.assertEqual(runtime.device_id, 7)
 
     def test_soc_aliases_use_the_documented_counter_frequency(self):

@@ -95,6 +95,27 @@ class TaskType(IntEnum):
     TASK_MHC_GRAD_PREV_X_AND_POST     = 117
     TASK_MHC_POST_GRAD                = 118
     TASK_MHC_GRAD_PREV_A_AND_MAPPING  = 119
+    TASK_GATE_SOFTPLUS                    = 120
+    TASK_GATE_SQRT                        = 121
+    TASK_GATE_ADD_BIAS                    = 122
+    TASK_GATE_TOPK                        = 123
+    TASK_GATE_GATHER                      = 124
+    TASK_GATE_REDUCE_SUM                  = 125
+    TASK_GATE_ADD_EPSILON                 = 126
+    TASK_GATE_DIV                         = 127
+    TASK_GATE_MUL_SCALE                   = 128
+    TASK_GATE_CAST_INDEX                  = 129
+    TASK_GATE_GRAD_MULS_SCALE             = 130
+    TASK_GATE_GRAD_BROADCAST_DENOMINATOR  = 131
+    TASK_GATE_GRAD_NEG                    = 132
+    TASK_GATE_GRAD_DIV_SELECTED           = 133
+    TASK_GATE_GRAD_DIV_SELECTED_RATIO     = 134
+    TASK_GATE_GRAD_MUL_CROSS              = 135
+    TASK_GATE_GRAD_DIV_DIRECT             = 136
+    TASK_GATE_GRAD_REDUCE_SUM             = 137
+    TASK_GATE_GRAD_BROADCAST_ROW_SUM      = 138
+    TASK_GATE_GRAD_ADD_SELECTED           = 139
+    TASK_GATE_GRAD_ZEROS                  = 140
 
 
 class EventType(IntEnum):
