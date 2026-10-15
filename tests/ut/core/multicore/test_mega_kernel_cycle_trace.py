@@ -21,6 +21,7 @@ from hyper_parallel.core.multicore.profiler.profiling import (
     CUBE_SLOT_COUNT,
     INVALID_OWNER_ID,
     PROFILE_RECORD,
+    TASK_TYPE_NAMES,
     _CycleTraceConfig,
     _parse_cycle_buffer,
     _profile_buffer_bytes_for_capacities,
@@ -144,11 +145,21 @@ class TestMegaKernelCycleTrace(unittest.TestCase):
                 self.assertEqual(event["args"]["task_stage"], "GMM1")
 
     def test_unknown_task_type_uses_generic_fallback(self):
-        """Keep a record readable when a concrete Kernel has no stage rule."""
+        """Keep a record readable when its task type is not registered."""
+        unknown_task_type = 0xFFFF
+        self.assertNotIn(unknown_task_type, TASK_TYPE_NAMES)
+        trace = _parse(_profile_buffer(desc_id=0x20000 + unknown_task_type))
+        event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
+
+        self.assertEqual(event["name"], f"TaskType_{unknown_task_type}")
+        self.assertEqual(event["args"]["task_type"], unknown_task_type)
+
+    def test_registered_mhc_post_task_type_preserves_its_name(self):
+        """Decode registered MHC task 107 instead of treating it as unknown."""
         trace = _parse(_profile_buffer(desc_id=0x20000 + 107))
         event = next(event for event in trace["traceEvents"] if event["ph"] == "X")
 
-        self.assertEqual(event["name"], "TaskType_107")
+        self.assertEqual(event["name"], "TaskType_MhcPost")
         self.assertEqual(event["args"]["task_type"], 107)
 
     def test_dropped_count_is_reported_without_overwriting_records(self):

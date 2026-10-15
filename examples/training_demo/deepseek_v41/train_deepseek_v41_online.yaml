@@ -60,6 +60,7 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
+  # HyperMegaMhc reuses the original fn/base/scale parameters.
   # These replacements are optimizations only: the registered architecture is
   # executable before the Trainer applies any of them.
   - match:
@@ -67,7 +68,7 @@ plan_overrides:
       - "model.layers.*.ffn_hc"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
     replace_module:
-      _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.mega_mhc.DeepseekV41HyperMegaMhc
   - match: "model.layers.*.engram"
     module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Engram
     replace_module:
