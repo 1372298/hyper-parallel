@@ -533,6 +533,42 @@ class TestCheckpointExcludeWrapper(unittest.TestCase):
         self.assertEqual(calls, {"block": 2, "excluded": 1})
         self.assertEqual(_SaveExactInput.calls, 1)
 
+    def test_preserved_inputs_allow_backward_before_trunk_replay(self):
+        """An excluded side loss must not replay the trunk during early backward."""
+        calls = {"block": 0, "excluded": 0}
+        losses = []
+        weight = Parameter(Tensor(np.ones(2, np.float32)), name="side_weight")
+
+        def side_loss(tensor: Tensor) -> Tensor:
+            """Save the detached trunk activation for a trainable side projection."""
+            calls["excluded"] += 1
+            return (tensor * weight).sum()
+
+        excluded = checkpoint_exclude_wrapper(side_loss, preserve_inputs=True)
+
+        def block(tensor: Tensor) -> Tensor:
+            """Publish the side loss while retaining a separate trunk graph."""
+            calls["block"] += 1
+            output = tensor * tensor
+            losses.append(excluded(output.detach()))
+            return output.sum()
+
+        tensor = Tensor(np.array([1.0, 2.0], np.float32))
+        tensor.requires_grad_()
+        weight.requires_grad_()
+        previous_grad_flag = _pynative_executor.grad_flag()
+        _pynative_executor.set_grad_flag(True)
+        try:
+            output = checkpoint_wrapper(block)(tensor)
+            losses[0].backward()
+            self.assertEqual(calls, {"block": 1, "excluded": 1})
+            np.testing.assert_allclose(weight.grad.asnumpy(), [1.0, 4.0])
+            output.backward()
+            self.assertEqual(calls, {"block": 2, "excluded": 1})
+            np.testing.assert_allclose(tensor.grad.asnumpy(), [2.0, 4.0])
+        finally:
+            _pynative_executor.set_grad_flag(previous_grad_flag)
+
     def test_function_wrapper_skips_middle_recompute(self):
         """A wrapped function should run in forward and reuse its output in recompute."""
         calls = {"middle": 0}

@@ -1791,11 +1791,12 @@ class MindSporePlatform(Platform):
         return ckpt_wrapper(module, **checkpoint_kwargs)
 
     @staticmethod
-    def checkpoint_exclude_wrapper(module: Any) -> Any:
+    def checkpoint_exclude_wrapper(module: Any, *, preserve_inputs: bool = False) -> Any:
         """Wrap a Cell or callable whose activations should not be recomputed.
 
         Args:
             module: MindSpore Cell or callable to exclude from checkpoint replay.
+            preserve_inputs: Retain saved inputs for backward without outer replay.
 
         Returns:
             The platform-specific checkpoint exclusion wrapper.
@@ -1804,7 +1805,7 @@ class MindSporePlatform(Platform):
         from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper import (
             checkpoint_exclude_wrapper,
         )
-        return checkpoint_exclude_wrapper(module)
+        return checkpoint_exclude_wrapper(module, preserve_inputs=preserve_inputs)
 
     @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):

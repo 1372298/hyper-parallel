@@ -492,11 +492,14 @@ def _apply_recompute_boundary(output: Any, input_bindings: List[_InputBinding]) 
 class CheckpointExcludeWrapper(ActivationWrapper):
     """Exclude a callable region from checkpoint recomputation."""
 
-    def __init__(self, module: Callable[..., Any]) -> None:
+    def __init__(self, module: Callable[..., Any], *, preserve_inputs: bool = False) -> None:
         """Initialize a checkpoint exclusion wrapper for a MindSpore Cell or function."""
         if not callable(module):
             raise ValueError("module must be a MindSpore Cell or callable")
+        if not isinstance(preserve_inputs, bool):
+            raise ValueError("preserve_inputs must be a bool")
         super().__init__(module, track_overlaps=False)
+        self.preserve_inputs = preserve_inputs
 
     def construct(self, *args: Any, **kwargs: Any) -> Any:
         """Execute normally outside recompute and return the cached output in recompute."""
@@ -509,7 +512,8 @@ class CheckpointExcludeWrapper(ActivationWrapper):
             _materialize_recompute_inputs(entry, args, kwargs)
             return _apply_recompute_boundary(entry.output, entry.input_bindings)
 
-        input_infos = _capture_recompute_inputs(args, kwargs)
+        # Early side-loss backward must not replay the surrounding live trunk.
+        input_infos = () if self.preserve_inputs else _capture_recompute_inputs(args, kwargs)
         input_bindings = []
         pack_token = _ACTIVE_PACK_STATE.set(_PackState(input_infos, input_bindings))
         try:
@@ -521,12 +525,16 @@ class CheckpointExcludeWrapper(ActivationWrapper):
         return _apply_recompute_boundary(output, input_bindings)
 
 
-def checkpoint_exclude_wrapper(module: Callable[..., Any]) -> CheckpointExcludeWrapper:
+def checkpoint_exclude_wrapper(
+    module: Callable[..., Any], *, preserve_inputs: bool = False
+) -> CheckpointExcludeWrapper:
     """Wrap a MindSpore Cell or function so its region is not recomputed.
 
     Args:
         module: MindSpore Cell or callable to execute only during the original
             checkpoint forward pass.
+        preserve_inputs: Keep real saved inputs for early backward. Defaults to
+            False, which rebuilds saved input aliases during checkpoint replay.
 
     Returns:
         A wrapper that saves the callable's autograd tensors and reuses its
@@ -540,4 +548,4 @@ def checkpoint_exclude_wrapper(module: Callable[..., Any]) -> CheckpointExcludeW
         backward-compatibility layer may deliberately preserve version counters,
         so not every in-place write can be detected from ``Tensor._version``.
     """
-    return CheckpointExcludeWrapper(module)
+    return CheckpointExcludeWrapper(module, preserve_inputs=preserve_inputs)
