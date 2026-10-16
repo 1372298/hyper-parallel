@@ -266,14 +266,16 @@ class TestOptimizerContracts(unittest.TestCase):
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.Muon.__init__)),
             "(self, muon_config: dict, adamw_config: dict, "
             "model: torch.nn.modules.module.Module, "
             "extra_adamw_name_keywords: Optional[List[str]] = None, "
-            "no_decay_params: Optional[List[str]] = None) -> None",
+            "no_decay_params: Optional[List[str]] = None, "
+            "excluded_param_ids: Optional[Sequence[int]] = None) -> None",
         )
         self.assertEqual(
             str(inspect.signature(optim.MixedPrecisionOptimizer.__init__)),

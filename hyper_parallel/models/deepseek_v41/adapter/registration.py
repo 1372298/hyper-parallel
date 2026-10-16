@@ -15,6 +15,9 @@
 """Register the DeepSeek-V4.1 model and adapter providers."""
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
+from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import (
+    build_deepseek_v41_external_state,
+)
 from hyper_parallel.models.deepseek_v41.adapter.conversion.checkpoint_mapping import (
     register_deepseek_v41_checkpoint_mapping,
 )
@@ -69,6 +72,13 @@ def _load_encoder_parallel_spec():
     return get_deepseek_v41_encoder_parallel_spec()
 
 
+def _load_loss():
+    """Return the V4.1 model-integrated output-loss adapter."""
+    from hyper_parallel.models.deepseek_v41.adapter import chunk_loss  # pylint: disable=C0415
+
+    return chunk_loss
+
+
 register_custom_model(
     "DeepseekV41ForCausalLM",
     "hyper_parallel.models.deepseek_v41.modeling_deepseek_v41",
@@ -81,6 +91,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v41",
     context_parallel=_load_context_parallel,
     expert_parallel=_load_expert_parallel,
+    external_state=build_deepseek_v41_external_state,
     sharding_rules=build_parameter_sharding_rules,
     fsdp_wrap_modules=get_fsdp_wrap_modules,
     fsdp_excluded_subtrees=get_fsdp_excluded_subtrees,
@@ -88,6 +99,7 @@ DEEPSEEK_V41_ADAPTER_SPEC = ModelAdapterSpec(
     recompute=build_recompute_policy,
     validation=_load_validation_spec,
     encoder_parallel=_load_encoder_parallel_spec,
+    loss=_load_loss,
 )
 register_model_adapter(DEEPSEEK_V41_ADAPTER_SPEC)
 

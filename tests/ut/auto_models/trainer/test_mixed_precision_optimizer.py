@@ -1158,17 +1158,28 @@ class TestOptimizerParameterDtypeValidation(unittest.TestCase):
     """Validate optimizer parameter dtype requirements before optimizer wrapping."""
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
-    def test_low_precision_parameters_require_fp32_main_params(self) -> None:
-        """Reject low-precision parameters without an fp32 main copy.
+    def test_fp16_parameters_require_fp32_main_params(self) -> None:
+        """Reject FP16 parameters without an FP32 main copy.
 
         Feature: Optimizer update dtype validation after model initialization.
-        Description: Validate a bf16 model with fp32 main parameters disabled.
+        Description: Validate an FP16 model with FP32 main parameters disabled.
         Expectation: Validation raises an error describing supported configurations.
         """
-        model = nn.Linear(4, 4, bias=False).to(torch.bfloat16)
+        model = nn.Linear(4, 4, bias=False).to(torch.float16)
 
         with self.assertRaisesRegex(ValueError, "fp32_main_params.*model_init_dtype"):
             _validate_optimize_dtype(model, fp32_main_params=False)
+
+    @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
+    def test_bf16_parameters_allow_native_optimizer_state(self) -> None:
+        """Allow BF16 parameters without an FP32 main copy.
+
+        Feature: Native BF16 optimizer update dtype.
+        Description: Validate a BF16 dense parameter beside an FP32 Host parameter.
+        Expectation: Neither parameter needs an FP32 main copy.
+        """
+        model = _MixedDtypeModel()
+        _validate_optimize_dtype(model, fp32_main_params=False)
 
     @arg_mark(["cpu_linux"], "level0", "onecard", "essential")
     def test_fp32_main_params_allows_low_precision_parameters(self) -> None:

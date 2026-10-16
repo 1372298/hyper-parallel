@@ -65,6 +65,9 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
   Indexed Dataset is the default. Online is acceptable only if deterministic
   sharding/replay and identical per-step input hashes are proven for every case;
   otherwise it is functional smoke only.
+- For an NPU/HCCL case with full determinism enabled, record that
+  `HCCL_DETERMINISTIC=true` is set before communicator initialization on every
+  rank; a later Torch seed call cannot configure an existing HCCL communicator.
 - Training launchers never download weights or datasets implicitly.
 - If only a Hugging Face repo ID or URL is available, use the pinned, source-only
   Git checkout produced with ``GIT_LFS_SKIP_SMUDGE=1`` as the reference repository.
@@ -78,6 +81,10 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
   loss and pre-clip global norm. Parameter and main-gradient probes diagnose
   scalar divergence; their numeric mismatch alone does not fail an aligned
   curve. Keep checkpoint, input, and finite-state checks mandatory.
+- Every formal end-to-end numerical self-consistency case must compare at least
+  ten consecutive, aligned optimizer steps. This includes parallel-strategy
+  generalization, recomputation, Production/Validate, and checkpoint continuation.
+  A one- or two-step smoke cannot establish numerical acceptance.
 - Keep learned MoE routing for formal cases. Forced routing is diagnostic only.
 - Compare optimized/custom modules with the authoritative native implementation
   before using end-to-end loss to judge them.
@@ -107,6 +114,27 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
   upcasting four BF16 Partial terms to FP32 is insufficient justification by
   itself; that generic upcast was rejected for this integration. Preserve the
   existing BF16 framework path unless a later explicit decision authorizes it.
+
+## Ten-Step Self-Consistency Gate
+
+Before a formal launch, choose a measurement window with at least ten consecutive
+optimizer steps after any shared warm start. Align reference and candidate by
+global step and identical input hash. For K-to-K+N continuation, run the
+uninterrupted reference through K+N, restore the complete state at K, and require
+`N >= 10`; with the standard matrix launcher, set
+`matrix.steps - matrix.resume_split_step >= 10`. A preparation or warm-start
+step does not count as one of the compared continuation steps. For example,
+`matrix.steps: 12` and `matrix.resume_split_step: 2` compare steps 3 through 12.
+
+At **each** aligned step, compare finite loss and the same global
+pre-clipping gradient-norm definition against separately declared tolerances.
+Also require matching learning rate and global input identity; compare post-clip
+norm when both sides record it. Keep per-step values and absolute/relative deltas
+in `cases/<case>/metrics.jsonl` and `comparison.json`, respectively. A missing
+step, missing norm, nonconsecutive window, or loss-only summary is `BLOCKED` or
+`FAIL`, never a precision `PASS`. Do not infer
+ten-step coverage from the configured training length: count the actual paired
+rows in `comparison.json` for every formal case.
 
 ## Workflow
 
@@ -154,6 +182,8 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
    separate, machine-readable VLM case ledger and launch it with the same Trainer
    runtime-evidence contract. Do not count unlaunched or reused old-revision cases
    as executed in the current matrix.
+   Reject a formal plan unless it yields at least ten compared optimizer steps
+   per end-to-end case; for resume, verify the post-split count separately.
    Before accepting the generated cases, write a coverage ledger from the final
    model and adapter capabilities. Give every supported parallel axis, meaningful
    hybrid topology, recomputation depth, resume mode, execution mode, and
@@ -196,6 +226,11 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
      --manifest <validation.yaml>
    ```
 
+   Before accepting the matrix result, inspect each formal case's
+   `comparison.json` scalar rows: require ten consecutive paired steps, with
+   per-step loss and global pre-clip norm both passing their declared tolerances.
+   A generated `PASS` from a shorter manifest is insufficient for this skill gate.
+
    For cropped scratch models whose sharded meta initialization can consume a
    topology-dependent RNG stream, require one common full-state DCP at the declared
    initial or warm-start step and restore the formal baseline plus every candidate
@@ -236,6 +271,10 @@ placements on every rank, including ranks with an empty uneven FSDP shard.
    distinguish measured numeric, exact categorical, non-applicable, and missing
    evidence. An absent numeric field on a structural optimizer-state record is not
    a non-finite tensor; a required missing artifact is `BLOCKED`, never `n/a`.
+   Include the ten-step per-case loss/norm table or link the exact structured
+   rows; aggregate maxima alone do not demonstrate consecutive coverage. If the
+   renderer shows only aggregates, preserve its output and write an adjacent
+   stepwise evidence appendix rather than editing the generated reports.
    Missing parity, missing
    matrix artifacts, absent
    strict parameter probes, unsupported operators without an independent eager

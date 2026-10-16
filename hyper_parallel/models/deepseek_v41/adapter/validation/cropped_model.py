@@ -355,6 +355,22 @@ def _apply_v41_dspark_fields(
     config.v41_dspark_confidence_coeff = float(dspark_confidence_coeff)
 
 
+def _apply_engram_host_fields(
+        config: DeepseekV4Config,
+        engram_storage_backend: str,
+        engram_max_pending_entries: int,
+        engram_max_sparse_rows_per_step: int,
+        engram_sparse_adam_config: dict[str, Any] | None,
+) -> None:
+    """Validate and fill the host-side Engram storage extension fields."""
+    if engram_storage_backend not in ("device", "host"):
+        raise ValueError("engram_storage_backend must be 'device' or 'host'")
+    config.engram_storage_backend = engram_storage_backend
+    config.engram_max_pending_entries = engram_max_pending_entries
+    config.engram_max_sparse_rows_per_step = engram_max_sparse_rows_per_step
+    config.engram_sparse_adam_config = engram_sparse_adam_config or {"lr": 1.0e-3}
+
+
 def build_deepseek_v41_validation_config(
         config_path: str,
         engram_assets_path: str,
@@ -371,6 +387,10 @@ def build_deepseek_v41_validation_config(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        engram_storage_backend: str = "device",
+        engram_max_pending_entries: int = 1000000,
+        engram_max_sparse_rows_per_step: int = 1000000,
+        engram_sparse_adam_config: dict[str, Any] | None = None,
 ) -> DeepseekV4Config:
     """Translate the released config into a configurable validation crop.
 
@@ -381,9 +401,7 @@ def build_deepseek_v41_validation_config(
             released decoder depth.
         text_parameter_divisor: Uniform divisor for text hidden, MLP, attention
             head count, low-rank dimensions, Indexer head count, and Engram
-            width. Per-head dimensions and the grouped-output partition count
-            stay unchanged so attention semantics and supported TP degrees are
-            preserved.
+            width; per-head dimensions stay unchanged.
         enable_vision: Enable the native multimodal branch. Its released depth
             is retained unless ``vision_num_hidden_layers`` is set.
         vision_num_hidden_layers: Optional visual-tower crop depth. This is
@@ -394,8 +412,7 @@ def build_deepseek_v41_validation_config(
             top-k and every released MoE layer are retained.
         exercise_post_training_indexer: Bound the candidate pool so a 4K smoke
             exercises candidate selection before the released Reindex layers.
-        indexer_loss_coeff: Sparse-stage Indexer KL coefficient. The released
-            report does not disclose its production value.
+        indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
         dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
             to the last three, matching the released layout.
@@ -443,6 +460,13 @@ def build_deepseek_v41_validation_config(
         dspark_loss_coeff,
         dspark_confidence_coeff,
     )
+    _apply_engram_host_fields(
+        config,
+        engram_storage_backend,
+        engram_max_pending_entries,
+        engram_max_sparse_rows_per_step,
+        engram_sparse_adam_config,
+    )
     config._attn_implementation = "eager"  # pylint: disable=protected-access
     # Record the source identity the way AutoConfig.from_pretrained does; the
     # codegen from_config path resolves the modeling source from it.
@@ -465,6 +489,10 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids: list[int] | None = None,
         dspark_loss_coeff: float = 1.0,
         dspark_confidence_coeff: float = 0.1,
+        engram_storage_backend: str = "device",
+        engram_max_pending_entries: int = 1000000,
+        engram_max_sparse_rows_per_step: int = 1000000,
+        engram_sparse_adam_config: dict[str, Any] | None = None,
         torch_dtype: str = "bfloat16",
         validate_placement: bool = False,
         distributed_setup: DistributedSetup | None = None,
@@ -483,18 +511,13 @@ def build_cropped_deepseek_v41(
     Args:
         config_path: Local DeepSeek-V4.1 repository.
         engram_assets_path: Prepared scaled-Engram JSON file.
-        num_hidden_layers: Optional decoder crop depth.
-        text_parameter_divisor: Uniform text-dimension divisor.
-        enable_vision: Enable the parameter-scaled visual tower.
-        vision_num_hidden_layers: Optional visual-tower crop depth.
-        vision_parameter_divisor: Uniform visual-dimension divisor.
         num_routed_experts: Routed-expert count for the parameter crop.
-        exercise_post_training_indexer: Exercise the released Full/Reindex
-            hierarchy at its native layer indices.
+        exercise_post_training_indexer: Exercise the Full/Reindex hierarchy at
+            native layer indices.
         indexer_loss_coeff: Sparse-stage Indexer KL coefficient.
         dspark_depth: Trainable DSpark stage count; 0 disables the drafter.
         dspark_target_layer_ids: Backbone layers feeding the drafter; defaults
-            to the last three, matching the released layout.
+            to the last three.
         dspark_loss_coeff: Drafter objective weight.
         dspark_confidence_coeff: Confidence-head BCE weight.
         torch_dtype: Forward dtype accepted by the model builder.
@@ -509,9 +532,6 @@ def build_cropped_deepseek_v41(
         model_init_dtype: Final parameter initialization dtype.
         codegen: Select the codegen ``gen`` backend for this build.
         codegen_config: Optional codegen backend configuration.
-
-    Returns:
-        Parallelized, randomly initialized V4.1 validation model.
     """
     config = build_deepseek_v41_validation_config(
         config_path,
@@ -528,7 +548,45 @@ def build_cropped_deepseek_v41(
         dspark_target_layer_ids=dspark_target_layer_ids,
         dspark_loss_coeff=dspark_loss_coeff,
         dspark_confidence_coeff=dspark_confidence_coeff,
+        engram_storage_backend=engram_storage_backend,
+        engram_max_pending_entries=engram_max_pending_entries,
+        engram_max_sparse_rows_per_step=engram_max_sparse_rows_per_step,
+        engram_sparse_adam_config=engram_sparse_adam_config,
     )
+    return _run_validation_model_builder(
+        config,
+        torch_dtype=torch_dtype,
+        validate_placement=validate_placement,
+        distributed_setup=distributed_setup,
+        peft_config=peft_config,
+        compile_config=compile_config,
+        activation_checkpoint=activation_checkpoint,
+        activation_checkpoint_selection=activation_checkpoint_selection,
+        swap_inputs=swap_inputs,
+        activation_swap=activation_swap,
+        model_init_dtype=model_init_dtype,
+        codegen=codegen,
+        codegen_config=codegen_config,
+    )
+
+
+def _run_validation_model_builder(
+        config: DeepseekV4Config,
+        *,
+        torch_dtype: str,
+        validate_placement: bool,
+        distributed_setup: DistributedSetup | None,
+        peft_config: Any | None,
+        compile_config: CompileConfig | dict[str, Any] | None,
+        activation_checkpoint: str | None,
+        activation_checkpoint_selection: Any | None,
+        swap_inputs: bool,
+        activation_swap: str,
+        model_init_dtype: str,
+        codegen: bool,
+        codegen_config: Any | None,
+) -> PreTrainedModel:
+    """Invoke the model builder with the trainer wiring."""
     return HyperAutoModelForCausalLM.from_config(
         config,
         distributed_setup=distributed_setup,
