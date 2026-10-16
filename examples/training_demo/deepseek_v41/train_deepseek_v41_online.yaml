@@ -171,6 +171,8 @@ plan_overrides:
     local_compute_fn:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
+      # Synthetic performance tests only; normal training keeps learned routing.
+      fix_router: false
 
   # DSpark drafter (enabled via --model.dspark_depth>0): small coefficient,
   # attention, and draft-MoE parameters stay TP-replicated; FSDP owns sharding.
