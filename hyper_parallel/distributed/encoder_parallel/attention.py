@@ -47,7 +47,7 @@ class EncoderAttentionContext:
         """Reject missing or repeated calls in an active ViT pass."""
         if set(self.seen) != self.expected or any(count != 1 for count in self.seen.values()):
             raise RuntimeError(
-                "[HP-ENCODER-008] vision attention execution mismatch; "
+                "vision attention execution mismatch; "
                 f"expected={sorted(self.expected)}; seen={self.seen}"
             )
 
@@ -57,7 +57,7 @@ class EncoderAttentionContext:
         actual = {"query": query_heads, "key": key_heads, "value": value_heads}
         if actual != self.declared_heads or any(count % self.cp_mesh.size() for count in actual.values()):
             raise ValueError(
-                "[HP-ENCODER-005] Ulysses runtime head count mismatch; phase=runtime; "
+                "Ulysses runtime head count mismatch; phase=runtime; "
                 f"module_fqn={module_fqn}; declared_head_counts={self.declared_heads}; "
                 f"runtime_head_counts={actual}; encoder_cp_size={self.cp_mesh.size()}"
             )

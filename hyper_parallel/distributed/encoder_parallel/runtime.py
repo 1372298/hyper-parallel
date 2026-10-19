@@ -70,7 +70,7 @@ def validate_ulysses_head_divisibility(*, encoder_cp_size: int, head_counts: Map
         matched = sorted(name for name, _ in model.named_modules()
                          if fnmatch.fnmatchcase(name, attention_pattern))
         raise ValueError(
-            "[HP-ENCODER-005] Encoder-CP/Ulysses head divisibility check failed; "
+            "Encoder-CP/Ulysses head divisibility check failed; "
             "constraint=head_count % encoder_cp_size == 0 for every Q/K/V; "
             "config_path=accelerator.encoder_parallel.encoder_cp_size; "
             f"encoder_cp_size={encoder_cp_size}; head_counts={dict(head_counts)}; "
@@ -96,7 +96,7 @@ def validate_attention_replacement(model: nn.Module, spec: EncoderParallelAdapte
                         if not isinstance(model.get_submodule(name), spec.replacement_attention_type))
     if not expected or missing or unexpected or wrong_type:
         raise RuntimeError(
-            "[HP-ENCODER-006] incomplete vision attention replacement: "
+            "incomplete vision attention replacement: "
             f"expected={len(expected)}; missing={missing}; unexpected={unexpected}; wrong_type={wrong_type}"
         )
     return expected
@@ -111,9 +111,9 @@ def validate_encoder_execution_options(options: Mapping[str, Any], bridge: Any) 
     """
     bridge.validate_training(options)
     if options.get("compile_enabled"):
-        raise NotImplementedError("[HP-ENCODER-011] v1 requires compile.enabled=false")
+        raise NotImplementedError("v1 requires compile.enabled=false")
     if options.get("validate_placement"):
-        raise NotImplementedError("[HP-ENCODER-012] v1 requires model.validate_placement=false")
+        raise NotImplementedError("v1 requires model.validate_placement=false")
 
 
 @dataclass
@@ -166,7 +166,7 @@ class EncoderParallelPlan:
                 feature = bridge.project(full_features[slot], segment.item)
                 if feature.ndim != 2 or feature.shape[0] != segment.item.output_rows:
                     raise ValueError(
-                        "[HP-ENCODER-017] aligner output does not match planned rows; "
+                        "aligner output does not match planned rows; "
                         f"item_id={segment.item.item_id}; actual_shape={tuple(feature.shape)}; "
                         f"expected_rows={segment.item.output_rows}"
                     )
@@ -176,7 +176,7 @@ class EncoderParallelPlan:
                 anchors.append(feature.sum() * 0.0)
             prototype = feature
         if prototype is None:
-            raise RuntimeError("[HP-ENCODER-009] active plan must have an aligner slot")
+            raise RuntimeError("active plan must have an aligner slot")
         anchor = torch.stack(anchors).sum() if anchors else prototype.sum() * 0.0
         return tuple(records), prototype, anchor
 
@@ -223,9 +223,9 @@ class EncoderParallelRuntime:
         )
         parent_size = mesh_context.cp_size * mesh_context.tp_size
         if mesh_context.pp_size != 1:
-            raise NotImplementedError("[HP-ENCODER-003] v1 requires pp_size=1")
+            raise NotImplementedError("v1 requires pp_size=1")
         if parent_size % config.encoder_cp_size:
-            raise ValueError("[HP-ENCODER-002] encoder_cp_size must divide cp_size*tp_size")
+            raise ValueError("encoder_cp_size must divide cp_size*tp_size")
         validate_ulysses_head_divisibility(encoder_cp_size=config.encoder_cp_size,
                                            head_counts=self.bridge.head_counts,
                                            attention_pattern=spec.attention_pattern, model=model)
@@ -258,7 +258,7 @@ class EncoderParallelRuntime:
         present = [batch.get(name) is not None for name in self.bridge.input_fields]
         if any(present) and not all(present):
             missing = [name for name in self.bridge.input_fields if batch.get(name) is None]
-            raise ValueError(f"[HP-ENCODER-013] incomplete image metadata bundle: missing={missing}")
+            raise ValueError(f"incomplete image metadata bundle: missing={missing}")
         return tuple(self.bridge.parse_images(batch)), layout
 
     def finalize_plan(self, items: tuple[EncoderWorkItem, ...],
@@ -284,7 +284,7 @@ class EncoderParallelRuntime:
             peer_digests = [torch.empty_like(local_digest) for _ in range(self.parent_mesh.size())]
             dist.all_gather(peer_digests, local_digest, group=self.parent_mesh.get_group())
             if any(int(peer.item()) != digest_value for peer in peer_digests):
-                raise ValueError("[HP-ENCODER-007] image metadata differs across decoder parent ranks")
+                raise ValueError("image metadata differs across decoder parent ranks")
         if dist.is_initialized() and self.global_mesh.size() > 1:
             dist.all_reduce(marker, op=dist.ReduceOp.MAX, group=self.global_mesh.get_group())
         active = bool(marker.item())
@@ -315,9 +315,9 @@ def build_encoder_parallel_runtime(*, config: EncoderParallelConfig, mesh_contex
     if not config.enabled:
         return None
     if model is None or model_adapter_spec is None or model_adapter_spec.encoder_parallel is None:
-        raise ValueError("[HP-ENCODER-001] enabled encoder parallel requires a model adapter provider")
+        raise ValueError("enabled encoder parallel requires a model adapter provider")
     spec = model_adapter_spec.encoder_parallel()
     if not isinstance(spec, EncoderParallelAdapterSpec):
-        raise TypeError("[HP-ENCODER-001] encoder_parallel provider returned an invalid spec")
+        raise TypeError("encoder_parallel provider returned an invalid spec")
     return EncoderParallelRuntime(config=config, mesh_context=mesh_context, model=model,
                                   spec=spec, execution_options=execution_options or {})

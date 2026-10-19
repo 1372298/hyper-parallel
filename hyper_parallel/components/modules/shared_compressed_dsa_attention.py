@@ -1449,7 +1449,7 @@ class SharedCompressedDSAAttentionBase(nn.Module):
         if is_recomputing():
             # A recompute must not publish again: its consumers read the entries
             # the forward pass wrote, and a second write would break the
-            # single-publisher contract (HP-STATE-002).
+            # single-publisher contract.
             return indexer_output
         if self.indexer.owns_key:
             shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)

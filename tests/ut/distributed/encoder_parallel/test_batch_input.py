@@ -97,12 +97,12 @@ class TestEncoderParallelInputAdapter(unittest.TestCase):
         adapter = EncoderParallelInputAdapter(
             runtime=_RecordedRuntime(events), inner=_RecordedInputs(events, "input_ids"),
         )
-        with self.assertRaisesRegex(ValueError, "HP-DATA-001"):
+        with self.assertRaisesRegex(ValueError, "runtime inputs cannot replace Omni model inputs"):
             adapter.build_runtime_inputs(batch={"input_ids": torch.zeros(1, 8)}, context=self._context())
         self.assertEqual(events, ["preflight", "inner"])
 
         events.clear()
-        with self.assertRaisesRegex(ValueError, "HP-DATA-001"):
+        with self.assertRaisesRegex(ValueError, "encoder_parallel_plan has two owners"):
             EncoderParallelInputAdapter(
                 runtime=_RecordedRuntime(events), inner=_RecordedInputs(events, "encoder_parallel_plan"),
             )
@@ -115,6 +115,6 @@ class TestEncoderParallelInputAdapter(unittest.TestCase):
         events = []
         adapter = EncoderParallelInputAdapter(runtime=_RecordedRuntime(events), inner=None)
         self.assertEqual(adapter.runtime_input_fields(), ("encoder_parallel_plan",))
-        with self.assertRaisesRegex(ValueError, "HP-DATA-001"):
+        with self.assertRaisesRegex(ValueError, "runtime inputs cannot replace Omni model inputs"):
             adapter.build_runtime_inputs(batch={"encoder_parallel_plan": object()}, context=self._context())
         self.assertEqual(events, ["preflight"])

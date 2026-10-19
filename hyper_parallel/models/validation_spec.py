@@ -123,7 +123,6 @@ class StateInvariantSpec:
     name: str
     checker: InvariantChecker
     phase: Literal["structure", "materialization", "checkpoint", "runtime"] = "materialization"
-    error_code: str = "HP-MAT-003"
 
     def __post_init__(self) -> None:
         if not self.name or not callable(self.checker):

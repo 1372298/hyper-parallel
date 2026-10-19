@@ -82,7 +82,6 @@ def validate_data_contract(
     if ownership["collisions"]:
         findings.append(
             ModelIntegrationFinding(
-                code="HP-DATA-001",
                 phase="D2",
                 owner_fqn="data.forward_fields",
                 severity=FindingSeverity.ERROR,
@@ -110,7 +109,6 @@ def validate_data_contract(
         if missing_runtime or shift_mismatch or missing_processor_revision:
             findings.append(
                 ModelIntegrationFinding(
-                    code="HP-DATA-002",
                     phase="D2",
                     owner_fqn="data.semantic_contract",
                     severity=FindingSeverity.ERROR,
@@ -155,7 +153,6 @@ def validate_observed_forward_fields(
         return []
     return [
         ModelIntegrationFinding(
-            code="HP-DATA-002",
             phase="D7",
             owner_fqn="model.forward",
             severity=FindingSeverity.ERROR,

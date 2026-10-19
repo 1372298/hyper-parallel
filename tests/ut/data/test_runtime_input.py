@@ -123,7 +123,7 @@ class TestRuntimeInputAdapter(unittest.TestCase):
 
         Feature: Runtime-input field ownership.
         Description: Return ``input_ids`` from a model runtime adapter.
-        Expectation: The merge fails with ``HP-DATA-001`` before forward.
+        Expectation: The merge fails before forward.
         """
         batch_runtime = self._omni_batch_runtime(_CollidingRuntimeAdapter())
         parallel_batch = {
@@ -131,7 +131,7 @@ class TestRuntimeInputAdapter(unittest.TestCase):
             "labels": torch.ones(1, 4, dtype=torch.long),
         }
 
-        with self.assertRaisesRegex(ValueError, "HP-DATA-001"):
+        with self.assertRaisesRegex(ValueError, "runtime inputs cannot replace Omni model inputs"):
             batch_runtime._build_runtime_inputs(  # pylint: disable=protected-access
                 parallel_batch
             )

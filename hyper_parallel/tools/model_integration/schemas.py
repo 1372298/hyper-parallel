@@ -16,14 +16,12 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional
 
 
-SCHEMA_VERSION = 1
-_ERROR_CODE = re.compile(r"^HP-[A-Z]+-[0-9]{3}$")
+SCHEMA_VERSION = 2
 
 
 def tolerance_value(
@@ -61,7 +59,6 @@ class IntegrationState(str, Enum):
 class ModelIntegrationFinding:
     """One structured diagnostic with facts and an actionable remediation."""
 
-    code: str
     phase: str
     owner_fqn: str
     severity: FindingSeverity
@@ -72,8 +69,6 @@ class ModelIntegrationFinding:
     related_config: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not _ERROR_CODE.fullmatch(self.code):
-            raise ValueError(f"invalid model integration error code: {self.code!r}")
         if not self.phase or not self.message:
             raise ValueError("model integration finding phase and message must be non-empty")
         if self.severity is FindingSeverity.ERROR and (
@@ -98,7 +93,7 @@ class ModelIntegrationFinding:
         unsafe = f"\nwhy unsafe: {self.why_unsafe}" if self.why_unsafe else ""
         remediation = f"\nfix: {self.remediation}" if self.remediation else ""
         return (
-            f"[{self.code}] {self.severity.value} phase={self.phase}: {self.message}"
+            f"{self.severity.value} phase={self.phase}: {self.message}"
             f"{owner}{facts}{unsafe}{remediation}"
         )
 

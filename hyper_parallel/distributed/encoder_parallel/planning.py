@@ -63,12 +63,12 @@ class DecoderSequenceLayout:
         sp = bool(mesh_context.sequence_parallel)
         if not 0 <= cp_rank < cp_size or not 0 <= tp_rank < tp_size:
             raise ValueError(
-                "[HP-ENCODER-004] decoder CP/TP coordinate is outside topology; "
+                "decoder CP/TP coordinate is outside topology; "
                 f"cp_rank={cp_rank}; cp_size={cp_size}; tp_rank={tp_rank}; tp_size={tp_size}"
             )
         if cp_local_length < 1 or (sp and cp_local_length % tp_size):
             raise ValueError(
-                "[HP-ENCODER-004] invalid decoder sequence layout; "
+                "invalid decoder sequence layout; "
                 f"sequence_parallel={sp}; cp_local_length={cp_local_length}; tp_size={tp_size}; "
                 "constraint=cp_local_length % tp_size == 0 when SP is enabled"
             )
@@ -88,7 +88,7 @@ class DecoderSequenceLayout:
         """
         if value.shape[sequence_dim] != self.cp_local_length:
             raise ValueError(
-                "[HP-ENCODER-004] CP-local token tensor length mismatch; "
+                "CP-local token tensor length mismatch; "
                 f"actual={value.shape[sequence_dim]}; expected={self.cp_local_length}; "
                 f"cp_rank={self.cp_rank}; tp_rank={self.tp_rank}"
             )
@@ -105,7 +105,7 @@ class DecoderSequenceLayout:
         expected = self.global_stop - self.global_start
         if hidden.shape[sequence_dim] != expected:
             raise ValueError(
-                "[HP-ENCODER-004] decoder hidden does not match planned CP/SP shard; "
+                "decoder hidden does not match planned CP/SP shard; "
                 f"actual={hidden.shape[sequence_dim]}; expected={expected}; "
                 f"global_interval=({self.global_start},{self.global_stop}); "
                 f"cp_rank={self.cp_rank}; tp_rank={self.tp_rank}"
@@ -122,7 +122,7 @@ def assign_lpt(items: Sequence[EncoderWorkItem], encoder_dp_size: int,
         encoder_cp_size: Sequence-sharding degree of each bucket.
     """
     if encoder_dp_size < 1 or encoder_cp_size < 1:
-        raise ValueError("[HP-ENCODER-002] encoder DP and CP sizes must be positive")
+        raise ValueError("encoder DP and CP sizes must be positive")
     buckets: list[list[EncoderWorkItem]] = [[] for _ in range(encoder_dp_size)]
     loads = [0] * encoder_dp_size
     for item in sorted(items, key=lambda value: (-value.sequence_length ** 2, value.batch_index, value.item_id)):
@@ -142,12 +142,12 @@ def build_segments(items: Sequence[EncoderWorkItem], encoder_cp_rank: int,
         encoder_cp_size: Number of shards per image.
     """
     if not 0 <= encoder_cp_rank < encoder_cp_size:
-        raise ValueError("[HP-ENCODER-002] invalid encoder CP rank")
+        raise ValueError("invalid encoder CP rank")
     segments = []
     offset = 0
     for item in items:
         if item.sequence_length < 1:
-            raise ValueError("[HP-ENCODER-013] image patch count must be positive")
+            raise ValueError("image patch count must be positive")
         local_length = (item.sequence_length + encoder_cp_size - 1) // encoder_cp_size
         start = encoder_cp_rank * local_length
         valid = max(0, min(local_length, item.sequence_length - start))
@@ -168,7 +168,7 @@ def build_destinations(items: Sequence[EncoderWorkItem], layouts: Mapping[int, D
     """
     lengths = {layout.global_sequence_length for layout in layouts.values()}
     if len(lengths) != 1:
-        raise ValueError("[HP-ENCODER-004] inconsistent decoder global lengths")
+        raise ValueError("inconsistent decoder global lengths")
     global_length = next(iter(lengths))
     result = {}
     for item in items:
@@ -176,12 +176,12 @@ def build_destinations(items: Sequence[EncoderWorkItem], layouts: Mapping[int, D
         stop = start + item.decoder_token_length
         if item.decoder_token_length <= 0 or start < 0 or stop > global_length:
             raise ValueError(
-                "[HP-ENCODER-016] image span is outside the decoder domain; "
+                "image span is outside the decoder domain; "
                 f"item_id={item.item_id}; span=({start},{stop}); global_sequence_length={global_length}"
             )
         owners = tuple(rank for rank, layout in layouts.items()
                        if max(start, layout.global_start) < min(stop, layout.global_stop))
         if not owners:
-            raise ValueError(f"[HP-ENCODER-016] image span has no decoder token owner; item_id={item.item_id}")
+            raise ValueError(f"image span has no decoder token owner; item_id={item.item_id}")
         result[item.item_id] = owners
     return result

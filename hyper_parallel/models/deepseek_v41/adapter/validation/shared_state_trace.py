@@ -98,7 +98,7 @@ def _record_event(
     """Record one bounded semantic event without retaining tensor state."""
     if len(trace.events) >= _MAX_SHARED_STATE_TRACE_EVENTS:
         raise RuntimeError(
-            "[HP-STATE-003] shared-state validation trace exceeded "
+            "shared-state validation trace exceeded "
             f"{_MAX_SHARED_STATE_TRACE_EVENTS} events"
         )
     trace.events.append(

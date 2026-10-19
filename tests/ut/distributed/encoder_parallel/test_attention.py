@@ -110,5 +110,5 @@ class TestEncoderAttention(unittest.TestCase):
         with activate_encoder_attention(context):
             context.record("first")
             context.record("first")
-        with self.assertRaisesRegex(RuntimeError, "HP-ENCODER-008"):
+        with self.assertRaisesRegex(RuntimeError, "vision attention execution mismatch"):
             context.assert_exactly_once()

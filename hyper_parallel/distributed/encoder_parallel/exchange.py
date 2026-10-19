@@ -98,7 +98,7 @@ def _route_variable_a2a(*, mode: FeatureExchangeMode,
     group_size = exchange_mesh.size()
     local_rank = exchange_mesh.get_local_rank()
     if group_size != len(source_records) * encoder_cp_size:
-        raise ValueError(f"[HP-ENCODER-009] {mode.value} exchange size disagrees with encoder parent")
+        raise ValueError(f"{mode.value} exchange size disagrees with encoder parent")
     width = int(prototype.shape[-1])
     send_chunks = []
     input_splits = []
@@ -145,7 +145,7 @@ def route_features(*, mode: FeatureExchangeMode, producer_records: Sequence[Enco
             prototype=prototype, parent_rank=parent_rank, destinations=destinations,
             encoder_cp_size=encoder_cp_size, exchange_mesh=exchange_mesh,
         )
-    raise ValueError(f"[HP-ENCODER-009] unsupported feature exchange mode: {mode!r}")
+    raise ValueError(f"unsupported feature exchange mode: {mode!r}")
 
 
 def unpack_records(rows: torch.Tensor, received_items: Sequence[EncoderWorkItem]
@@ -164,7 +164,7 @@ def unpack_records(rows: torch.Tensor, received_items: Sequence[EncoderWorkItem]
         offset = stop
     if offset != rows.shape[0]:
         raise ValueError(
-            "[HP-ENCODER-009] transported rows disagree with planned images; "
+            "transported rows disagree with planned images; "
             f"rows={rows.shape[0]}; described={offset}"
         )
     return tuple(sorted(records, key=lambda record: (

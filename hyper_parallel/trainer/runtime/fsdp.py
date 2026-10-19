@@ -310,17 +310,17 @@ class FSDPRuntimeDiagnostics:
         error_sections = []
         if bypassed_child_units:
             error_sections.append(
-                "[HP-FSDP-007] child FSDP module was bypassed while its parameter "
+                "child FSDP module was bypassed while its parameter "
                 "participated in backward:\n  - " + "\n  - ".join(bypassed_child_units)
             )
         if order_violations:
             error_sections.append(
-                "[HP-FSDP-008] configured prefetch targets do not follow "
+                "configured prefetch targets do not follow "
                 "the observed runtime order:\n  - " + "\n  - ".join(order_violations)
             )
         if pending_all_gathers:
             error_sections.append(
-                "[HP-FSDP-009] unconsumed parameter all-gather exists at "
+                "unconsumed parameter all-gather exists at "
                 "the optimizer boundary:\n  - " + "\n  - ".join(pending_all_gathers)
             )
         if error_sections:

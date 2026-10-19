@@ -247,6 +247,7 @@ class TrainerModelIntegrationSession:
         return self.mode == "runtime"
 
     def _validate_final_model(self) -> None:
+        """Run final-tree validation and record the structured report."""
         report, ownership, fsdp_units = validate_final_model(
             self.model,
             context={"trainer_config": self.config.to_dict()},
@@ -483,7 +484,7 @@ class TrainerModelIntegrationSession:
                 )
             if modality_gradients and not all(modality_gradients.values()):
                 raise RuntimeError(
-                    "[HP-DATA-002] multimodal inputs reached the model but one or more "
+                    "multimodal inputs reached the model but one or more "
                     "declared visual parameters have missing or non-finite gradients"
                 )
 
@@ -586,14 +587,14 @@ class TrainerModelIntegrationSession:
             or analysis["missing_consumer_keys"]
         ):
             raise RuntimeError(
-                "[HP-STATE-001] shared-state producer/consumer contract failed: "
+                "shared-state producer/consumer contract failed: "
                 f"missing_producers={analysis['missing_producer_keys']}, "
                 f"missing_consumers={analysis['missing_consumer_keys']}, "
                 f"missing_sources={analysis['missing_sources']}"
             )
         if analysis["duplicate_publications"]:
             raise RuntimeError(
-                "[HP-STATE-002] shared-state producer replayed inside one forward: "
+                "shared-state producer replayed inside one forward: "
                 f"{analysis['duplicate_publications']}"
             )
 

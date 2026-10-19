@@ -95,7 +95,7 @@ class TestFSDPRuntimeDiagnostics(unittest.TestCase):
         self.model.second.hsdp_scheduler.forward_prefetch_cells = [self.model.first]
         self._run_micro_step()
 
-        with self.assertRaisesRegex(RuntimeError, "HP-FSDP-008"):
+        with self.assertRaisesRegex(RuntimeError, "configured prefetch targets do not follow"):
             self.diagnostics.validate_before_optimizer_step()
 
     def test_prefetched_conditional_target_that_did_not_execute_fails(self) -> None:
@@ -119,7 +119,7 @@ class TestFSDPRuntimeDiagnostics(unittest.TestCase):
         self.model.first.hsdp_scheduler.hsdp_state.hsdp_params = [hsdp_param]
         self._run_micro_step()
 
-        with self.assertRaisesRegex(RuntimeError, "HP-FSDP-009"):
+        with self.assertRaisesRegex(RuntimeError, "unconsumed parameter all-gather exists"):
             self.diagnostics.validate_before_optimizer_step()
 
     def test_non_fused_completed_but_unconsumed_output_fails(self) -> None:
@@ -163,7 +163,7 @@ class TestFSDPRuntimeDiagnostics(unittest.TestCase):
         inputs = torch.randn(2, 4, requires_grad=True)
         self.model.second(inputs).sum().backward()
 
-        with self.assertRaisesRegex(RuntimeError, "HP-FSDP-007"):
+        with self.assertRaisesRegex(RuntimeError, "child FSDP module was bypassed"):
             self.diagnostics.validate_before_optimizer_step()
 
 

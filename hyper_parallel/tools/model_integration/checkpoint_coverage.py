@@ -130,7 +130,6 @@ def _coverage_findings(
     if unsupported_missing or unsupported_unexpected:
         findings.append(
             ModelIntegrationFinding(
-                code="HP-CKPT-001",
                 phase="D5",
                 owner_fqn="<root>",
                 severity=FindingSeverity.ERROR,
@@ -153,7 +152,6 @@ def _coverage_findings(
     if non_reversible:
         findings.append(
             ModelIntegrationFinding(
-                code="HP-CKPT-002",
                 phase="D5",
                 owner_fqn="<root>",
                 severity=FindingSeverity.ERROR,
