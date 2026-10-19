@@ -126,14 +126,16 @@ def _launch_kda_state_summary(
     gate: torch.Tensor,
     *,
     chunk_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch the validated mixed-tile summary used by the P2P path."""
-    return _launch_kda_mixed_state_summary(
+    output_transition: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Launch the shared S/M summary used by the state CP protocols."""
+    return _launch_kda_paired_state_summary(
         key,
         w,
         u,
         gate,
         chunk_size=chunk_size,
+        output_transition=output_transition,
     )
 
 
@@ -202,17 +204,19 @@ def _launch_kda_state_gradient_summary(
 
 
 @torch.compiler.disable
-def _launch_kda_mixed_state_summary(
+def _launch_kda_paired_state_summary(
     key: torch.Tensor,
     w: torch.Tensor,
     u: torch.Tensor,
     gate: torch.Tensor,
     *,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build ``S_ext`` and ``M`` in compile-time-separated BV=128 modes."""
+    output_transition: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build Ascend FLA-paired ``S_ext`` and an explicit FP32 transfer ``M``."""
     from ._triton.kimi_delta_attention.state_summary import (  # pylint: disable=import-outside-toplevel
         kda_split_state_summary_kernel,
+        kda_state_transition_kernel,
     )
 
     batch, sequence_length, heads, key_dim, value_dim = (
@@ -229,21 +233,23 @@ def _launch_kda_mixed_state_summary(
         dtype=torch.float32,
         device=key.device,
     )
-    transition = torch.empty(
-        batch,
-        heads,
-        key_dim,
-        key_dim,
-        dtype=torch.float32,
-        device=key.device,
-    )
+    transition = None
+    if output_transition:
+        transition = torch.empty(
+            batch,
+            heads,
+            key_dim,
+            key_dim,
+            dtype=torch.float32,
+            device=key.device,
+        )
     kda_split_state_summary_kernel[(1, batch * heads)](
         key,
         w,
         u,
         gate,
         state_ext,
-        transition,
+        transition if transition is not None else state_ext,
         sequence_length,
         H=heads,
         H_TOTAL=heads,
@@ -255,24 +261,20 @@ def _launch_kda_mixed_state_summary(
         OUTPUT_MODE=1,
         num_warps=2,
     )
-    kda_split_state_summary_kernel[(1, batch * heads)](
-        key,
-        w,
-        u,
-        gate,
-        state_ext,
-        transition,
-        sequence_length,
-        H=heads,
-        H_TOTAL=heads,
-        HEAD_OFFSET=0,
-        K=key_dim,
-        V=value_dim,
-        BT=chunk_size,
-        BV=128,
-        OUTPUT_MODE=2,
-        num_warps=1,
-    )
+    if output_transition:
+        kda_state_transition_kernel[(triton.cdiv(key_dim, 64), batch * heads)](
+            key,
+            w,
+            gate,
+            transition,
+            sequence_length,
+            H=heads,
+            K=key_dim,
+            BT=chunk_size,
+            BV=64,
+            num_warps=4,
+            num_stages=2,
+        )
     return state_ext, transition
 
 
@@ -284,14 +286,33 @@ def kda_state_summary_forward_from_prepared(
     gate: torch.Tensor,
     *,
     chunk_size: int = 64,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build a fused summary for an outer P2P custom-autograd function."""
+    output_transition: bool = True,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build the local affine summary for state context parallelism.
+
+    ``S_ext`` follows Ascend FLA h's FP32 feedback. ``M`` composes explicit
+    chunk transfers with FP32 feedback, following FLA CP.
+    ``output_transition=False`` returns only S and skips M allocation/computation.
+    It is valid for a zero-entry P2P endpoint whose backward never applies M.
+
+    Args:
+        key: Prepared keys, shaped [batch, tokens, heads, key_dim].
+        w: Prepared feedback weights with the same shape as key.
+        u: Prepared values, shaped [batch, tokens, heads, value_dim].
+        gate: Per-chunk cumulative log2 gates matching key.
+        chunk_size: Number of tokens per local chunk; the kernel requires 64.
+        output_transition: Whether the caller needs the local transition M.
+
+    Returns:
+        The FP32 state S and the FP32 transition M, or None when M is omitted.
+    """
     return _launch_kda_state_summary(
         key,
         w,
         u,
         gate,
         chunk_size=chunk_size,
+        output_transition=output_transition,
     )
 
 
@@ -309,9 +330,23 @@ def kda_state_gradient_summary_from_prepared(
 ) -> torch.Tensor:
     """Return the local-loss contribution to the incoming KDA state gradient.
 
-    ``grad_value`` is read-only in this operator. Callers must build this
-    summary before passing the same buffer to a local backward implementation
-    that updates ``grad_value`` in place, such as FLA ``bwd_dhu``.
+    Match Ascend FLA ``dhu`` at zero terminal state: scale ``grad_output``
+    before its dot-input cast and preserve the two K64 slabs and subtraction
+    grouping. This summary omits the full ``dh``/``dv`` outputs. All inputs
+    are read-only; the affine application to a nonzero state is a separate step.
+
+    Args:
+        query: Prepared gated queries [B,T,H,K].
+        key: Matching prepared gated keys.
+        w: Prepared feedback weights matching key.
+        gate: Per-chunk cumulative log2 gates matching key.
+        grad_output: Original token-output gradients [B,T,H,V].
+        grad_value: Local value gradients before recurrent feedback.
+        scale: Attention scaling factor.
+        chunk_size: Tokens per local chunk; the kernel requires 64.
+
+    Returns:
+        FP32 local contribution G, shaped [B,H,K,V].
     """
     return _launch_kda_state_gradient_summary(
         query,
@@ -328,10 +363,19 @@ def kda_state_gradient_summary_from_prepared(
 
 def apply_kda_state_summary(
     state_ext: torch.Tensor,
-    transition: torch.Tensor,
+    transition: Optional[torch.Tensor],
     initial_state: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Apply a prepared KDA state summary in FP32."""
+    """Apply a prepared KDA state summary in FP32.
+
+    Args:
+        state_ext: Local zero-entry state S.
+        transition: Local transfer M; may be omitted for a zero entry.
+        initial_state: Incoming FP32 state, or None for a zero entry.
+
+    Returns:
+        The outgoing FP32 state.
+    """
     if initial_state is None:
         return state_ext
     return torch.matmul(transition, initial_state.float()) + state_ext
