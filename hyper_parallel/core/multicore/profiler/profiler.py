@@ -302,6 +302,7 @@ class TorchMegaKernelProfiler:
             else:
                 self._drain(keep=False)
         finally:
+            self._raw_invocations.clear()
             for call in self._pending:
                 self._release_profile_buffer(call, cache=False)
             self._pending.clear()
@@ -525,8 +526,10 @@ class TorchMegaKernelProfiler:
                 self._finalize_window()
 
     def _finalize_window(self) -> None:
-        self._last_trace = self._build_trace(self._raw_invocations)
-        self._raw_invocations.clear()
+        try:
+            self._last_trace = self._build_trace(self._raw_invocations)
+        finally:
+            self._raw_invocations.clear()
         self._window_index += 1
         if self._on_trace_ready is not None:
             self._on_trace_ready(self)

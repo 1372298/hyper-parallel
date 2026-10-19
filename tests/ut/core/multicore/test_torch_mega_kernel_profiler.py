@@ -14,10 +14,13 @@
 # ============================================================================
 """Unit tests for the standalone Torch MegaKernel profiler frontend."""
 
+from __future__ import annotations
+
 import inspect
 import json
 from pathlib import Path
 import tempfile
+from typing import Any
 import unittest
 from unittest.mock import patch
 
@@ -28,11 +31,12 @@ from hyper_parallel.core.multicore.torch import ops as multicore_adapter
 class _FakeStorage:
     """Track explicit release of a fake tensor storage."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize storage release counters."""
         self.released = False
         self.resize_calls = 0
 
-    def resize_(self, size):
+    def resize_(self, size: int) -> None:
         """Record whether the storage was resized to zero."""
         self.resize_calls += 1
         self.released = size == 0
@@ -41,10 +45,11 @@ class _FakeStorage:
 class _FakeArray:
     """Array-like wrapper exposing a byte conversion."""
 
-    def __init__(self, data):
+    def __init__(self, data: bytes) -> None:
+        """Store the synthetic Host payload."""
         self._data = data
 
-    def tobytes(self):
+    def tobytes(self) -> bytes:
         """Return the synthetic Host payload."""
         return self._data
 
@@ -52,27 +57,28 @@ class _FakeArray:
 class _FakeProfileBuffer:
     """Small tensor-like profile buffer used by profiler lifecycle tests."""
 
-    def __init__(self, data):
+    def __init__(self, data: bytes) -> None:
+        """Initialize a buffer payload and its lifecycle counters."""
         self._data = data
         self.storage = _FakeStorage()
         self.cpu_calls = 0
         self.zero_calls = 0
 
-    def cpu(self):
+    def cpu(self) -> _FakeProfileBuffer:
         """Record a simulated Device-to-Host transfer."""
         self.cpu_calls += 1
         return self
 
-    def zero_(self):
+    def zero_(self) -> _FakeProfileBuffer:
         """Record buffer initialization and return the tensor-like object."""
         self.zero_calls += 1
         return self
 
-    def numpy(self):
+    def numpy(self) -> _FakeArray:
         """Return an array-like wrapper for the synthetic payload."""
         return _FakeArray(self._data)
 
-    def untyped_storage(self):
+    def untyped_storage(self) -> _FakeStorage:
         """Return the storage object used to verify explicit release."""
         return self.storage
 
@@ -80,11 +86,13 @@ class _FakeProfileBuffer:
 class _FakeBuffer:
     """Event-counter stand-in that records requested slices."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize an event-counter buffer on a synthetic NPU."""
         self.device = "npu:0"
         self.requested_slices = []
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: slice) -> tuple[str, slice]:
+        """Record and return one requested buffer slice."""
         self.requested_slices.append(key)
         return ("view", key)
 
@@ -100,10 +108,11 @@ class _FakeRuntime:
     kernel_name = "FakeMegaKernel"
     buffer_size = 4
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the parser call log."""
         self.parse_calls = []
 
-    def parse(self, data, *, detailed_task_names):
+    def parse(self, data: bytes, *, detailed_task_names: bool) -> dict[str, Any]:
         """Return a deterministic trace for one fake invocation payload."""
         self.parse_calls.append((data, detailed_task_names))
         anchor = int(data.decode("ascii"))
@@ -139,10 +148,11 @@ class _FakeRuntime:
 class _FakeNpu:
     """NPU runtime stand-in that records synchronization calls."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the device synchronization log."""
         self.synchronized_devices = []
 
-    def synchronize(self, device_id):
+    def synchronize(self, device_id: int) -> None:
         """Record a simulated NPU synchronization."""
         self.synchronized_devices.append(device_id)
 
@@ -185,7 +195,8 @@ class TestMegaKernelSchedule(unittest.TestCase):
 class TestTorchMegaKernelProfiler(unittest.TestCase):
     """Validate call selection, private Device buffers, D2H boundaries, and export."""
 
-    def tearDown(self):
+    def tearDown(self) -> None:
+        """Reset the process-local profiler after each test."""
         setattr(torch_profiler, "_ACTIVE_PROFILER", None)
 
     def test_inactive_call_uses_disabled_runtime_without_profile_allocation(self):
@@ -329,6 +340,124 @@ class TestTorchMegaKernelProfiler(unittest.TestCase):
             "profile_buffer",
             inspect.signature(multicore_adapter.mega_moe_grad).parameters,
         )
+
+    def test_context_exit_discards_host_data_on_parse_failure(self) -> None:
+        """Feature: MegaKernel profiler exception cleanup.
+
+        Description: Fail parsing after multiple calls have drained to Host.
+        Expectation: Propagate the parser error and release all capture resources.
+        """
+        runtime = _FakeRuntime()
+        profile_buffer = _FakeProfileBuffer(b"1000")
+        profiler = torch_profiler.mega_kernel_profile(max_pending_calls=1)
+        parse_error = ValueError("invalid profile header")
+
+        with (
+            patch.object(torch_profiler.torch, "npu", _FakeNpu()),
+            patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
+            patch.object(runtime, "parse", side_effect=parse_error),
+        ):
+            with self.assertRaises(ValueError) as raised:
+                with profiler:
+                    for _ in range(3):
+                        profiler.acquire_eventless_call(runtime, "forward").complete()
+                    self.assertEqual(
+                        len(profiler._raw_invocations), 2,
+                        f"Expected 2 drained invocations, got {len(profiler._raw_invocations)}",
+                    )
+
+        self.assertIs(raised.exception, parse_error, f"Expected {parse_error!r}, got {raised.exception!r}")
+        self.assertEqual(
+            len(profiler._raw_invocations), 0,
+            f"Expected 0 retained invocations, got {len(profiler._raw_invocations)}",
+        )
+        self.assertEqual(len(profiler._pending), 0, f"Expected 0 pending calls, got {len(profiler._pending)}")
+        self.assertEqual(
+            len(profiler._profile_buffer_pool), 0,
+            f"Expected 0 pooled buffers, got {len(profiler._profile_buffer_pool)}",
+        )
+        self.assertTrue(
+            profile_buffer.storage.released,
+            f"Expected released=True, got {profile_buffer.storage.released}",
+        )
+        self.assertIsNone(torch_profiler._ACTIVE_PROFILER, f"Expected None, got {torch_profiler._ACTIVE_PROFILER}")
+        self.assertFalse(profiler._entered, f"Expected entered=False, got {profiler._entered}")
+
+    def test_step_discards_host_data_immediately_on_parse_failure(self) -> None:
+        """Feature: MegaKernel capture window failure.
+
+        Description: Catch a parser exception at a scheduled step boundary.
+        Expectation: Discard raw data immediately without reporting or retrying the window.
+        """
+        runtime = _FakeRuntime()
+        profile_buffer = _FakeProfileBuffer(b"1000")
+        ready = []
+        profiler = torch_profiler.mega_kernel_profile(
+            schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+            on_trace_ready=ready.append,
+        )
+
+        with (
+            patch.object(torch_profiler.torch, "npu", _FakeNpu()),
+            patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
+            patch.object(runtime, "parse", side_effect=ValueError("invalid profile header")) as parse,
+        ):
+            with profiler:
+                profiler.acquire_eventless_call(runtime, "forward").complete()
+                with self.assertRaisesRegex(ValueError, "invalid profile header"):
+                    profiler.step()
+                self.assertEqual(
+                    len(profiler._raw_invocations), 0,
+                    f"Expected 0 retained invocations, got {len(profiler._raw_invocations)}",
+                )
+                self.assertIsNone(profiler._last_trace, f"Expected None, got {profiler._last_trace}")
+                self.assertEqual(profiler._window_index, 0, f"Expected window index 0, got {profiler._window_index}")
+                self.assertEqual(len(ready), 0, f"Expected 0 callbacks, got {len(ready)}")
+
+        parse.assert_called_once()
+        self.assertTrue(
+            profile_buffer.storage.released,
+            f"Expected released=True, got {profile_buffer.storage.released}",
+        )
+
+    def test_context_exit_discards_host_data_when_drain_fails(self) -> None:
+        """Feature: MegaKernel profiler final cleanup.
+
+        Description: Exit with retained Host data and an unfinished pending launch.
+        Expectation: Clear raw data even though drain fails before the parser runs.
+        """
+        runtime = _FakeRuntime()
+        profile_buffer = _FakeProfileBuffer(b"1000")
+        profiler = torch_profiler.mega_kernel_profile(max_pending_calls=1)
+
+        with (
+            patch.object(torch_profiler.torch, "npu", _FakeNpu()),
+            patch.object(torch_profiler.torch, "empty", return_value=profile_buffer),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before launches complete"):
+                with profiler:
+                    profiler.acquire_eventless_call(runtime, "forward").complete()
+                    profiler.acquire_eventless_call(runtime, "forward")
+                    self.assertEqual(
+                        len(profiler._raw_invocations), 1,
+                        f"Expected 1 drained invocation, got {len(profiler._raw_invocations)}",
+                    )
+
+        self.assertEqual(
+            len(profiler._raw_invocations), 0,
+            f"Expected 0 retained invocations, got {len(profiler._raw_invocations)}",
+        )
+        self.assertEqual(len(profiler._pending), 0, f"Expected 0 pending calls, got {len(profiler._pending)}")
+        self.assertEqual(
+            len(profiler._profile_buffer_pool), 0,
+            f"Expected 0 pooled buffers, got {len(profiler._profile_buffer_pool)}",
+        )
+        self.assertTrue(
+            profile_buffer.storage.released,
+            f"Expected released=True, got {profile_buffer.storage.released}",
+        )
+        self.assertIsNone(torch_profiler._ACTIVE_PROFILER, f"Expected None, got {torch_profiler._ACTIVE_PROFILER}")
+        self.assertFalse(profiler._entered, f"Expected entered=False, got {profiler._entered}")
 
     def test_pending_invocations_use_distinct_private_buffers(self):
         """Do not overwrite an earlier layer call before the window is drained."""
