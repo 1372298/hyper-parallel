@@ -148,44 +148,31 @@ ACLSHMEM_DEVICE void mte_put_nbi(__gm__ uint8_t *remote_dst, __gm__ const uint8_
 /** @brief Complete explicit MTE NBI operations previously issued by the calling AIV. */
 ACLSHMEM_DEVICE void mte_quiet() { aclshmemx_mte_quiet(); }
 
-// One worker owns both UB halves until its final MTE3 write has completed.
-template <typename T>
-__aicore__ inline void get_pipelined(GM_ADDR destination, GM_ADDR source, int64_t elements, int source_pe) {
-  if (elements == 0) {
-    return;
-  }
+/**
+ * @brief Query the CANN-owned MTE resources for one target Root PE.
+ *
+ * @param target_pe Target in CANN Root WORLD coordinates.
+ * @param ub_address Receives the CANN-owned UB base address available to the calling AIV.
+ * @param ub_bytes Receives the CANN-owned UB capacity in Byte.
+ * @return Whether the target supports MTE transport.
+ */
+ACLSHMEM_DEVICE bool query_mte_resources(int32_t target_pe, uint64_t &ub_address, uint64_t &ub_bytes) {
   auto *state = aclshmemi_get_state();
-  if (!(state->topo_list[source_pe] & ACLSHMEM_TRANSPORT_MTE)) {
-    AscendC::Trap();
-  }
-  auto *remote = reinterpret_cast<__gm__ T *>(aclshmem_ptr(source, source_pe));
-  if (remote == nullptr) {
-    AscendC::Trap();
-  }
-  auto *local = reinterpret_cast<__gm__ T *>(destination);
-  uint64_t ub = state->mte_config.aclshmem_ub;
-  uint64_t block_bytes = state->mte_config.ub_size / 2;
-  // Larger remote-read bursts lengthen concurrent GMM execution.
-  constexpr uint64_t max_block_bytes = 4 * 1024;
-  if (block_bytes > max_block_bytes) {
-    block_bytes = max_block_bytes;
-  }
-  uint64_t total_bytes = static_cast<uint64_t>(elements) * sizeof(T);
-  AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-  AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-  for (uint64_t offset = 0, block = 0; offset < total_bytes; offset += block_bytes, ++block) {
-    AscendC::TEventID event = (block & 1) ? EVENT_ID1 : EVENT_ID0;
-    auto *buffer = reinterpret_cast<__ubuf__ T *>(ub + (block & 1) * block_bytes);
-    uint64_t bytes = total_bytes - offset < block_bytes ? total_bytes - offset : block_bytes;
-    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(event);
-    aclshmemi_copy_gm2ub(buffer, remote + offset / sizeof(T), bytes);
-    AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(event);
-    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(event);
-    aclshmemi_copy_ub2gm(local + offset / sizeof(T), buffer, bytes);
-    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
-  }
-  AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-  AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+  ub_address = static_cast<uint64_t>(state->mte_config.aclshmem_ub);
+  ub_bytes = state->mte_config.ub_size;
+  return (state->topo_list[target_pe] & ACLSHMEM_TRANSPORT_MTE) != 0;
+}
+
+/** @brief Copy one contiguous byte range from GM to caller-owned UB. */
+template <typename T>
+ACLSHMEM_DEVICE void copy_gm_to_ub(__ubuf__ T *destination, __gm__ T *source, uint64_t bytes) {
+  aclshmemi_copy_gm2ub(destination, source, bytes);
+}
+
+/** @brief Copy one contiguous byte range from caller-owned UB to GM. */
+template <typename T>
+ACLSHMEM_DEVICE void copy_ub_to_gm(__gm__ T *destination, __ubuf__ T *source, uint64_t bytes) {
+  aclshmemi_copy_ub2gm(destination, source, bytes);
 }
 
 }  // namespace hyper_parallel::multicore::shmem::cann::device

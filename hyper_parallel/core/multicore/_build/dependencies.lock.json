@@ -121,7 +121,7 @@
         "resolution": "exact upstream commit with a locked Runtime symbol-loading adapter applied only to an isolated source copy",
         "patches": [
           {
-            "path": "hyper_parallel/core/multicore/shmem/cann_runtime_symbols.patch",
+            "path": "hyper_parallel/core/multicore/shmem/_build/patches/cann_runtime_symbols.patch",
             "sha256": "049d3e85e413dbebc6953aaf0940108b66348e2ff3647aeb11349fd8ead2bc98",
             "purpose": "resolve required rt APIs from libruntime.so when libascendcl.so does not depend on it"
           }

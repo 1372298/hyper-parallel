@@ -1,0 +1,355 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Unit tests for MegaMoe workspace capacity and SHMEM Heap policy."""
+
+import threading
+import unittest
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import Mock, patch
+
+import torch
+
+from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore.modules.mega_moe import heap_manager as heap_manager_module
+from hyper_parallel.core.multicore.modules.mega_moe.heap_manager import (
+    _HeapManager,
+    _WorkspaceLayout,
+    _get_heap_manager,
+)
+from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
+    MegaMoeWorkspace,
+    _workspace_allocation_specs,
+)
+from hyper_parallel.core.multicore.shmem import _lifecycle
+from tests.common.mark_utils import arg_mark
+
+
+class TestMegaMoeHeapManager(unittest.TestCase):
+    """Characterize MegaMoe capacity policy independently of NPU allocation."""
+
+    # These tests deliberately inspect the private manager and lifecycle transaction.
+    # pylint: disable=protected-access
+
+    def setUp(self) -> None:
+        """Install one-rank lifecycle and configuration boundaries."""
+        self.reference = SimpleNamespace(
+            device="npu:0",
+            dtype=torch.bfloat16,
+            element_size=lambda: 2,
+        )
+        self.root_group = object()
+        self.root_patch = patch.object(_lifecycle, "root_members", return_value=(0,))
+        self.stage_patch = patch.object(
+            _lifecycle,
+            "_reconfiguration_stage",
+            side_effect=lambda operation, **_kwargs: operation() or 0.0,
+        )
+        self.environment_patch = patch.dict(heap_manager_module.os.environ, {}, clear=True)
+        self.root_patch.start()
+        self.stage = self.stage_patch.start()
+        self.environment_patch.start()
+        self.addCleanup(self.root_patch.stop)
+        self.addCleanup(self.stage_patch.stop)
+        self.addCleanup(self.environment_patch.stop)
+        self.addCleanup(self._reset_manager)
+        self._reset_manager()
+
+    @staticmethod
+    def _reset_manager() -> None:
+        """Reset the process singleton between isolated tests."""
+        heap_manager_module._HEAP_MANAGER = None  # pylint: disable=protected-access
+
+    @staticmethod
+    def _layout(required_bytes: int, capacity: int, name: str = "layout") -> _WorkspaceLayout:
+        """Build a deterministic layout without duplicating the capacity formula."""
+        return _WorkspaceLayout(required_bytes, (("name", name),), capacity)
+
+    def _manager_with_reservation(
+        self,
+        specification: dict,
+        layout: _WorkspaceLayout,
+    ) -> _HeapManager:
+        """Create a manager and submit one reservation."""
+        manager = _HeapManager(self.root_group, self.reference)
+        manager.reserve(((specification, layout),), allow_resize=True)
+        return manager
+
+    @staticmethod
+    def _allocations(
+        specification: Any,
+        capacity: int,
+    ) -> tuple[tuple[str, _lifecycle._AllocationSpec], ...]:  # pylint: disable=protected-access
+        """Return one workspace's ordered symmetric Allocation specifications."""
+        return _workspace_allocation_specs(
+            dispatch_mode=specification.dispatch_mode,
+            routed_slots=specification.routed_slots,
+            receive_capacity=capacity,
+            hidden_size=specification.hidden_size,
+            ep_size=specification.ep_size,
+            num_experts=specification.num_experts,
+            dtype=torch.bfloat16,
+        )
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_reservations_define_layout_and_roll_back_failed_additions(self) -> None:
+        """Align aggregate reservations and roll back only a failed identity-based addition."""
+        reservations = (
+            ({"name": "first"}, self._layout(1_500_000, 64, "first")),
+            ({"name": "second"}, self._layout(1_000_000, 32, "second")),
+        )
+        manager = _HeapManager(self.root_group, self.reference)
+        added = manager.reserve(reservations, allow_resize=True)
+
+        self.assertEqual(manager.heap_bytes, 4 * 1024**2)
+        self.assertEqual(added, tuple(item[0] for item in reservations))
+        self.assertIs(self.stage.call_args.kwargs["group"], self.root_group)
+
+        first = {"shape": 1}
+        equal = {"shape": 1}
+        manager = self._manager_with_reservation(first, self._layout(512, 1))
+
+        with (
+            patch.object(_lifecycle, "_reconfiguration_stage", side_effect=RuntimeError("agreement failed")),
+            self.assertRaisesRegex(RuntimeError, "agreement failed"),
+        ):
+            manager.reserve(((equal, self._layout(512, 1)),), allow_resize=True)
+        self.assertEqual(len(manager.entries), 1)
+        self.assertIs(manager.entries[0].specification, first)
+
+        added = manager.reserve(((equal, self._layout(512, 1)),), allow_resize=True)
+        self.assertEqual(added, (equal,))
+        manager.rollback_reservations(added, None)
+        self.assertEqual([entry.specification for entry in manager.entries], [first])
+
+        workspace = Mock()
+        manager.bind(workspace, SimpleNamespace(name="fixed"), first)
+        with self.assertRaisesRegex(RuntimeError, "fixed SHMEM layout"):
+            manager.reserve(((equal, self._layout(3 * 1024**2, 2)),), allow_resize=False)
+        self.assertEqual([entry.specification for entry in manager.entries], [first])
+
+    def test_manager_owns_and_reuses_one_retryable_runtime_reference(self) -> None:
+        """Reuse an attached manager and commit detach only after its sole release succeeds."""
+        manager = self._manager_with_reservation({"name": "runtime"}, self._layout(512, 1))
+        with (
+            patch.object(heap_manager_module.shmem, "acquire") as acquire,
+            patch.object(heap_manager_module.shmem, "release") as release,
+        ):
+            self.assertTrue(manager.attach_runtime())
+            self.assertFalse(manager.attach_runtime())
+            acquire.assert_called_once_with(self.root_group, heap_size_bytes=2 * 1024**2)
+            release.side_effect = RuntimeError("busy")
+            with self.assertRaisesRegex(RuntimeError, "busy"):
+                manager.detach_runtime()
+            self.assertTrue(manager.runtime_attached)
+            release.side_effect = None
+            manager.detach_runtime()
+        self.assertFalse(manager.runtime_attached)
+        self.assertEqual(release.call_count, 2)
+
+        first = _get_heap_manager(None, self.reference)
+        first._runtime_attached = True
+        self.assertIs(_get_heap_manager(None, self.reference), first)
+        first._runtime_attached = False
+        self.assertIsNot(_get_heap_manager(None, self.reference), first)
+
+    def test_restart_binds_materialized_workspaces_and_preserves_lazy_entries(self) -> None:
+        """Bind ordered result slices for shared and private workspaces around one lazy entry."""
+        specifications = ({"name": "push"}, {"name": "lazy"}, {"name": "pull"})
+        current_layouts = [
+            self._layout(512, 1, "push"),
+            self._layout(256, 1, "lazy"),
+            self._layout(1024, 2, "pull"),
+        ]
+        target_layouts = [
+            self._layout(1024, 3, "push"),
+            self._layout(256, 1, "lazy"),
+            self._layout(1536, 4, "pull"),
+        ]
+        manager = _HeapManager(self.root_group, self.reference)
+        manager.reserve(
+            tuple(zip(specifications, current_layouts)),
+            allow_resize=True,
+        )
+        manager._runtime_attached = True
+        bound_specs = (
+            SimpleNamespace(dispatch_mode="push", routed_slots=2, hidden_size=4, ep_size=1, num_experts=2),
+            SimpleNamespace(dispatch_mode="push", routed_slots=2, hidden_size=4, ep_size=1, num_experts=2),
+            SimpleNamespace(dispatch_mode="pull", routed_slots=3, hidden_size=4, ep_size=1, num_experts=2),
+        )
+        workspaces = [MegaMoeWorkspace(shared=True), MegaMoeWorkspace(shared=False), MegaMoeWorkspace(shared=False)]
+        materialized_indices = (0, 2)
+        old_tensors = []
+        for index in materialized_indices:
+            workspace = workspaces[index]
+            spec = bound_specs[index]
+            allocations = self._allocations(spec, current_layouts[index].receive_capacity)
+            current_tensors = tuple(torch.empty(target.shape, dtype=target.dtype) for _, target in allocations)
+            for tensor, (field_name, _) in zip(current_tensors, allocations):
+                setattr(workspace, field_name, tensor)
+            workspace.completion_event = object()
+            workspace.capacity_floor = current_layouts[index].receive_capacity
+            old_tensors.extend(current_tensors)
+        for workspace, bound_spec, specification in zip(workspaces, bound_specs, specifications):
+            manager.bind(workspace, bound_spec, specification)
+        stages = {
+            "preflight_ms": 1.0, "quiesce_ms": 2.0, "release_ms": 3.0, "finalize_ms": 4.0,
+            "bootstrap_ms": 5.0, "initialize_ms": 6.0, "restore_ms": 7.0, "commit_ms": 8.0,
+        }
+
+        def restart(**kwargs: Any) -> _lifecycle._RestartResult:
+            """Validate the declarative request and return replacement Tensors."""
+            heap_size_bytes = kwargs["heap_size_bytes"]
+            replacements = kwargs["replacements"]
+            preflight_hook = kwargs["preflight_hook"]
+            self.assertEqual(heap_size_bytes, 2 * 1024**2)
+            self.assertEqual(len(replacements), 8)
+            agreement = preflight_hook()
+            self.assertEqual([entry.is_materialized for entry in agreement.entries], [True, False, True])
+            result_tensors = tuple(
+                torch.empty(replacement.target.shape, dtype=replacement.target.dtype)
+                for replacement in replacements
+            )
+            return _lifecycle._RestartResult(result_tensors, stages)  # pylint: disable=protected-access
+
+        with (
+            patch.object(shmem, "_restart", side_effect=restart),
+            patch.object(heap_manager_module.time, "perf_counter", side_effect=(10.0, 10.125)),
+        ):
+            manager._restart(target_layouts, 2 * 1024**2)
+
+        rebound_tensors = []
+        for index in materialized_indices:
+            workspace = workspaces[index]
+            spec = bound_specs[index]
+            targets = self._allocations(spec, target_layouts[index].receive_capacity)
+            rebound_tensors.extend(getattr(workspace, field_name) for field_name, _ in targets)
+            self.assertEqual(
+                [(tuple(getattr(workspace, field_name).shape), getattr(workspace, field_name).dtype)
+                 for field_name, _ in targets],
+                [(target.shape, target.dtype) for _, target in targets],
+            )
+        self.assertTrue(all(actual is not old for actual, old in zip(rebound_tensors, old_tensors)))
+        self.assertIsNone(workspaces[1].completion_event)
+        self.assertEqual(manager.epoch, 1)
+        self.assertEqual(manager.growth_records[-1]["stages_ms"], stages)
+        self.assertEqual(manager.growth_records[-1]["total_ms"], 125.0)
+
+    def test_capacity_fast_path_and_explicit_limit_fallback(self) -> None:
+        """Keep sufficient capacity lock-free and fall back to the minimum within an explicit limit."""
+        manager = _HeapManager(self.root_group, self.reference)
+        workspace = SimpleNamespace(capacity_floor=2)
+        with patch.object(manager, "access") as access:
+            manager.ensure_capacity(workspace, 2)
+        access.assert_not_called()
+
+        specification = {"shape": "dynamic"}
+        manager = self._manager_with_reservation(specification, self._layout(512, 1))
+        manager.heap_limit = 2 * 1024**2
+        manager.heap_bytes = manager.heap_limit
+        workspace = Mock(capacity_floor=1)
+        workspace.describe_restart_allocations.return_value = ()
+        workspace.validate_restart_allocations.return_value = False
+        manager.bind(workspace, SimpleNamespace(name="bound"), specification)
+
+        def layout(specification: dict, dtype: torch.dtype, capacity: int) -> _WorkspaceLayout:
+            """Return a capacity-dependent layout for fallback selection."""
+            del specification, dtype
+            required = 3 * 1024**2 if capacity == 3 else 1024
+            return self._layout(required, capacity)
+
+        with (
+            patch.object(heap_manager_module, "_grow_receive_capacity", return_value=(3, 2)),
+            patch.object(heap_manager_module, "_workspace_layout", side_effect=layout),
+            patch.object(shmem, "_restart", return_value=_lifecycle._RestartResult((), {})),
+        ):
+            manager.ensure_capacity(workspace, 2)
+        self.assertEqual(manager.entries[0].layout.receive_capacity, 2)
+        self.assertEqual(workspace.capacity_floor, 2)
+
+    def test_resize_lock_rejects_concurrent_access(self) -> None:
+        """Reject another submission while one capacity change owns the manager lock."""
+        specification = {"shape": "dynamic"}
+        manager = self._manager_with_reservation(specification, self._layout(512, 1))
+        workspace = Mock(capacity_floor=1)
+        workspace.describe_restart_allocations.return_value = ()
+        workspace.validate_restart_allocations.return_value = False
+        manager.bind(workspace, SimpleNamespace(name="bound"), specification)
+        entered = threading.Event()
+        resume = threading.Event()
+
+        def restart(**kwargs: Any) -> _lifecycle._RestartResult:
+            """Hold the restart call while another thread probes manager access."""
+            kwargs["preflight_hook"]()
+            entered.set()
+            if not resume.wait(timeout=2):
+                raise RuntimeError("test did not release restart")
+            return _lifecycle._RestartResult((), {})
+
+        with (
+            patch.object(heap_manager_module, "_grow_receive_capacity", return_value=(2, 2)),
+            patch.object(heap_manager_module, "_workspace_layout", return_value=self._layout(1024, 2)),
+            patch.object(shmem, "_restart", side_effect=restart),
+        ):
+            thread = threading.Thread(target=manager.ensure_capacity, args=(workspace, 2))
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                with self.assertRaisesRegex(RuntimeError, "concurrent Heap operations"), manager.access():
+                    self.fail("Concurrent access entered a restart transaction")
+            finally:
+                resume.set()
+                thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+    def test_restart_failure_boundary_controls_manager_state(self) -> None:
+        """Keep preflight retryable and make destructive or binding failures terminal."""
+        initial = self._layout(512, 1)
+        target = self._layout(1024, 2)
+        manager = self._manager_with_reservation({"name": "failure"}, initial)
+        with (
+            patch.object(shmem, "_restart", side_effect=RuntimeError("preflight failed")),
+            patch.object(_lifecycle, "_runtime_is_healthy", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "preflight failed"),
+        ):
+            manager._restart([target], 2 * 1024**2)
+        self.assertEqual((manager.state, manager.entries[0].layout, manager.epoch), ("ready", initial, 0))
+
+        with (
+            patch.object(shmem, "_restart", side_effect=RuntimeError("destructive failed")),
+            patch.object(_lifecycle, "_runtime_is_healthy", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "destructive failed"),
+        ):
+            manager._restart([target], 2 * 1024**2)
+        self.assertEqual(manager.state, "failed")
+
+        manager = self._manager_with_reservation({"name": "binding failure"}, initial)
+        result = _lifecycle._RestartResult((Mock(),), {})
+        with (
+            patch.object(shmem, "_restart", return_value=result),
+            patch.object(manager, "_validate_restart_result"),
+            patch.object(manager, "_bind_restart_result", side_effect=RuntimeError("binding failed")),
+            patch.object(heap_manager_module.shmem, "free") as free,
+            patch.object(heap_manager_module.shmem, "release") as release,
+            self.assertRaisesRegex(RuntimeError, "binding failed"),
+        ):
+            manager._restart([target], 2 * 1024**2)
+        self.assertEqual(manager.state, "failed")
+        free.assert_not_called()
+        release.assert_not_called()
+
+if __name__ == "__main__":
+    unittest.main()
