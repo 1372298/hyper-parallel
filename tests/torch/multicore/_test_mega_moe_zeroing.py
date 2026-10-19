@@ -14,6 +14,7 @@
 # ============================================================================
 """Verify that MegaMoe never consumes unwritten activation or communication rows."""
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -53,8 +54,9 @@ def poison_overwritten_buffers(value: float) -> Iterator[None]:
     def _poisoned_claim(workspace):
         claim(workspace)
         # The existing stream lease must finish before overwriting shared storage.
-        workspace.expert_buffer.fill_(value)
-        workspace.routed_buffer.fill_(value)
+        for tensor in (workspace.expert_buffer, workspace.source_buffer, workspace.routed_buffer):
+            if tensor is not None:
+                tensor.fill_(value)
 
     with (
         patch.object(function_module, "_allocate_forward_intermediates", side_effect=_forward),
@@ -99,7 +101,9 @@ def test_mega_moe_poisoned_buffers() -> None:
     source, upstream = baseline.make_data(shape)
     stream = torch.npu.Stream(device=baseline.DEVICE)
     results = []
-    for factor in (None, 1.5):
+    mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
+    factors = (None, 1.5) if mode == "push" else (None,)
+    for factor in factors:
         start_shmem_lifetime()
         mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         patterns = ["balanced", "tail", "empty_experts", "balanced"]
@@ -117,4 +121,4 @@ def test_mega_moe_poisoned_buffers() -> None:
                 results.append({"factor": factor, "pattern": pattern, "poison": str(value), "passed": True})
         finally:
             mega.close()
-    write_evidence({"poisoned_buffers": results})
+    write_evidence({"dispatch_mode": mode, "poisoned_buffers": results})

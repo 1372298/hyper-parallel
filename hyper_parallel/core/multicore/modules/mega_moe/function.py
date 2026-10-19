@@ -229,6 +229,7 @@ def _prepare_backward_execution(
             grad_output,
             saved.weight1,
             saved.weight2,
+            dispatch[:saved.dispatch.shape[0]] if plan.reuse_backward_dispatch else None,
         ),
     )
 

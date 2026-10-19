@@ -17,30 +17,37 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 import os
+from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from types import MethodType
 
 import torch
 import torch.distributed as dist
+import torch_npu  # pylint: disable=unused-import
 from torch import nn
 from torch.nn import functional
-import torch_npu  # pylint: disable=unused-import
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4SparseMoeBlock,
+)
 
 from hyper_parallel.distributed import ShardingPlanner, apply_sharding_plan
 from hyper_parallel.distributed.mesh import MeshContext
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
+    DeepseekV41MegaMoeExperts,
+)
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_megamoe_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
-    DeepseekV41TopKRouter, bind_shared_expert_forward,
+    DeepseekV41TopKRouter,
+    _v41_sparse_moe_forward,
+    bind_shared_expert_forward,
 )
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime
+from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
 from tests.torch.multicore._test_mega_moe_dynamic_tokens import _assert_close
 
 
@@ -50,12 +57,10 @@ def _text_signature(self: nn.Module, hidden_states: torch.Tensor,
     raise AssertionError(f"Missing MegaMoe injection for {type(self).__name__}: {hidden_states.shape}, {input_ids}")
 
 
-def _vision_signature(self: nn.Module, hidden_states: torch.Tensor,
-                      input_ids: torch.Tensor | None = None,
-                      image_mask: torch.Tensor | None = None) -> torch.Tensor:
-    """Retain the VLM block signature until the declared compute injection."""
-    raise AssertionError(f"Missing MegaMoe injection for {type(self).__name__}: {hidden_states.shape}, "
-                         f"{input_ids}, {image_mask}")
+@wraps(_v41_sparse_moe_forward)
+def _vision_signature(self: nn.Module, *_args: object, **_kwargs: object) -> torch.Tensor:
+    """Follow the production VLM signature while requiring compute injection."""
+    raise AssertionError(f"Missing MegaMoe injection for {type(self).__name__}")
 
 
 def _model(tp: int, cp: int, vision: bool, mode: str) -> nn.Module:
@@ -243,10 +248,13 @@ def test_deepseek_v41_parallel() -> None:
     apply_sharding_plan(model, plan, mesh)
     cases = [_compare(block, reference, mesh, count, vision) for count in (17, 129)]
     report = {'rank': rank, 'tp': tp, 'cp': cp, 'ep': world, 'vision': vision,
+              'torch': torch.__version__, 'torch_npu': torch_npu.__version__,
               'dispatch_mode': mode, 'passed': True, 'cases': cases}
-    directory = os.getenv('HP_DSV41_PARALLEL_RESULT_DIR')
-    if directory:
-        output = Path(directory) / f'{mode}-tp{tp}-cp{cp}-vision{int(vision)}-rank{rank}.json'
+    if os.getenv('HP_MEGA_MOE_LEVEL1_RESULT'):
+        write_evidence(report)
+    elif os.getenv('HP_DSV41_PARALLEL_RESULT_DIR'):
+        output = (Path(os.environ['HP_DSV41_PARALLEL_RESULT_DIR'])
+                  / f'{mode}-tp{tp}-cp{cp}-vision{int(vision)}-rank{rank}.json')
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
     print(json.dumps(report), flush=True)

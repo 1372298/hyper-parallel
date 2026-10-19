@@ -17,7 +17,7 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
@@ -33,7 +33,7 @@ def _run_worker(case: str) -> None:
     if not multicore_adapter_is_available("hyper_parallel_mega_gate_torch"):
         raise RuntimeError("MegaGate ST requires a wheel or PYTHONPATH payload built with --multicore on")
     with without_inherited_rank_environment():
-        parallel_run([TorchCase(_WORKER, case, num_proc=1)], global_num_proc=1)
+        run_multicore_case(_WORKER, case, num_proc=1)
 
 
 @arg_mark(

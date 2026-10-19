@@ -24,8 +24,12 @@ from pathlib import Path
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.torch.multicore._evidence_helpers import (
+    capture_worker_logs,
+    run_acceptance_worker,
+)
 from tests.common.port_utils import allocate_port
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
@@ -40,15 +44,10 @@ _PERFORMANCE_WORLD_SIZE = 4
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="unessential")
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-def test_mega_moe_dynamic_tokens(monkeypatch, dispatch_mode: str) -> None:
+def test_mega_moe_dynamic_tokens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str) -> None:
     """Validate EP8 unequal and zero source lengths against an independent FP32 oracle."""
-    _prepare_torch_multicore_test_environment()
-    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
-    monkeypatch.setenv("HP_DYNAMIC_DISPATCH", dispatch_mode)
-    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    with without_inherited_rank_environment():
-        parallel_run([TorchCase("tests/torch/multicore/_test_mega_moe_dynamic_tokens.py",
-                                "test_dynamic_tokens", num_proc=8)], global_num_proc=8)
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_dynamic_tokens", 8, "_test_mega_moe_dynamic_tokens.py")
 
 
 def _prepare_torch_multicore_test_environment() -> None:
@@ -67,17 +66,10 @@ def _run_precision_worker(monkeypatch) -> None:
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(64 * 1024 * 1024))
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PRECISION_WORLD_SIZE))
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    with without_inherited_rank_environment():
-        parallel_run(
-            [
-                TorchCase(
-                    _WORKER,
-                    "test_mega_moe_level0_balanced",
-                    num_proc=_PRECISION_WORLD_SIZE,
-                )
-            ],
-            global_num_proc=_PRECISION_WORLD_SIZE,
-        )
+    with without_inherited_rank_environment(), capture_worker_logs(
+        _WORKER, "test_mega_moe_level0_balanced", Path("logs/mega_moe_precision"),
+    ):
+        run_multicore_case(_WORKER, "test_mega_moe_level0_balanced", num_proc=_PRECISION_WORLD_SIZE)
 
 
 @arg_mark(
@@ -93,6 +85,7 @@ def test_mega_moe_level0_precision(monkeypatch) -> None:
 
 def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
     """Run common/MegaMoe A/B in one four-rank process group."""
+    result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(result_dir))) / "performance"
     result_path = result_dir / "routed_expert_ab.json"
     monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_PERFORMANCE_WORLD_SIZE))
@@ -102,17 +95,10 @@ def _run_performance_worker(monkeypatch, result_dir: Path) -> dict:
     monkeypatch.setenv("HP_MEGA_MOE_PERF_RESULT", str(result_path))
     monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", "62000-62063")
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    with without_inherited_rank_environment():
-        parallel_run(
-            [
-                TorchCase(
-                    _WORKER,
-                    "test_mega_moe_fwd_bwd_performance",
-                    num_proc=_PERFORMANCE_WORLD_SIZE,
-                )
-            ],
-            global_num_proc=_PERFORMANCE_WORLD_SIZE,
-        )
+    with without_inherited_rank_environment(), capture_worker_logs(
+        _WORKER, "test_mega_moe_fwd_bwd_performance", result_dir / "worker_logs",
+    ):
+        run_multicore_case(_WORKER, "test_mega_moe_fwd_bwd_performance", num_proc=_PERFORMANCE_WORLD_SIZE)
     return json.loads(result_path.read_text(encoding="utf-8"))
 
 
@@ -163,30 +149,24 @@ def test_mega_moe_representative_performance(monkeypatch, tmp_path: Path) -> Non
 
 
 def _run_acceptance_worker(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, cards: int, worker: str | None = None,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, cards: int, worker: str,
     heap_bytes: int = 64 * 1024 * 1024,
+    variant: str | None = None,
 ) -> dict:
     """Launch one real-device acceptance worker and require its rank evidence."""
     _prepare_torch_multicore_test_environment()
-    result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path)))
-    result_path = result_dir / f"{case}.json"
-    if worker is None:
-        worker = "_test_mega_moe_resources.py" if cards == 2 else "_test_mega_moe_defaults.py"
-    monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(cards))
-    monkeypatch.setenv("HP_MEGA_MOE_LEVEL1_RESULT", str(result_path))
-    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    if cards == 2:
-        monkeypatch.setenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", str(heap_bytes))
-    else:
-        monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
-    with without_inherited_rank_environment():
-        parallel_run(
-            [TorchCase(str(Path(__file__).with_name(worker)), case, num_proc=cards)],
-            global_num_proc=cards,
-        )
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    assert len(result["ranks"]) == cards, f"expected {cards} rank records, got {len(result['ranks'])}."
-    return result
+    print(
+        f"MegaMoe worker {case}: cards={cards}, assigned_devices={os.getenv('ASCEND_RT_VISIBLE_DEVICES')}, "
+        f"hccl_base={os.getenv('HCCL_IF_BASE_PORT')}, hccl_ports={os.getenv('HCCL_NPU_SOCKET_PORT_RANGE')}", flush=True,
+    )
+    worker_path = str(Path(__file__).with_name(worker))
+
+    def launch(result_dir: Path) -> None:
+        """Keep device setup and distributed execution outside the CPU helper."""
+        with without_inherited_rank_environment(), capture_worker_logs(worker_path, case, result_dir / "worker_logs"):
+            run_multicore_case(worker_path, case, num_proc=cards)
+
+    return run_acceptance_worker(monkeypatch, tmp_path, case, cards, launch, heap_bytes, variant)
 
 
 @arg_mark(
@@ -216,8 +196,12 @@ def test_mega_moe_local_capacity_lifetime(
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_poisoned_buffers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Require complete writes after NaN and stale-value poisoning across route changes."""
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_poisoned_buffers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Require complete writes after NaN and stale-value poisoning across both transports."""
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_poisoned_buffers", 2, "_test_mega_moe_zeroing.py",
     )
@@ -230,16 +214,16 @@ def test_mega_moe_poisoned_buffers(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     essential_mark="unessential",
 )
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-def test_mega_moe_device_ready_lifecycle(
+def test_mega_moe_resource_lifecycle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
 ) -> None:
-    """Feature: Device-owned ready generations.
-    Description: Reuse lifecycle scenarios for push and pull through the same worker.
-    Expectation: Replay, streams and capacity-error recovery preserve outputs and gradients.
+    """Feature: Shared-resource training and device-owned ready generations.
+    Description: Compare serial, alternating-stream and replay stacks in both transports.
+    Expectation: SGD, memory, ready generations and launch-error recovery remain correct.
     """
     monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
     _run_acceptance_worker(
-        monkeypatch, tmp_path, "test_mega_moe_device_ready_lifecycle", 2, "_test_mega_moe_ready.py",
+        monkeypatch, tmp_path, "test_mega_moe_resource_lifecycle", 2, "_test_mega_moe_lifecycle.py",
     )
 
 
@@ -249,33 +233,17 @@ def test_mega_moe_device_ready_lifecycle(
     card_mark="allcards",
     essential_mark="unessential",
 )
-def test_mega_moe_shared_resources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: Shared execution resources and private SHMEM ownership.
-
-    Description: Compare real serial stacks and alternate streams, then mix private/managed close orders.
-    Expectation: Outputs, gradients and updates match while memory remains stable.
+@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
+def test_mega_moe_router_interface(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
+) -> None:
+    """Feature: Router graph without caller-provided counts.
+    Description: Run one common/MegaMoe SGD step at the representative shape in each transport.
+    Expectation: Output, Router/input/route/expert gradients and parameter updates agree.
     """
-    _run_acceptance_worker(
-        monkeypatch,
-        tmp_path,
-        "test_mega_moe_shared_resource_acceptance",
-        2,
-    )
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level1",
-    card_mark="allcards",
-    essential_mark="unessential",
-)
-def test_mega_moe_default_interface(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Feature: Default and explicit capacity without Router-provided counts.
-
-    Description: Compare identical representative shapes in ABBA order, including Router timing.
-    Expectation: Outputs and gradients agree; stable latency, peak memory and software identity are recorded.
-    """
-    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_default_capacity_acceptance", 4)
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_mega_moe_router_interface", 4,
+                           "_test_mega_moe_router_interface.py")
 
 
 @arg_mark(
@@ -305,12 +273,10 @@ def test_mega_moe_group_list_isolation(
 ) -> None:
     """Feature: Graph-sized grouped-matmul scratch beyond 16 experts per rank.
 
-    Description: Repeat balanced, empty-expert, skew and single-destination routes with 10 to 128 local experts.
-    Expectation: Forward, all gradients and SGD updates match common MoE over eight steps per shape.
+    Description: Exercise odd tails, 16/17 and 32/33 boundaries and 128 local experts in both transports.
+    Expectation: Forward, all gradients and SGD updates match common MoE across route transitions per shape.
     """
     monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
-    evidence_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / dispatch_mode
-    monkeypatch.setenv("HP_MEGA_MOE_EVIDENCE_DIR", str(evidence_dir))
     _run_acceptance_worker(
         monkeypatch, tmp_path, "test_mega_moe_group_list_isolation", 2, "_test_mega_moe_runtime.py",
         heap_bytes=128 * 1024 * 1024,

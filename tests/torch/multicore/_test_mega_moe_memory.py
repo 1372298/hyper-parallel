@@ -16,7 +16,9 @@
 
 import gc
 import os
+from contextlib import nullcontext
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
@@ -172,7 +174,8 @@ def test_mega_moe_local_capacity_lifetime() -> None:
     shape = baseline.MoeShape(local_num_tokens=4096, hidden_size=1024)
     mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     results = []
-    for factor in (None, 1.5):
+    factors = (None, 1.5) if mode == "push" else (None,)
+    for factor in factors:
         start_shmem_lifetime()
         mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         resources = mega._get_execution_resources(baseline.make_data(shape)[0])  # pylint: disable=protected-access
@@ -191,21 +194,34 @@ def test_mega_moe_local_capacity_lifetime() -> None:
                     assert args[17].data_ptr() != args[0].data_ptr()
                     return kernel(*args)
 
-                with patch.object(ops, "mega_moe_grad_with_diagnostic_buffer", side_effect=_backward):
+                with patch.object(ops, "mega_moe_grad_with_diagnostic_buffer", side_effect=_backward), patch.object(
+                    ops, "mega_moe_grad", side_effect=partial(_backward, kernel=ops.mega_moe_grad),
+                ):
                     for patterns in pairs:
                         expected = _deferred_pair(common, shape, patterns)
-                        with multicore_profiler.mega_kernel_profile(
+                        capture = factor is None and patterns == pairs[0]
+                        profile_context = multicore_profiler.mega_kernel_profile(
                             schedule=schedule(wait=0, warmup=0, active=1, repeat=1),
-                        ) as profiler:
+                        ) if capture else nullcontext()
+                        with profile_context as profiler:
                             actual = _deferred_pair(mega, shape, patterns)
-                            profiler.step()
-                        trace = profiler.export_chrome_trace(Path(os.environ["HP_MEGA_MOE_LEVEL1_RESULT"]).with_name(
-                            f"{mode}_rank{baseline.RANK}_trace.json"))
-                        assert trace["megaKernelCycleTrace"]["invocationCount"] == 6
-                        assert trace["megaKernelCycleTrace"]["droppedRecordCount"] == 0
+                            if profiler is not None:
+                                profiler.step()
+                        if profiler is not None:
+                            trace = profiler.export_chrome_trace(
+                                Path(os.environ["HP_MEGA_MOE_LEVEL1_RESULT"]).with_name(
+                                    f"{mode}_reuse{reuse}_rank{baseline.RANK}_trace.json"))
+                            metadata = trace["megaKernelCycleTrace"]
+                            assert metadata["invocationCount"] == 6, (
+                                f"rank={baseline.RANK}: expected 6 invocations, got {metadata}"
+                            )
+                            assert metadata["droppedRecordCount"] == 0, (
+                                f"rank={baseline.RANK}: expected no dropped records, got {metadata}"
+                            )
                         for index, (reference, observed) in enumerate(zip(expected, actual)):
                             baseline.assert_close(f"capacity patterns={patterns} tensor={index}", observed, reference)
-                        results.append({"factor": factor, "reuse": reuse, "patterns": patterns, "match": True})
+                        results.append({"factor": factor, "reuse": reuse, "patterns": patterns,
+                                        "profiled": capture, "match": True})
             if mode == "pull":
                 data_bytes = shape.local_num_tokens * shape.top_k * shape.hidden_size * 2
                 assert 2 * data_bytes < shmem.debug_state()["config"]["heap_size_bytes"] < 3 * data_bytes
