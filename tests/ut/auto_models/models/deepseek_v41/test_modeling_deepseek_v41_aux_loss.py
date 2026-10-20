@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Callable
 from unittest.mock import Mock, patch
 
 import torch
@@ -229,7 +230,9 @@ class TestV41RouterAuxLoss(unittest.TestCase):
             forward=lambda hidden_states, input_ids=None, router_token_mask=None: hidden_states,
         )
 
-        def dispatch(target, states, *, router_fn, ep_group):
+        def dispatch(
+                target: Any, states: torch.Tensor, *, router_fn: Callable, ep_group: Any,
+        ) -> torch.Tensor:
             """Exercise the real gate call without expert communication."""
             del ep_group
             router_fn(target, states)
@@ -416,7 +419,9 @@ class TestV41NativeAuxLoss(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries_to_plan_overrides(entries, ep_size=1), {})
 
-            def dispatch(target, states, *, router_fn, ep_group):
+            def dispatch(
+                    target: Any, states: torch.Tensor, *, router_fn: Callable, ep_group: Any,
+            ) -> torch.Tensor:
                 """Use native experts to validate the EP region without communication."""
                 del ep_group
                 indices, weights = router_fn(target, states)
@@ -476,7 +481,9 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
                         torch.nn.init.normal_(router.weight)
                         reference = copy.deepcopy(router)
 
-                        def execute(states, indices, weights):
+                        def execute(
+                                states: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor,
+                        ) -> torch.Tensor:
                             """Emulate only the native expert gradient carrier on CPU."""
                             del indices
                             return weights.sum(-1).reshape(*states.shape[:-1], 1).expand_as(states)
@@ -525,6 +532,12 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
         Description: Feed CP-local metadata into the second TP shard of a two-row batch.
         Expectation: Router receives sliced masks/IDs, contiguous image mask and CP/TP groups.
         """
+        for fixed in (False, True):
+            with self.subTest(fixed=fixed):
+                self._check_megamoe_metadata(fixed)
+
+    def _check_megamoe_metadata(self, fixed: bool) -> None:
+        """Keep CP/TP/DP metadata independent of the synthetic dispatch destinations."""
         tp, cp, dp = Mock(), Mock(), Mock()
         for axis in (tp, cp, dp):
             axis.size.return_value = 2
@@ -533,7 +546,8 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
         mesh.__getitem__ = Mock(side_effect={"dp": dp, "cp": cp, "tp": tp}.__getitem__)
         ep = Mock()
         ep.__getitem__ = Mock(return_value=SimpleNamespace(size=lambda: 2))
-        router = Mock(top_k=2, return_value=(torch.empty(4, 4), torch.ones(4, 2), torch.zeros(4, 2).long()))
+        router = Mock(num_experts=4, top_k=2,
+                      return_value=(torch.empty(4, 4), torch.ones(4, 2), torch.zeros(4, 2).long()))
         experts = Mock(spec=DeepseekV41MegaMoeExperts, swiglu_limit=1.5, sequence_parallel=True)
         experts.side_effect = lambda states, unused_indices, unused_weights: torch.zeros_like(states)
         module = SimpleNamespace(
@@ -544,7 +558,9 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
         images = torch.tensor([[False, True, False, True], [True, False, True, False]])
         valid = torch.tensor([[True, True, False, True], [True, False, True, True]])
         ids = torch.tensor([[0, 0, 1, 1], [2, 2, 3, 3]])
-        compute = deepseek_v41_megamoe_compute_fn(module=module, mesh=mesh, tp_mesh=tp, cp_mesh=cp, ep_mesh=ep)
+        compute = deepseek_v41_megamoe_compute_fn(
+            module=module, mesh=mesh, tp_mesh=tp, cp_mesh=cp, ep_mesh=ep, fix_router=fixed,
+        )
         compute(module, states, image_mask=images, router_token_mask=valid,
                 router_sequence_ids=ids, router_num_sequences=4)
         actual = router.call_args.kwargs
@@ -555,6 +571,9 @@ class TestV41MegaMoeAuxLoss(unittest.TestCase):
         self.assertEqual(actual["num_sequences"], 4)
         self.assertEqual(actual["sequence_partition_groups"], (cp.get_group(), tp.get_group()))
         self.assertEqual(router.expert_bias_update_groups, (dp.get_group(), cp.get_group(), tp.get_group()))
+        expected_indices = torch.tensor([[0, 2], [1, 3], [0, 2], [1, 3]]) if fixed else torch.zeros(4, 2).long()
+        torch.testing.assert_close(experts.call_args.args[1], expected_indices)
+        self.assertIs(experts.call_args.args[2], router.return_value[1])
 
 
 class _RouterCarrier(DeepseekV4SparseMoeBlock):
