@@ -10,6 +10,7 @@
 #include "cycle_trace_recorder.h"
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
+#include "l1_tensor_dump.h"
 
 namespace MulticoreRuntime {
 
@@ -23,10 +24,10 @@ namespace MulticoreRuntime {
 template <typename Derived>
 class AivPipelineWorkerBase {
  public:
-  __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtime_config, GM_ADDR profile_buffer) {
+  __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtime_config, GM_ADDR diagnostic_buffer) {
     worker_id_ = worker_id;
     runtime_config_ = runtime_config;
-    profile_buffer_ = profile_buffer;
+    diagnostic_buffer_ = diagnostic_buffer;
     task_capacity_ = getRuntimeTaskCapacity(runtime_config);
     stage_count_ = static_cast<uint32_t>(
       getTaskIndexNumByTaskType(runtime_config, TaskAiCoreType::TASK_AICORE_VECTOR));
@@ -34,6 +35,14 @@ class AivPipelineWorkerBase {
   }
 
   __aicore__ inline void Process() {
+    if (getDiagnosticMode(runtime_config_) == DiagnosticMode::NORMAL) {
+      ProcessFast();
+      return;
+    }
+    if (getDiagnosticMode(runtime_config_) == DiagnosticMode::TENSOR_DUMP_L1) {
+      ProcessL1Dump();
+      return;
+    }
     if (isCycleProfileEnabled(runtime_config_)) {
       ProcessProfiled();
       return;
@@ -42,6 +51,18 @@ class AivPipelineWorkerBase {
   }
 
  protected:
+  __aicore__ inline void ProcessL1Dump() {
+    GM_ADDR parameters[Derived::DIAGNOSTIC_PARAMETER_COUNT] = {};
+    static_cast<Derived *>(this)->PopulateDiagnosticInputList(parameters);
+    for (uint32_t stage = 0; stage < stage_count_; ++stage) {
+      const uint32_t task_id = LoadTaskId(stage);
+      CaptureL1TaskTensors(diagnostic_buffer_, parameters, task_id, L1_DUMP_PHASE_BEFORE, worker_id_);
+      ExecuteTask(task_id);
+      AscendC::PipeBarrier<PIPE_ALL>();
+      CaptureL1TaskTensors(diagnostic_buffer_, parameters, task_id, L1_DUMP_PHASE_AFTER, worker_id_);
+    }
+  }
+
   __aicore__ inline void ProcessFast() {
     for (uint32_t stage = 0; stage < stage_count_; ++stage) {
       const uint32_t task_id = LoadTaskId(stage);
@@ -51,7 +72,7 @@ class AivPipelineWorkerBase {
 
   __aicore__ inline void ProcessProfiled() {
     CycleTraceRecorder recorder;
-    recorder.Init(worker_id_, profile_buffer_, getAicProfileRecordCapacity(runtime_config_),
+    recorder.Init(worker_id_, diagnostic_buffer_, getAicProfileRecordCapacity(runtime_config_),
                   getAivProfileRecordCapacity(runtime_config_));
     for (uint32_t stage = 0; stage < stage_count_; ++stage) {
       const uint32_t task_id = LoadTaskId(stage);
@@ -82,7 +103,7 @@ class AivPipelineWorkerBase {
   uint32_t stage_count_ = 0;
   __gm__ uint8_t *runtime_config_ = nullptr;
   __gm__ int32_t *task_ids_ = nullptr;
-  GM_ADDR profile_buffer_ = nullptr;
+  GM_ADDR diagnostic_buffer_ = nullptr;
 };
 
 }  // namespace MulticoreRuntime

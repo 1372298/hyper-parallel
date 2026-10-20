@@ -16,13 +16,13 @@ constexpr uint32_t kRouteStageCount = 10;
 
 class RoutePipelineWorker : public MulticoreRuntime::AivPipelineWorkerBase<RoutePipelineWorker> {
  public:
-  __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtime_config, GM_ADDR profile_buffer,
+  __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtime_config, GM_ADDR diagnostic_buffer,
                               __gm__ float *logits, __gm__ float *text_bias, __gm__ float *vision_bias,
                               __gm__ bool *image_mask, __gm__ float *routing_weights, __gm__ int64_t *expert_indices,
                               __gm__ float *route_scores, __gm__ float *selected_scores,
                               __gm__ float *normalization_denominator, GM_ADDR user_workspace,
                               const HyperMegaGateRouteTilingData &tiling_data, uint64_t first_row, uint32_t row_count) {
-    MulticoreRuntime::AivPipelineWorkerBase<RoutePipelineWorker>::Init(worker_id, runtime_config, profile_buffer);
+    MulticoreRuntime::AivPipelineWorkerBase<RoutePipelineWorker>::Init(worker_id, runtime_config, diagnostic_buffer);
     route_.Init(logits, text_bias, vision_bias, image_mask, tiling_data.useVisionBias != 0, routing_weights,
                 expert_indices, route_scores, selected_scores, normalization_denominator, user_workspace,
                 tiling_data.expertCount, tiling_data.topK, tiling_data.routedScalingFactor, tiling_data.batchRows,
@@ -73,6 +73,11 @@ class RoutePipelineWorker : public MulticoreRuntime::AivPipelineWorkerBase<Route
     }
   }
 
+  static constexpr uint32_t DIAGNOSTIC_PARAMETER_COUNT = 11;
+  __aicore__ inline void PopulateDiagnosticInputList(GM_ADDR *parameters) {
+    route_.PopulateDiagnosticInputList(parameters);
+  }
+
  private:
   HyperMegaGate::RoutePipeline route_;
 };
@@ -81,7 +86,7 @@ class RoutePipelineWorker : public MulticoreRuntime::AivPipelineWorkerBase<Route
 
 extern "C" __global__ __aicore__ void hyper_mega_gate_route(GM_ADDR logits, GM_ADDR text_bias, GM_ADDR vision_bias,
                                                             GM_ADDR image_mask, GM_ADDR runtime_config,
-                                                            GM_ADDR profile_buffer, GM_ADDR routing_weights,
+                                                            GM_ADDR diagnostic_buffer, GM_ADDR routing_weights,
                                                             GM_ADDR expert_indices, GM_ADDR route_scores,
                                                             GM_ADDR selected_scores, GM_ADDR normalization_denominator,
                                                             GM_ADDR workspace, GM_ADDR tiling) {
@@ -106,7 +111,8 @@ extern "C" __global__ __aicore__ void hyper_mega_gate_route(GM_ADDR logits, GM_A
       MulticoreRuntime::getTaskIndexNumByTaskType(runtime, MulticoreRuntime::TaskAiCoreType::TASK_AICORE_VECTOR) !=
         static_cast<int32_t>(kRouteStageCount) ||
       required_runtime_bytes > tiling_data.runtimeConfigBytes ||
-      (MulticoreRuntime::isCycleProfileEnabled(runtime) && required_profile_bytes > tiling_data.profileBufferBytes)) {
+      (MulticoreRuntime::isCycleProfileEnabled(runtime) &&
+       required_profile_bytes > tiling_data.diagnosticBufferBytes)) {
     Trap();
   }
 
@@ -122,7 +128,7 @@ extern "C" __global__ __aicore__ void hyper_mega_gate_route(GM_ADDR logits, GM_A
   }
 
   RoutePipelineWorker worker;
-  worker.Init(worker_id, runtime, profile_buffer, reinterpret_cast<__gm__ float *>(logits),
+  worker.Init(worker_id, runtime, diagnostic_buffer, reinterpret_cast<__gm__ float *>(logits),
               reinterpret_cast<__gm__ float *>(text_bias), reinterpret_cast<__gm__ float *>(vision_bias),
               reinterpret_cast<__gm__ bool *>(image_mask), reinterpret_cast<__gm__ float *>(routing_weights),
               reinterpret_cast<__gm__ int64_t *>(expert_indices), reinterpret_cast<__gm__ float *>(route_scores),

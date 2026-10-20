@@ -17,7 +17,7 @@ class HyperMegaGateRouteGrad : public OpDef {
     this->Input("route_scores").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
     this->Input("expert_indices").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
     this->Input("runtime_config").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
-    this->Input("profile_buffer").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
+    this->Input("diagnostic_buffer").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
     this->Output("selected_score_grad").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
     this->Output("zero_score_grad").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
     this->Attr("top_k").AttrType(REQUIRED).Int();

@@ -129,6 +129,12 @@ class RouteGradPipeline : private TokenRowPipeline {
     InitRows(worker_id, tiling.tokenCount, tiling.rowsPerWorker, tiling.batchRows);
   }
 
+  __aicore__ inline void PopulateDiagnosticInputList(GM_ADDR *parameters) {
+    parameters[0] = reinterpret_cast<GM_ADDR>(selected_scores_);
+    parameters[1] = reinterpret_cast<GM_ADDR>(denominator_);
+    parameters[2] = reinterpret_cast<GM_ADDR>(grad_weights_);
+  }
+
   __aicore__ inline void MulsScaleGrad() {
     if (top_k_ == 1) {
       RunUnaryMuls(grad_weights_, selected_score_grad_, scaling_);

@@ -39,111 +39,80 @@ kernel 的开始、结束和总耗时，但无法直接回答以下问题：
 
 ## 2. 总体架构
 
-### 2.1 分层
+### 2.1 并列工具与公共层
 
-| 层次 | 主要文件 | 职责 |
-|------|----------|------|
-| 公共 API | `core/multicore/profiler/__init__.py` | 对外重导出 schedule、context 和 merge 统一入口 |
-| Torch session | `core/multicore/profiler/profiler.py` | active session、快慢配置选择、普通显存 buffer 池、D2H 和窗口导出 |
-| Host profiling runtime | `core/multicore/profiler/profiling.py` | 容量计算、SoC 频率、buffer 解析和 Chrome Trace 构造 |
-| 图与 Kernel 语义 | `scheduler/graph.py`、`modules/<kernel>/profiling.py` | 节点展示名、task 范围和可选 owner 规则 |
-| MegaMoe 调用链 | `modules/mega_moe/plan.py`、`function.py` | 准备双 RuntimeConfig，并在正反向 launch 前接入 session |
-| Host/Device ABI | `scheduler/config.py`、`ops/runtime/runtime_config.hpp` | 固定宽度配置和 task profiling 元数据 |
-| Device recorder | `ops/runtime/cycle_trace_recorder.h` | 每核 header、record 和 dropped 计数 |
-| Device worker | `ops/runtime/worker_kernel.h` | 快慢路径分流及 wait/compute/trigger 采样 |
-| 离线融合 | `core/multicore/profiler/trace_merger.py` | invocation 分组、外层 kernel 选择、时间对齐和诊断报告 |
+profiling 与 L0/L1 dump 同属于 `diagnostics`，通过协议与组合接入，不相互继承或调用：
+
+```text
+diagnostics/
+├── api.py                       # prepare / MegaKernelDiagnostics.launch
+├── common/
+│   ├── graph.py                 # 通用图契约与只读 task/stage/owner metadata
+│   ├── runtime.py               # 普通 runtime 与惰性 metadata
+│   ├── call.py                  # 完整 LaunchArguments 与完成/取消边界
+│   ├── session.py               # DiagnosticSession 协议、进程互斥
+│   └── schedule.py              # DiagnosticAction、schedule
+├── profiler/
+│   ├── api.py                   # profiling session、buffer 池、pending、窗口
+│   ├── cycle_trace.py           # profiler 私有配置、容量、解析
+│   └── trace_merger.py           # 离线融合
+└── dump/                        # 独立的 L0/L1 工具；不导入 profiler
+```
+
+依赖方向是 `profiler → common ← dump`；公共层不导入具体工具或 MegaMoe。
+`modules/<kernel>/diagnostics.py` 提供业务 owner 规则，动态 Tensor 视图 resolver 留在业务自己的
+`tensor_dump.py`。通用 profiler 不认识 Expert、GMM 或 MoE 路由。
 
 ### 2.2 数据流
 
 ```text
-RuntimeConfig builder
-    ├─ ComputeGraph 拓扑顺序 + op.task_num ─► task 的阶段 ID / Host 展示名
-    ├─ normal RuntimeConfig: cycle_profiling_enabled = 0
-    └─ profiled RuntimeConfig: enable = 1 + AIC/AIV capacity
-                              │
-                              ▼
-MegaMoe forward / backward launch
-    └─ prepare_mega_kernel_call(direction)
-        ├─ no active capture ─► normal RuntimeConfig + graph-sized event workspace
-        │                        └─ Device fast path；不申请/读取 profile buffer
-        └─ active capture ────► profiled RuntimeConfig
-                                + per-invocation ordinary NPU profile_buffer
-                                           │
-                                           ▼
-                                Device direct-writes cycle records
-                                           │
-                         step/window boundary or pending limit
-                                           ▼
-                              NPU synchronize + direct D2H + parse
-                                           │
-                         ┌─────────────────┴─────────────────┐
-                         ▼                                   ▼
-                 standalone trace JSON             merge with outer trace
+plan：只创建 normal RuntimeConfig image
+    │
+每次调用检查 diagnostics.is_active
+    ├─ False：直接调用原 native wrapper → mode=0 → ProcessFast
+    └─ True：通用 launch → 唯一活动 session.prepare_call(context)
+                               │
+                   profiler 首次使用该 plan：
+                   公共 metadata（惰性、只读）
+                       → 私有 Host cfg：trace ID/owner + AIC/AIV capacity
+                       → 私有 Device image：mode=1
+                               │
+                   per-invocation diagnostic_buffer
+                               │
+                   Device cycle records
+                               │
+                   step/window/pending limit：
+                   NPU synchronize → D2H → parse
+                               │
+                   独立 trace → 可选离线 merge
 ```
 
-MegaMoe 正反向在 launch 前调用公共内部适配器。Profiler hook 根据当前 session 选择本次 launch 的
-RuntimeConfig，并在采集开启时取得内部 `profile_buffer`；调度 event workspace 仍沿用原有按图容量分配的
-对称内存。
-这些参数只穿过内部 native 调用链，不改变 `MegaMoeExperts` 等业务接口。
-
-### 2.3 目录关系
-
-```text
-hyper_parallel/
-├── core/multicore/
-│   ├── profiler/
-│   │   ├── __init__.py
-│   │   ├── profiler.py
-│   │   ├── profiling.py
-│   │   └── trace_merger.py
-│   ├── scheduler/config.py
-│   ├── scheduler/graph.py
-│   ├── modules/mega_moe/
-│   │   ├── forward/graph.py
-│   │   ├── backward/graph.py
-│   │   ├── profiling.py
-│   │   ├── plan.py
-│   │   └── function.py
-│   └── ops/runtime/
-│       ├── runtime_config.hpp
-│       ├── cycle_trace_recorder.h
-│       └── worker_kernel.h
-tests/
-├── ut/core/multicore/
-│   ├── test_profiling.py
-│   ├── test_torch_mega_kernel_profiler.py
-│   └── test_trace_merger.py
-└── torch/expert_parallel/
-    ├── test_mega_moe_profiling.py
-    └── _test_mega_moe_profiling.py
-```
+每次只产生当前工具的一个句柄；不存在先准备 profile handle 再叠加或覆盖 dump 的过程。
+共享的是 `diagnostic_buffer` ABI 参数位置，而不是同时写入同一内存。
+两个工具的 session 当前互斥，均不改变业务 event counter、ready handshake、workspace 或 autograd 租约。
 
 ---
 
 ## 3. RuntimeConfig 与调用生命周期
 
-### 3.1 双配置模型
+### 3.1 普通配置与工具私有派生配置
 
-每个 shape-specific plan 保留普通配置，并按需准备开启 profiling 的配置：
+| 配置 | 准备时机 | 关键内容 |
+|---|---|---|
+| normal | plan 构造 | diagnostic_mode=0；原有 task/queue 数据 |
+| profiler 私有配置 | 首次选中 WARMUP/RECORD/RECORD_AND_SAVE | diagnostic_mode=1；trace ID、owner 与每核容量 |
+| L1 dump 私有配置 | 每次选中 L1 调用 | diagnostic_mode=2；不使用 profiler 的 trace ID/容量 |
 
-| 配置 | 用途 | 关键字段 |
-|------|------|----------|
-| normal RuntimeConfig | context 外、`NONE` action 和关闭态快路径 | `cycle_profiling_enabled = 0` |
-| profiled RuntimeConfig | `WARMUP`、`RECORD`、`RECORD_AND_SAVE` | enable 为 1，并写入 AIC/AIV 容量 |
+`prepare_mega_kernel_diagnostics()` 保存完整 Host 配置并创建一个普通 image，
+不解析诊断 metadata、不执行 resolver、不计算 profile layout。
+关闭或 action=NONE 时，业务直接走普通 wrapper，不进入 diagnostic launch，不创建诊断句柄。
 
-两个配置按以下时机创建和使用：
+首次选中 profiler 时，`_PreparedProfileRuntime` 复制 Host 配置，在副本中编码 trace 描述符、owner，
+计算容量并上传独立的 profile image。普通 Host/Device 配置均保持不变。
+session 按公共 runtime 对象缓存 profiler 配置，退出时释放该 session 的缓存。
 
-1. 构造 MegaMoe plan 时，只把 `cycle_profiling_enabled` 设为 0 的 RuntimeConfig 序列化成
-   `normal_tensor`；此时 `profile_tensor` 还不存在。
-2. 第一次执行 `WARMUP`、`RECORD` 或 `RECORD_AND_SAVE` action 时，
-   `prepare_mega_kernel_call()` 首次访问 `profile_tensor`。该属性复制一份 `normal_tensor`，只把副本中的
-   enable 字段改为 1，并缓存这份开启版供后续采集调用复用。
-3. profiler context 外或 action 为 `NONE` 时始终选择 `normal_tensor`；采集 action 才选择
-   `profile_tensor`。
-
-`normal_tensor` 在整个 plan 生命周期内保持关闭且不再修改，`profile_tensor` 作为独立副本按需创建。正反向 launch
-均通过 `prepare_mega_kernel_call()` 根据当前 schedule action 取得本次调用所需的 RuntimeConfig。这样 action 可在普通
-执行与采集之间切换，同时避免不同调用共享可变的 enable 状态；profiling context 结束后的普通调用会继续使用关闭配置。
+公共 owner 是 `GraphDiagnosticMetadata.task_owner_ids`；`profile_owner_id` 只是 profiler 在私有配置中的
+Device 编码，dump 不读取它。动态视图 resolver 和 dump 目录校验不会进入 profiler 准备路径。
 
 ### 3.2 Schedule 状态机
 
@@ -165,7 +134,7 @@ MegaMoe workspace 中正向、反向各保留一块按图容量分配的对称 `
 EP 大于 1 时，尾部还保存跨调用持续递增的 ready generation。每次 launch 只清零计数器前缀，不破坏 ready
 generation。
 进入采集 action 后，Torch profiler 按 `(device_id, buffer_size)` 从 session 私有池取得普通 NPU
-`profile_buffer`。每个尚未 drain 的 invocation 独占一块 buffer，因此同一 step 的多层正反向调用不会互相
+`diagnostic_buffer`。每个尚未 drain 的 invocation 独占一块 buffer，因此同一 step 的多层正反向调用不会互相
 覆盖；Device 直接把 record 写入最终 buffer，不再创建 D2D snapshot。
 
 D2H 和解析只发生在：
@@ -190,7 +159,7 @@ Python `RuntimeConfigC` 与 AscendC `RuntimeHeader` 必须保持 64 Byte 固定�
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `cycle_profiling_enabled` | `uint32` | 当前 launch 是否进入采样路径 |
+| `diagnostic_mode` | `uint32` | 0=普通/L0，1=profiling，2=L1 dump |
 | `aic_profile_record_capacity` | `uint32` | 每个 AIC worker 的 record 容量 |
 | `aiv_profile_record_capacity` | `uint32` | 每个 AIV worker 的 record 容量 |
 
@@ -216,7 +185,7 @@ all_event_counters（按图容量分配的对称内存）
 ├── scheduler event counters
 └── ready generation tail（EP > 1）
 
-profile_buffer（普通 NPU 显存，仅采集 action 分配）
+diagnostic_buffer（普通 NPU 显存，仅采集 action 分配）
 ├── AIC slot 0
 │   ├── 64-byte core header
 │   └── N × 32-byte records
@@ -226,10 +195,12 @@ profile_buffer（普通 NPU 显存，仅采集 action 分配）
 
 每个 AIC/AIV worker 拥有独立 slot，避免全局 record allocator 和原子抢占。core header 保存 entry cycle、
 有效/丢弃数量、core 类型、block ID 和容量；record 保存起止 cycle、`desc_id`、`task_id`、
-`stage_task_index` 和 `owner_id`。profile slot 从 `profile_buffer` 的 offset 0 开始，不占用 symmetric
+`stage_task_index` 和 `owner_id`。profile slot 从 `diagnostic_buffer` 的 offset 0 开始，不占用 symmetric
 heap。
 
-`profile_buffer` 是内部 native ABI 输入：正反向 OpProto、OpDef、ACLNN GetWorkspaceSize、L0 和 Device
+`diagnostic_buffer` 是 profiling 与 L1 Tensor dump 平等使用的公共诊断入参；当前两种工具的 session 互斥。
+profiling 模式写入 cycle trace，L1 dump 模式写入 Tensor 快照，普通执行与 L0 dump 不读取其诊断内容。
+它通过内部 native ABI 传递：正反向 OpProto、OpDef、ACLNN GetWorkspaceSize、L0 和 Device
 kernel 的输入列表都显式传递它，但 Python 公共 `mega_moe()`、`mega_moe_grad()` 和
 `MegaMoeExperts` 签名保持不变。普通调用通过私有 adapter 补齐参数；profiling 关闭时用原
 `all_event_counters` 作为未读取的占位 tensor，不产生新的申请、切片或数据搬运。
@@ -259,18 +230,18 @@ duration_us  = (end_cycle - start_cycle) / cycle_frequency_mhz
 ```
 
 当前内部频率映射支持 Ascend 910B/910C/910_93 系列，A2/A3 使用 50 MHz。SoC 名称来自
-`torch_npu.npu.get_device_name()`；未知型号会在开启 RuntimeConfig 前显式失败，不接受用户从前端传入猜测值。
+`torch_npu.npu.get_device_name()`；未知型号会在解析采集结果时显式失败，不接受用户从前端传入猜测值。
 
 ### 4.5 关闭态快路径
 
-worker 在 `Process()` 入口读取一次 enable 字段，并在进入任务循环前选择快慢实现。关闭路径具有以下约束：
+worker 在 ready handshake 之后、`Process()` 的任务循环之前读取 `DiagnosticMode`，并在进入任务循环前选择快慢实现。关闭路径具有以下约束：
 
 - 不读取 system cycle；
 - 不执行 profiling barrier；
 - 不写 core header 或 record；
 - 不读取 `profile_desc_id` / `profile_owner_id`；
 - 只清零 `all_event_counters` 的调度计数器前缀，保留 ready generation 尾部；
-- 不申请普通 NPU `profile_buffer`，也不创建 event-counter view；内部占位参数不会被 Device 读取。
+- 不申请普通 NPU `diagnostic_buffer`，也不创建 event-counter view；内部占位参数不会被 Device 读取。
 
 这样可避免把 profiling 判断放进每个 task 的热循环。
 
@@ -336,27 +307,25 @@ task 仍使用 task type 兜底名称。
 
 MegaMoe 的阶段顺序和 TaskDesc 区间直接取自生成 RuntimeConfig 的正反向 `ComputeGraph`。每个
 `OperatorNode` 可就地设置 `diagnostic_name`；GMM1、GMM2、DispatchGrad 等业务名称与对应算子定义放在
-一起。通用 Host 逻辑在 task 构造和调度修订完成后按拓扑顺序扫描图，自动写入 descId，并保存 Host-only
-展示 metadata，不再通过 `task_type`、tiling position 或 input position 反向猜测阶段。
+一起。公共 metadata 在首次采集时按拓扑顺序解析；profiler 将 descId 写入自己的配置副本，不再通过 `task_type`、tiling position 或 input position 反向猜测阶段。
 
-`modules/mega_moe/profiling.py` 只保留 `Expert` owner label 和全局 expert ID resolver。resolver 同时接收
+`modules/mega_moe/diagnostics.py` 只保留 `Expert` owner label 和全局 expert ID resolver。resolver 同时接收
 `OperatorNode` 与其 TaskDesc，因此 Dispatch/Combine 等同类型算子可按节点身份区分。公共 GMM、SwiGLU 和
 AllToAll task builder 不写 MegaMoe owner，模型用户也无需传阶段名、rank、device 或 RuntimeConfig。
 
 ### 6.4 正反向 launch 接入
 
-Profiling 接入点为：
-
 ```text
 _MegaMoeFunction.forward / backward
-    └── prepare_mega_kernel_call(runtime, direction, event_counters)
-        ├── 当前 session 不采集 ──► normal RuntimeConfig + ABI placeholder
-        └── WARMUP / RECORD ─────► profiled RuntimeConfig + private profile_buffer
+    ├─ diagnostics.is_active=False → 原 mega_moe/mega_moe_grad wrapper
+    └─ True → diagnostics.launch(runtime ABI parameters, direction, events)
+                → profiler.prepare_call → 完整 profile 参数
+                → native wrapper_with_diagnostic_buffer
+                → complete / 异常 cancel
 ```
 
-`direction` 区分正反向 invocation。成功 launch 后调用 handle 的 `complete()` 完成 pending 记账；
-Device 已直接写入该调用独占的 buffer，不需要再复制。异常路径调用 `cancel()` 撤销 pending 状态并释放
-buffer。模型调用方无需传 profiling 参数。
+`direction` 区分正反向 invocation。成功 launch 后句柄标记完成，Device 直接写入本次独占的 buffer，
+无需 D2D snapshot；drain 才同步与回读。异常取消只撤销本次 profiling 状态，模型用户无需传诊断参数。
 
 ---
 
@@ -365,15 +334,17 @@ buffer。模型调用方无需传 profiling 参数。
 ### 7.1 导入
 
 ```python
-from hyper_parallel.core.multicore import profiler as multicore_profiler
+from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler
 ```
 
-`core.multicore.profiler` 延迟加载 Torch backend，公共 `core/` 不直接导入 Torch。
+具体工具从 `diagnostics.profiler` 导入；公共 `diagnostics` 不导入工具。项目为 Torch-only，不设 backend 分派。
 
-### 7.2 schedule
+### 7.2 公共 schedule
 
 ```python
-multicore_profiler.schedule(
+from hyper_parallel.core.multicore.diagnostics import schedule
+
+schedule(
     *,
     wait: int,
     warmup: int,
@@ -383,7 +354,7 @@ multicore_profiler.schedule(
 )
 ```
 
-所有参数必须是非负整数，且 `active > 0`。返回对象接受零起始 step 并产生 `ProfilerAction`。
+所有参数必须是非负整数，且 `active > 0`。返回对象接受零起始 step 并产生 `DiagnosticAction`。
 
 ### 7.3 mega_kernel_profile
 
@@ -548,10 +519,10 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore import profiler as multicore_profiler
+from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler, schedule as diagnostic_schedule
 
 rank = dist.get_rank()
-schedule = multicore_profiler.schedule(wait=0, warmup=0, active=1, repeat=1)
+schedule = diagnostic_schedule(wait=0, warmup=0, active=1, repeat=1)
 
 with torch.no_grad():
     # Context 外使用相同 shape 做真实 warmup。
@@ -578,7 +549,9 @@ NPU synchronize 和 barrier，能够避免启动偏差被误认为 kernel 内部
 ### 10.2 训练窗口
 
 ```python
-capture_schedule = multicore_profiler.schedule(
+from hyper_parallel.core.multicore.diagnostics import schedule as diagnostic_schedule
+
+capture_schedule = diagnostic_schedule(
     skip_first=5,
     wait=1,
     warmup=1,
@@ -604,6 +577,7 @@ profiler.export_chrome_trace(f"rank{rank}_train_trace.json")
 
 ```python
 from pathlib import Path
+from hyper_parallel.core.multicore.diagnostics import schedule as diagnostic_schedule
 
 
 def on_trace_ready(profiler):
@@ -612,7 +586,7 @@ def on_trace_ready(profiler):
 
 
 with multicore_profiler.mega_kernel_profile(
-    schedule=multicore_profiler.schedule(wait=1, warmup=1, active=2, repeat=3),
+    schedule=diagnostic_schedule(wait=1, warmup=1, active=2, repeat=3),
     on_trace_ready=on_trace_ready,
 ) as profiler:
     for batch in data_loader:
@@ -629,7 +603,7 @@ msprof --output=/path/to/dump python your_program.py
 找到当前 rank/device 对应的原生 `trace.json` 后执行：
 
 ```python
-from hyper_parallel.core.multicore import profiler as multicore_profiler
+from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler
 
 multicore_profiler.merge_chrome_traces(
     "/path/to/dump/.../trace.json",
@@ -658,14 +632,15 @@ multicore_profiler.merge_chrome_traces(
 1. 使用同一份 `ComputeGraph` 按拓扑顺序构造 RuntimeConfig task，并保证每个节点的 `task_num` 与实际连续
    TaskDesc 区间一致；
 2. 在需要自定义名称的 `OperatorNode` 上填写 `diagnostic_name`；其余节点直接复用 `name`；
-3. 需要 owner 时，在 `modules/<kernel>/profiling.py` 实现接收节点、TaskDesc 和 topology 的 resolver；
+3. 需要 owner 时，在 `modules/<kernel>/diagnostics.py` 实现接收节点、TaskDesc 和 topology 的 resolver；
    不属于任何 owner 的节点返回 `None`；
-4. 在 RuntimeConfig builder 完成全部 task 和调度修订后调用一次
-   `_apply_mega_kernel_profile_graph()`；
-5. 在 plan 中用 `_prepare_mega_kernel_runtime_config()` 准备 normal/profiled 配置和 Host metadata；
-6. 在内部 OpProto、OpDef、ACLNN、L0、Device kernel 和框架 adapter 中贯通 `profile_buffer` 输入，但保持
+4. RuntimeConfig builder 只生成普通执行的 task/queue，不写诊断字段；
+5. 在 plan 中调用 `prepare_mega_kernel_diagnostics(graph, runtime_config, ...)`，可显式调用
+   `validate_mega_kernel_diagnostic_contract()` 检查图/task/ABI；诊断 metadata 与 profile image 自动惰性准备；
+6. 在内部 OpProto、OpDef、ACLNN、L0、Device kernel 和框架 adapter 中贯通 `diagnostic_buffer` 输入，但保持
    模型用户接口不变；
-7. 在正反向 launch 前调用 `prepare_mega_kernel_call()`，成功后 `complete()`，异常路径 `cancel()`；
+7. 正反向先检查 `diagnostics.is_active`；关闭时直接走原 wrapper，开启时通过
+   `with diagnostics.launch(...)` 提供完整参数并管理完成/取消；
 8. 增加布局、metadata、Torch session、导出、merge 和真实 NPU 测试。
 
 图节点是阶段身份的唯一来源，不再另建 TaskDesc 字段匹配表。若某个 builder 不能保证“按图拓扑顺序、每个
@@ -684,6 +659,85 @@ multicore_profiler.merge_chrome_traces(
 - 单元测试、NPU 完整性断言和本文档。
 
 结构性变更必须升级相应 schema，不得让旧解析器静默接受不兼容布局。
+
+---
+
+### 11.4 Native ABI 与广播队列
+
+只有调度依赖、在 C++ 内硬编码 Tensor 地址的 MegaKernel，可通过 `graph_adapter` 惰性补充真实端口。
+回调放在 `modules/<kernel>/diagnostics.py`，接收原图和私有 Host 配置，返回诊断图；不能修改原图或普通
+Device 配置。`bind_graph_tensor_ports()` 在图副本上设置 `diagnostic_host_ports`，此时端口来自 Host 描述，
+不受 `TaskDesc.inputs/outputs` 各 4 项的序列化容量限制，也不会改写计算使用的 TaskDesc。
+这些端口可用 `shape=[]`、`is_dynamic=True` 表示形状在调用时解析；导出文件的实际维度以 `actualShape`
+和 `storedShape` 为准。导出 rank 使用 job-global rank，MoE 的 Expert ID/路由计算仍使用 EP 组内 rank，
+二者通过业务 `owner_context` 区分，避免多个并行组都写入 `rank_0`。
+
+普通队列以 `execution_mode="event_driven"` 接入；MoE 配对 AIV worker 使用 `vector_worker_stride=2`，
+MHC 全 AIV worker 使用 `vector_worker_stride=1`。MegaGate 使用 `execution_mode="aiv_pipeline"`：每个
+worker 在自己的 token 行分片上执行同一组 task ID，没有调度事件。Profiler 按完整阶段序列计算每核容量；
+L1 按 `(task_id, worker_id)` 分配 record/slot，并由 Device 检查 worker ID，防止不同核写入同一份快照。
+广播目录使用 `task_<id>_worker_<id>`，普通队列仍使用 `task_<id>`。
+
+MHC 在 Torch wrapper 分配原有输出之后、发射之前绑定真实 ABI Tensor。MegaGate 正向在诊断开启时通过
+`mega_gate_route_out` 预分配同样的 5 个输出；关闭时仍调用原 native wrapper。地址列表只在 Device L1 分支
+临时构造，不给普通 worker 增加诊断地址数组或初始化工作。
+
+| MegaKernel | L0 | L1 范围与边界 |
+|---|---|---|
+| MegaMoe | 按图采集调用前输入和调用后结果 | 动态 Expert/token 视图；pull 可采本地接收输出，不可将远端来源当作本地输入；GMM 协作输出改选已满足依赖的下游输入 |
+| HyperMegaMhc | 真实 ABI 端口，而非调度图的工作区别名 | 支持连续 token tile；不把 CANN 环形 X-cast 工作区冒充 `hc_before_norm`，不暴露迭代优先布局的非连续 Sinkhorn cache |
+| HyperMegaMhcGrad | 包括完成归约后的参数梯度 | 支持 token 局部输入/输出；多核协作累加的参数梯度只允许 L0，L1 必须筛选安全端口 |
+| MegaGate Route | logits、bias、mask 和 5 个 native 结果 | 按真实 AIV 行分片采集可寻址的 GM 端口；内部 CANN 工作区不作为普通 Tensor 暴露 |
+| MegaGate RouteGrad | 包括 ACLNN 后处理完成的 `grad_logits` | 采集 MegaKernel 内可寻址的输入；scatter/sqrt/softplus 后处理不是该 task 序列，最终梯度只属于 L0 |
+
+RouteGrad 的后处理由一个 `task_num=0` 的 Host 边界节点描述。它可参加 L0 的来源/去向整理，但没有 Device
+task ID，不生成 L1 record，也不会在 timeline 中伪造一个不存在的 MegaKernel task。
+
+### 11.5 Tensor dump 的使用与存储
+
+```python
+from hyper_parallel.core.multicore.diagnostics import dump, schedule
+
+config = dump.TensorDumpConfig("./dump", level="L0")
+with dump.tensor_dump(config, schedule=schedule(wait=0, warmup=0, active=1, repeat=1)) as dumper:
+    output = model(inputs)
+    dumper.step()
+```
+
+L0 在每次选中的 native 调用之前复制外部输入，在调用完成之后复制中间/最终结果，不等整个模型结束才读取
+原 Tensor。快照是独立 CPU `torch.Tensor`，由 dumper 的窗口调用记录持有；窗口结束时 `torch.save()` 为
+`.pt`，保留 BF16 等原始 dtype。同一 L0 Tensor 的多个 stage 端口文件使用硬链接。对外只呈现 `stages/`
+和 manifest；`before/after` 是记录采集时机的 metadata，不是必须暴露的目录。较长窗口会累积 CPU 内存，
+目前没有独立 Host 总量预算，应控制 active step、rank、方向和 Tensor 筛选范围。
+每次调用的句柄负责采集或解码其快照，成功后通过完成回调将调用记录交给 dumper；两者不互读私有状态。
+失败时仍由句柄清理本次调用的数据，不向窗口提交半成品。
+L0 保存的是调用边界上的实际存储值，不能还原原地更新或工作区复用前的历史中间值；这类需求应使用安全的
+L1 task 端口，而不是根据 stage 文件名假定每个历史时刻都被保留下来。
+
+L1 通过 `stages`、`task_ids`、`stage_task_indices`、`owner_ids`、`core_types/core_ids`、`tensor_names`
+及 `io` 选择采集对象。静态图使用默认视图；动态或硬编码地址语义由业务 resolver 在每次 Kernel 发射前返回
+`L1TensorView(source_offset_bytes, shape)`。Host 校验真实 ABI Tensor 的 dtype、连续性、完整范围后，
+再执行可选截断和 payload 分配；Device 不执行 Python resolver。
+静态连续切片会根据源偏移裁剪尾块；默认路径不把跨行的内维切片误当作连续字节段。此类非连续范围需要
+业务 resolver 明确选择可复制的连续范围，不能仅改变 shape 后直接复制。
+
+L1 Device buffer 使用版本 2：
+
+```text
+[0, 32)       Header：版本、有效条数、区域偏移和总大小
+[32, 64)      对齐填充
+[64, 262208)  Record table：4096 × 64 B，只有 record_count 条有效
+[262208, ...) Payload：每条 record 对应独立 slot，slot 起点按 64 B 对齐
+```
+
+每条 record 的 10 个 uint32 字段描述 task、phase、ABI 源位置/偏移、目标 slot、字节数、状态、task index
+和 worker ID，余下 24 B 对齐填充。record 和 payload slot 不共享写入者的数据缓存行；普通队列使用任意
+worker 标记，广播队列使用具体 worker ID。buffer 随实际 payload 增长，固定 table 大小不是快照容量上限。
+在构造 Host bytearray 和 Device 分配前检查预算（默认单次 512 MiB）及 32 位 buffer ABI 上限。
+
+Device 等待原依赖后采 before，执行计算并完成 barrier 后采 after，最后发布原业务完成事件。采样使用通用
+字节复制和缓存同步；诊断关闭时仍进入原 `ProcessFast`，不会初始化 trace recorder、扫描 record、解析视图、
+分配快照区或进行 D2H。L1 会显著扰动执行时间，不能用开启 L1 时的耗时推断业务性能。
 
 ---
 
@@ -723,17 +777,11 @@ pytest -v tests/torch/multicore/test_mega_moe_profiling.py
 关闭态性能必须比较“完全没有 profiling runtime 的基线”和“包含能力但 schedule action 为 `NONE` 的产物”。
 测试应固定 workload、预热、采样轮数和 rank 聚合方式，并使用预先定义的回退门槛判断，而不是只比较一次均值。
 
-### 12.4 2026-09-09 真实 NPU 回归
+### 12.4 当前回归结果
 
-独立 `profile_buffer` 改造后在 Ascend 910B3 上完成以下验证：
-
-- 34 个定向 UT 和 5 个 subtest 全部通过；
-- Torch multicore 的 Ascend 910B/910_93 正反向 Device kernel、OpProto/OpDef、ACLNN、L0 和 Torch adapter
-  均编译成功；
-- 2-rank 完整正向+反向精度用例和共享资源/交替 stream 用例通过，覆盖 profiling 关闭路径；
-- 2-rank 正向 profiling 每 rank 仍为 1 个 invocation、1411 条事件、0 dropped；
-- 同次 `msprof` 采集中 rank 0/device 6 与 rank 1/device 7 各融合 1411 条内部事件，均未 fallback、无
-  warning，内部 span 未越过外层 Device kernel。
+验收应覆盖各 MegaKernel 的普通正反向结果、Profiler trace 完整性、L0 原始 dtype/硬链接、L1 task/worker
+隔离和 payload 数值，以及失败清理、调用计数器和缓存 plan 的隔离。CPU 模拟的规划/解码测试不能替代 NPU
+执行；功能回归也不替代关闭态性能 A/B。
 
 ---
 

@@ -15,7 +15,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMhcGetWorkspaceSize(
   const aclTensor *previousOutput, const aclTensor *residual, const aclTensor *previousPreMix,
   const aclTensor *previousPostMix, const aclTensor *previousResidualMix, const aclTensor *phi, const aclTensor *alpha,
   const aclTensor *bias, const aclTensor *normWeight, const aclTensor *runtimeConfig, const aclTensor *allEventCounters,
-  const aclTensor *profileBuffer, aclTensor *newResidual, aclTensor *nextPreMix, aclTensor *nextPostMix,
+  const aclTensor *diagnosticBuffer, aclTensor *newResidual, aclTensor *nextPreMix, aclTensor *nextPostMix,
   aclTensor *nextResidualMix, aclTensor *blockInput, aclTensor *hcBeforeNorm, aclTensor *invRms, aclTensor *sumOut,
   aclTensor *normOut, aclTensor *mixedInput, aclTensor *rmsRstd, double hcEps, double normEps, int64_t numIters,
   bool needBackward, uint64_t *workspaceSize, aclOpExecutor **executor);

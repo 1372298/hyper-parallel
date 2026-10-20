@@ -31,7 +31,7 @@ class HyperMegaMhcGrad : public OpDef {
     AddInput("previous_residual_mix", {ge::DT_FLOAT});
     AddInput("runtime_config", {ge::DT_UINT8});
     AddInput("all_event_counters", {ge::DT_UINT8});
-    AddInput("profile_buffer", {ge::DT_UINT8});
+    AddInput("diagnostic_buffer", {ge::DT_UINT8});
     AddOutput("grad_residual", {ge::DT_BF16});
     AddOutput("grad_phi", {ge::DT_FLOAT});
     AddOutput("grad_alpha", {ge::DT_FLOAT});

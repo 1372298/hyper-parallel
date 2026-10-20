@@ -8,13 +8,11 @@
 #include "hyper_mega_mhc_tiling_key.h"
 #include "worker_kernel.cpp"
 
-using namespace AscendC;
-
 template <int8_t MHC_SPLIT_MODE>
 __global__ __aicore__ void hyper_mega_mhc(GM_ADDR residual, GM_ADDR phi, GM_ADDR alpha, GM_ADDR bias,
                                           GM_ADDR previousOutput, GM_ADDR previousPreMix, GM_ADDR previousPostMix,
                                           GM_ADDR previousResidualMix, GM_ADDR normWeight, GM_ADDR runtimeConfig,
-                                          GM_ADDR allEventCounters, GM_ADDR profileBuffer, GM_ADDR newResidualOut,
+                                          GM_ADDR allEventCounters, GM_ADDR diagnosticBuffer, GM_ADDR newResidualOut,
                                           GM_ADDR nextPreMixOut, GM_ADDR nextPostMixOut, GM_ADDR nextResidualMixOut,
                                           GM_ADDR blockInputOut, GM_ADDR hcBeforeNormOut, GM_ADDR invRmsOut,
                                           GM_ADDR sumOutOut, GM_ADDR normOutOut, GM_ADDR mixedInputOut,
@@ -42,7 +40,7 @@ __global__ __aicore__ void hyper_mega_mhc(GM_ADDR residual, GM_ADDR phi, GM_ADDR
     normWeight,
     runtimeConfig,
     allEventCounters,
-    profileBuffer,
+    diagnosticBuffer,
     newResidual,
     nextPreMix,
     nextPostMix,

@@ -21,9 +21,13 @@
 #define ASCEND_IS_AIC constexpr(g_coreType == AscendC::AIC)
 #endif
 
-using namespace AscendC;
-using namespace MhcPreSinkhorn;
-using namespace MulticoreRuntime;
+using MhcPreSinkhorn::MhcPreSinkhornStage1;
+using MhcPreSinkhorn::MhcPreSinkhornStage2;
+using MulticoreRuntime::KernelWorkerBase;
+using MulticoreRuntime::RuntimeStorageBoundsPolicy;
+using MulticoreRuntime::TaskDesc;
+using MulticoreRuntime::TaskType;
+using MulticoreRuntime::VectorWorkerPolicy;
 
 namespace {
 constexpr int64_t POST_HIDDEN_TILE = 2048;
@@ -81,7 +85,7 @@ class KernelWorker
   // Custom input_list layout assembled by hyper_mega_mhc.cpp.
   static constexpr uint32_t TILING_IDX = 24;
   static constexpr uint32_t EVENT_IDX = 10;
-  static constexpr uint32_t PROFILE_IDX = 11;
+  static constexpr uint32_t DIAGNOSTIC_IDX = 11;
   static constexpr uint32_t WORKSPACE_IDX = 23;
   static constexpr uint32_t RUNTIME_BOUNDS_OFFSET = offsetof(HyperMegaMhcLaunchTilingData, runtimeConfigBytes);
 

@@ -27,7 +27,7 @@ RouteGradOutputs HyperMegaGateRouteGradKernel(const aclTensor *selected_scores,
                                               const aclTensor *normalization_denominator,
                                               const aclTensor *grad_routing_weights, const aclTensor *route_scores,
                                               const aclTensor *expert_indices, const aclTensor *runtime_config,
-                                              const aclTensor *profile_buffer, int64_t top_k,
+                                              const aclTensor *diagnostic_buffer, int64_t top_k,
                                               float routed_scaling_factor, aclOpExecutor *executor);
 
 /**
@@ -42,8 +42,9 @@ RouteGradOutputs HyperMegaGateRouteGradKernel(const aclTensor *selected_scores,
 const aclTensor *HyperMegaGateRouteGrad(const aclTensor *logits, const aclTensor *route_scores,
                                         const aclTensor *selected_scores, const aclTensor *normalization_denominator,
                                         const aclTensor *expert_indices, const aclTensor *grad_routing_weights,
-                                        const aclTensor *runtime_config, const aclTensor *profile_buffer, int64_t top_k,
-                                        float routed_scaling_factor, const aclTensor *output, aclOpExecutor *executor);
+                                        const aclTensor *runtime_config, const aclTensor *diagnostic_buffer,
+                                        int64_t top_k, float routed_scaling_factor, const aclTensor *output,
+                                        aclOpExecutor *executor);
 
 }  // namespace l0op
 

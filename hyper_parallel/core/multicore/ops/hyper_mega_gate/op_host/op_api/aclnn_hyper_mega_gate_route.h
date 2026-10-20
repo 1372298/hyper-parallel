@@ -20,7 +20,7 @@ extern "C" {
  * Inputs are borrowed until the returned executor has been launched. logits
  * is contiguous FP32 [tokens, experts]; text_bias and vision_bias are FP32
  * [experts]. image_mask is contiguous BOOL [tokens] when use_vision_bias is
- * true and BOOL [1] otherwise. runtime_config and profile_buffer are borrowed
+ * true and BOOL [1] otherwise. runtime_config and diagnostic_buffer are borrowed
  * contiguous UINT8 vectors on the same device. All five outputs are
  * caller-owned contiguous tensors: routing_weights, selected_scores and
  * expert_indices are [tokens, top_k], route_scores is [tokens, experts], and
@@ -36,7 +36,7 @@ extern "C" {
  */
 ACLNN_API aclnnStatus aclnnHyperMegaGateRouteGetWorkspaceSize(
   const aclTensor *logits, const aclTensor *text_bias, const aclTensor *vision_bias, const aclTensor *image_mask,
-  const aclTensor *runtime_config, const aclTensor *profile_buffer, const aclTensor *routing_weights,
+  const aclTensor *runtime_config, const aclTensor *diagnostic_buffer, const aclTensor *routing_weights,
   const aclTensor *expert_indices, const aclTensor *route_scores, const aclTensor *selected_scores,
   const aclTensor *normalization_denominator, int64_t top_k, double routed_scaling_factor, bool use_vision_bias,
   uint64_t *workspaceSize, aclOpExecutor **executor);

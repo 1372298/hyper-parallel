@@ -249,7 +249,7 @@ ge::graphStatus TilingRouteGrad(gert::TilingContext *context) {
   tiling.set_kAlign(k_align);
   tiling.set_sharedTmpBytes(shared_tmp_bytes);
   tiling.set_runtimeConfigBytes(inputs.runtime_bytes);
-  tiling.set_profileBufferBytes(inputs.profile_bytes);
+  tiling.set_diagnosticBufferBytes(inputs.profile_bytes);
   tiling.set_kSlot0Offset(offsets[0]);
   tiling.set_kSlot1Offset(offsets[1]);
   tiling.set_kSlot2Offset(offsets[2]);

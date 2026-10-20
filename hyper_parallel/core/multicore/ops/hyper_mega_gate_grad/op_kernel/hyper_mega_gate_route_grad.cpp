@@ -34,11 +34,11 @@ constexpr MulticoreRuntime::TaskType kOneStages[kOneStageCount] = {
 
 class RouteGradWorker : public MulticoreRuntime::AivPipelineWorkerBase<RouteGradWorker> {
  public:
-  __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtime_config, GM_ADDR profile_buffer,
+  __aicore__ inline void Init(uint32_t worker_id, __gm__ uint8_t *runtime_config, GM_ADDR diagnostic_buffer,
                               __gm__ float *selected_scores, __gm__ float *denominator, __gm__ float *grad_weights,
                               __gm__ float *selected_score_grad, __gm__ float *zero_score_grad, GM_ADDR workspace,
                               const HyperMegaGateRouteGradTilingData &tiling) {
-    MulticoreRuntime::AivPipelineWorkerBase<RouteGradWorker>::Init(worker_id, runtime_config, profile_buffer);
+    MulticoreRuntime::AivPipelineWorkerBase<RouteGradWorker>::Init(worker_id, runtime_config, diagnostic_buffer);
     top_k_ = tiling.topK;
     pipeline_.Init(worker_id, selected_scores, denominator, grad_weights, selected_score_grad, zero_score_grad,
                    workspace, tiling);
@@ -92,6 +92,11 @@ class RouteGradWorker : public MulticoreRuntime::AivPipelineWorkerBase<RouteGrad
     }
   }
 
+  static constexpr uint32_t DIAGNOSTIC_PARAMETER_COUNT = 7;
+  __aicore__ inline void PopulateDiagnosticInputList(GM_ADDR *parameters) {
+    pipeline_.PopulateDiagnosticInputList(parameters);
+  }
+
  private:
   HyperMegaGate::RouteGradPipeline pipeline_;
   uint32_t top_k_ = 0;
@@ -107,7 +112,7 @@ class RouteGradWorker : public MulticoreRuntime::AivPipelineWorkerBase<RouteGrad
  */
 extern "C" __global__ __aicore__ void hyper_mega_gate_route_grad(
   GM_ADDR selected_scores, GM_ADDR normalization_denominator, GM_ADDR grad_routing_weights, GM_ADDR route_scores,
-  GM_ADDR expert_indices, GM_ADDR runtime_config, GM_ADDR profile_buffer, GM_ADDR selected_score_grad,
+  GM_ADDR expert_indices, GM_ADDR runtime_config, GM_ADDR diagnostic_buffer, GM_ADDR selected_score_grad,
   GM_ADDR zero_score_grad, GM_ADDR workspace, GM_ADDR tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   GET_TILING_DATA(tiling_data, tiling);
@@ -125,7 +130,7 @@ extern "C" __global__ __aicore__ void hyper_mega_gate_route_grad(
   (void)route_scores;
   (void)expert_indices;
   RouteGradWorker worker;
-  worker.Init(worker_id, runtime, profile_buffer, reinterpret_cast<__gm__ float *>(selected_scores),
+  worker.Init(worker_id, runtime, diagnostic_buffer, reinterpret_cast<__gm__ float *>(selected_scores),
               reinterpret_cast<__gm__ float *>(normalization_denominator),
               reinterpret_cast<__gm__ float *>(grad_routing_weights),
               reinterpret_cast<__gm__ float *>(selected_score_grad), reinterpret_cast<__gm__ float *>(zero_score_grad),

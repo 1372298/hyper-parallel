@@ -17,7 +17,7 @@ aclnnStatus aclnnHyperMegaMhcGetWorkspaceSize(
   const aclTensor *previousOutput, const aclTensor *residual, const aclTensor *previousPreMix,
   const aclTensor *previousPostMix, const aclTensor *previousResidualMix, const aclTensor *phi, const aclTensor *alpha,
   const aclTensor *bias, const aclTensor *normWeight, const aclTensor *runtimeConfig, const aclTensor *allEventCounters,
-  const aclTensor *profileBuffer, aclTensor *newResidual, aclTensor *nextPreMix, aclTensor *nextPostMix,
+  const aclTensor *diagnosticBuffer, aclTensor *newResidual, aclTensor *nextPreMix, aclTensor *nextPostMix,
   aclTensor *nextResidualMix, aclTensor *blockInput, aclTensor *hcBeforeNorm, aclTensor *invRms, aclTensor *sumOut,
   aclTensor *normOut, aclTensor *mixedInput, aclTensor *rmsRstd, double hcEps, double normEps, int64_t numIters,
   bool needBackward, uint64_t *workspaceSize, aclOpExecutor **executor) {
@@ -25,7 +25,7 @@ aclnnStatus aclnnHyperMegaMhcGetWorkspaceSize(
   L2_DFX_PHASE_1(
     aclnnHyperMegaMhc,
     DFX_IN(previousOutput, residual, previousPreMix, previousPostMix, previousResidualMix, phi, alpha, bias, normWeight,
-           runtimeConfig, allEventCounters, profileBuffer, hcEps, normEps, numIters, needBackward),
+           runtimeConfig, allEventCounters, diagnosticBuffer, hcEps, normEps, numIters, needBackward),
     DFX_OUT(newResidual, nextPreMix, nextPostMix, nextResidualMix, blockInput, hcBeforeNorm, invRms, sumOut, normOut,
             mixedInput, rmsRstd));
   auto uniqueExecutor = CREATE_EXECUTOR();
@@ -46,16 +46,16 @@ aclnnStatus aclnnHyperMegaMhcGetWorkspaceSize(
   MAKE_CONTIGUOUS(normWeight);
   MAKE_CONTIGUOUS(runtimeConfig);
   MAKE_CONTIGUOUS(allEventCounters);
-  MAKE_CONTIGUOUS(profileBuffer);
+  MAKE_CONTIGUOUS(diagnosticBuffer);
 
 #undef MAKE_CONTIGUOUS
 
   const auto outputs = l0op::HyperMegaMhc(
     residualContiguous, phiContiguous, alphaContiguous, biasContiguous, previousOutputContiguous,
     previousPreMixContiguous, previousPostMixContiguous, previousResidualMixContiguous, normWeightContiguous,
-    runtimeConfigContiguous, allEventCountersContiguous, profileBufferContiguous, newResidual, nextPreMix, nextPostMix,
-    nextResidualMix, blockInput, hcBeforeNorm, invRms, sumOut, normOut, mixedInput, rmsRstd, 4, numIters, hcEps,
-    normEps, needBackward, uniqueExecutor.get());
+    runtimeConfigContiguous, allEventCountersContiguous, diagnosticBufferContiguous, newResidual, nextPreMix,
+    nextPostMix, nextResidualMix, blockInput, hcBeforeNorm, invRms, sumOut, normOut, mixedInput, rmsRstd, 4, numIters,
+    hcEps, normEps, needBackward, uniqueExecutor.get());
   CHECK_RET(std::all_of(outputs.begin(), outputs.end(), [](const aclTensor *value) { return value != nullptr; }),
             ACLNN_ERR_INNER_NULLPTR);
   *workspaceSize = uniqueExecutor->GetWorkspaceSize();

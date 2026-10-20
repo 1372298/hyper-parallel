@@ -16,7 +16,7 @@
  *   - static constexpr uint32_t TILING_IDX  — index into input_list for tiling params
  *   - static constexpr uint32_t EVENT_IDX   — index into input_list for all_event_counters
  *   - void ExecuteComputeKernel(TaskDesc)    — op-specific task dispatch switch
- *   - static constexpr uint32_t PROFILE_IDX — index into input_list for the ordinary profile buffer
+ *   - static constexpr uint32_t DIAGNOSTIC_IDX — index into input_list for the shared profiling/dump buffer
  *
  * Compute kernels (ExecuteMatmul, ExecuteShmemPutMem, etc.) are NOT part of this class;
  * they belong in each op's worker_kernel.cpp.
@@ -30,6 +30,7 @@
 #include "runtime_config.hpp"
 #include "runtime_storage_bounds.h"
 #include "cycle_trace_recorder.h"
+#include "l1_tensor_dump.h"
 
 #include "get_mem.h"
 
@@ -123,11 +124,15 @@ class KernelWorkerBase {
     if (has_ready) {
       WaitForDeviceReady(meta);
     }
-    bool profile_enabled = isCycleProfileEnabled(this->runtimeConfigPtr);
-    if (profile_enabled) {
-      ProcessProfiled();
-    } else {
-      ProcessFast();
+    switch (getDiagnosticMode(this->runtimeConfigPtr)) {
+      case DiagnosticMode::PROFILE:
+        ProcessProfiled();
+        break;
+      case DiagnosticMode::TENSOR_DUMP_L1:
+        ProcessL1Dump();
+        break;
+      default:
+        ProcessFast();
     }
     if (meta.completion_event != 0) {
       CompleteDeviceReads(meta);
@@ -162,9 +167,36 @@ class KernelWorkerBase {
 #endif
   }
 
+  __aicore__ inline void ProcessL1Dump() {
+#ifdef __DAV_C220_CUBE__
+    uint32_t block_idx = this->worker_id_;
+    do {
+      if (block_idx >= this->cube_task_num) {
+        return;
+      }
+      TaskId task_index = GetTaskIndex(block_idx);
+      ExecuteTaskL1Dump(task_index);
+      block_idx = block_idx + this->core_num;
+    } while (1);
+#else
+    uint32_t block_idx = GetVectorScheduleIndex();
+    if (block_idx == INVALID_VECTOR_SCHEDULE_INDEX) {
+      return;
+    }
+    do {
+      if (block_idx >= this->vector_task_num) {
+        return;
+      }
+      TaskId task_index = GetTaskIndex(block_idx);
+      ExecuteTaskL1Dump(task_index);
+      block_idx = block_idx + this->active_vector_num;
+    } while (1);
+#endif
+  }
+
   __aicore__ inline void ProcessProfiled() {
     CycleTraceRecorder cycle_trace_recorder;
-    cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::PROFILE_IDX],
+    cycle_trace_recorder.Init(this->worker_id_, this->input_list[Derived::DIAGNOSTIC_IDX],
                               getAicProfileRecordCapacity(this->runtimeConfigPtr),
                               getAivProfileRecordCapacity(this->runtimeConfigPtr));
 #ifdef __DAV_C220_CUBE__
@@ -356,6 +388,32 @@ class KernelWorkerBase {
     if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
       TriggerEvent(task_desc.trigger_event);
     }
+  }
+
+  __aicore__ inline void ExecuteTaskL1Dump(TaskId task_id) {
+    if (task_id >= runtime_task_capacity) {
+      AscendC::Trap();
+    }
+    TaskDesc task_desc;
+    getTaskDesc(this->runtimeConfigPtr, &(task_desc), task_id);
+    if ((task_desc.dependent_event != EVENT_INVALID_ID && task_desc.dependent_event >= runtime_event_capacity) ||
+        static_cast<uint64_t>(task_desc.trigger_event) + ATOMIC_ADD_VALUE_LEN > runtime_event_capacity) {
+      AscendC::Trap();
+    }
+    if (task_desc.dependent_event != EVENT_INVALID_ID) {
+      WaitForDependency(task_desc.dependent_event, task_desc.extra_value_2);
+    }
+    CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_BEFORE);
+    static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
+    PipeBarrier<PIPE_ALL>();
+    CaptureL1TaskTensors(task_id, L1_DUMP_PHASE_AFTER);
+    if (task_desc.task_type != TaskType::TASK_SHMEM_PUT_MEM_SIGNAL) {
+      TriggerEvent(task_desc.trigger_event);
+    }
+  }
+
+  __aicore__ inline void CaptureL1TaskTensors(TaskId task_id, uint32_t phase) {
+    MulticoreRuntime::CaptureL1TaskTensors(input_list[Derived::DIAGNOSTIC_IDX], input_list, task_id, phase, worker_id_);
   }
 
   __aicore__ inline void ExecuteTaskProfiled(TaskId task_id, CycleTraceRecorder &cycle_trace_recorder) {

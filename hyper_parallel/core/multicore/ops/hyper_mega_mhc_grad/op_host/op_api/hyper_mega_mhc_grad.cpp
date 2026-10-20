@@ -17,13 +17,13 @@ const std::array<const aclTensor *, 9> HyperMegaMhcGrad(
   const aclTensor *gradCurrentPre, const aclTensor *mixedInput, const aclTensor *rmsRstd, const aclTensor *normWeight,
   const aclTensor *directGradX, const aclTensor *previousResidual, const aclTensor *previousOutput,
   const aclTensor *previousPost, const aclTensor *previousResidualMix, const aclTensor *runtimeConfig,
-  const aclTensor *allEventCounters, const aclTensor *profileBuffer, const aclTensor *gradResidual,
+  const aclTensor *allEventCounters, const aclTensor *diagnosticBuffer, const aclTensor *gradResidual,
   const aclTensor *gradPhi, const aclTensor *gradAlpha, const aclTensor *gradBias, const aclTensor *gradPreviousOutput,
   const aclTensor *gradPreviousPre, const aclTensor *gradPreviousPost, const aclTensor *gradPreviousResidual,
   const aclTensor *gradNormWeight, double hcEps, aclOpExecutor *executor) {
   L0_DFX(HyperMegaMhcGrad, gradHinPlaceholder, gradHPost, gradHRes, x, phi, alpha, bias, previousPre, hcBeforeNorm,
          invRms, sumOut, normOut, gradCurrentPre, mixedInput, rmsRstd, normWeight, directGradX, previousResidual,
-         previousOutput, previousPost, previousResidualMix, runtimeConfig, allEventCounters, profileBuffer,
+         previousOutput, previousPost, previousResidualMix, runtimeConfig, allEventCounters, diagnosticBuffer,
          gradResidual, gradPhi, gradAlpha, gradBias, gradPreviousOutput, gradPreviousPre, gradPreviousPost,
          gradPreviousResidual, gradNormWeight, hcEps);
   auto *gradResidualOut = const_cast<aclTensor *>(gradResidual);
@@ -39,7 +39,7 @@ const std::array<const aclTensor *, 9> HyperMegaMhcGrad(
     HyperMegaMhcGrad,
     OP_INPUT(gradHinPlaceholder, gradHPost, gradHRes, x, phi, alpha, bias, previousPre, hcBeforeNorm, invRms, sumOut,
              normOut, gradCurrentPre, mixedInput, rmsRstd, normWeight, directGradX, previousResidual, previousOutput,
-             previousPost, previousResidualMix, runtimeConfig, allEventCounters, profileBuffer),
+             previousPost, previousResidualMix, runtimeConfig, allEventCounters, diagnosticBuffer),
     OP_OUTPUT(gradResidualOut, gradPhiOut, gradAlphaOut, gradBiasOut, gradPreviousOutputOut, gradPreviousPreOut,
               gradPreviousPostOut, gradPreviousResidualOut, gradNormWeightOut),
     OP_ATTR(static_cast<float>(hcEps)));

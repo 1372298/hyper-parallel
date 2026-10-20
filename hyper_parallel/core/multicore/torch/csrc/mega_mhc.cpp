@@ -41,7 +41,7 @@ ElevenTensorRefs mega_mhc_npu(const at::Tensor &previous_output, const at::Tenso
                               const at::Tensor &previous_pre_mix, const at::Tensor &previous_post_mix,
                               const at::Tensor &previous_residual_mix, const at::Tensor &phi, const at::Tensor &alpha,
                               const at::Tensor &bias, const at::Tensor &norm_weight, const at::Tensor &runtime_config,
-                              const at::Tensor &all_event_counters, const at::Tensor &profile_buffer,
+                              const at::Tensor &all_event_counters, const at::Tensor &diagnostic_buffer,
                               at::Tensor &new_residual, at::Tensor &next_pre_mix, at::Tensor &next_post_mix,
                               at::Tensor &next_residual_mix, at::Tensor &block_input, at::Tensor &hc_before_norm,
                               at::Tensor &inv_rms, at::Tensor &sum_out, at::Tensor &norm_out, at::Tensor &mixed_input,
@@ -49,7 +49,7 @@ ElevenTensorRefs mega_mhc_npu(const at::Tensor &previous_output, const at::Tenso
                               bool need_backward) {
   EXEC_NPU_CMD_EXT(aclnnHyperMegaMhc, previous_output, residual, previous_pre_mix, previous_post_mix,
                    previous_residual_mix, phi, alpha, bias, norm_weight, runtime_config, all_event_counters,
-                   profile_buffer, new_residual, next_pre_mix, next_post_mix, next_residual_mix, block_input,
+                   diagnostic_buffer, new_residual, next_pre_mix, next_post_mix, next_residual_mix, block_input,
                    hc_before_norm, inv_rms, sum_out, norm_out, mixed_input, rms_rstd, hc_eps, norm_eps, num_iters,
                    need_backward);
   return ElevenTensorRefs(new_residual, next_pre_mix, next_post_mix, next_residual_mix, block_input, hc_before_norm,
@@ -61,7 +61,7 @@ ElevenTensorRefs mega_mhc_meta(const at::Tensor & /*previous_output*/, const at:
                                const at::Tensor & /*previous_residual_mix*/, const at::Tensor & /*phi*/,
                                const at::Tensor & /*alpha*/, const at::Tensor & /*bias*/,
                                const at::Tensor & /*norm_weight*/, const at::Tensor & /*runtime_config*/,
-                               const at::Tensor & /*all_event_counters*/, const at::Tensor & /*profile_buffer*/,
+                               const at::Tensor & /*all_event_counters*/, const at::Tensor & /*diagnostic_buffer*/,
                                at::Tensor &new_residual, at::Tensor &next_pre_mix, at::Tensor &next_post_mix,
                                at::Tensor &next_residual_mix, at::Tensor &block_input, at::Tensor &hc_before_norm,
                                at::Tensor &inv_rms, at::Tensor &sum_out, at::Tensor &norm_out, at::Tensor &mixed_input,
@@ -81,15 +81,15 @@ NineTensorRefs mega_mhc_grad_npu(const at::Tensor &grad_hin_placeholder, const a
                                  const at::Tensor &previous_residual, const at::Tensor &previous_output,
                                  const at::Tensor &previous_post, const at::Tensor &previous_residual_mix,
                                  const at::Tensor &runtime_config, const at::Tensor &all_event_counters,
-                                 const at::Tensor &profile_buffer, at::Tensor &grad_residual, at::Tensor &grad_phi,
+                                 const at::Tensor &diagnostic_buffer, at::Tensor &grad_residual, at::Tensor &grad_phi,
                                  at::Tensor &grad_alpha, at::Tensor &grad_bias, at::Tensor &grad_previous_output,
                                  at::Tensor &grad_previous_pre, at::Tensor &grad_previous_post,
                                  at::Tensor &grad_previous_residual, at::Tensor &grad_norm_weight, double hc_eps) {
   EXEC_NPU_CMD_EXT(aclnnHyperMegaMhcGrad, grad_hin_placeholder, grad_h_post, grad_h_res, x, phi, alpha, bias,
                    previous_pre, hc_before_norm, inv_rms, sum_out, norm_out, grad_current_pre, mixed_input, rms_rstd,
                    norm_weight, direct_grad_x, previous_residual, previous_output, previous_post, previous_residual_mix,
-                   runtime_config, all_event_counters, profile_buffer, grad_residual, grad_phi, grad_alpha, grad_bias,
-                   grad_previous_output, grad_previous_pre, grad_previous_post, grad_previous_residual,
+                   runtime_config, all_event_counters, diagnostic_buffer, grad_residual, grad_phi, grad_alpha,
+                   grad_bias, grad_previous_output, grad_previous_pre, grad_previous_post, grad_previous_residual,
                    grad_norm_weight, hc_eps);
   return NineTensorRefs(grad_residual, grad_phi, grad_alpha, grad_bias, grad_previous_output, grad_previous_pre,
                         grad_previous_post, grad_previous_residual, grad_norm_weight);

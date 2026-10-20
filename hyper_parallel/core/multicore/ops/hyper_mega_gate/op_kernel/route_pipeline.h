@@ -58,6 +58,18 @@ class RoutePipeline {
     row_count_ = row_count;
   }
 
+  __aicore__ inline void PopulateDiagnosticInputList(GM_ADDR *parameters) {
+    parameters[0] = reinterpret_cast<GM_ADDR>(logits_);
+    parameters[1] = reinterpret_cast<GM_ADDR>(text_bias_);
+    parameters[2] = reinterpret_cast<GM_ADDR>(vision_bias_);
+    parameters[3] = reinterpret_cast<GM_ADDR>(image_mask_);
+    parameters[6] = reinterpret_cast<GM_ADDR>(routing_weights_);
+    parameters[7] = reinterpret_cast<GM_ADDR>(expert_indices_);
+    parameters[8] = reinterpret_cast<GM_ADDR>(route_scores_);
+    parameters[9] = reinterpret_cast<GM_ADDR>(selected_scores_);
+    parameters[10] = reinterpret_cast<GM_ADDR>(normalization_denominator_);
+  }
+
   __aicore__ inline void Softplus() {
     TPipe pipe;
     TQue<QuePosition::VECIN, 1> input_queue;

@@ -22,8 +22,12 @@
 #define ASCEND_IS_AIC constexpr(g_coreType == AscendC::AIC)
 #endif
 
-using namespace AscendC;
-using namespace MulticoreRuntime;
+using MulticoreRuntime::KernelWorkerBase;
+using MulticoreRuntime::RuntimeLaunchTiling;
+using MulticoreRuntime::RuntimeStorageBoundsPolicy;
+using MulticoreRuntime::TaskDesc;
+using MulticoreRuntime::TaskType;
+using MulticoreRuntime::VectorWorkerPolicy;
 
 using HyperMegaMhcGradLaunchTilingData = RuntimeLaunchTiling<MhcPreSinkhornBackwardArch22TilingData>;
 
@@ -142,7 +146,7 @@ class KernelWorker
  public:
   static constexpr uint32_t TILING_IDX = 34;
   static constexpr uint32_t EVENT_IDX = 22;
-  static constexpr uint32_t PROFILE_IDX = 23;
+  static constexpr uint32_t DIAGNOSTIC_IDX = 23;
   static constexpr uint32_t WORKSPACE_IDX = 33;
   static constexpr uint32_t RUNTIME_BOUNDS_OFFSET = offsetof(HyperMegaMhcGradLaunchTilingData, storage_bounds);
 

@@ -27,7 +27,7 @@ TILING_DATA_FIELD_DEF(uint32_t, kAlign);
 TILING_DATA_FIELD_DEF(uint32_t, sharedTmpBytes);
 TILING_DATA_FIELD_DEF(uint32_t, stageCount);
 TILING_DATA_FIELD_DEF(uint64_t, runtimeConfigBytes);
-TILING_DATA_FIELD_DEF(uint64_t, profileBufferBytes);
+TILING_DATA_FIELD_DEF(uint64_t, diagnosticBufferBytes);
 TILING_DATA_FIELD_DEF(uint64_t, scoreAOffset);
 TILING_DATA_FIELD_DEF(uint64_t, topkValuesOffset);
 TILING_DATA_FIELD_DEF(uint64_t, indicesI32Offset);

@@ -8,13 +8,19 @@
 
 TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
   m.def(
+    "mega_gate_route_out(Tensor logits, Tensor text_bias, Tensor vision_bias, Tensor image_mask, "
+    "Tensor runtime_config, Tensor diagnostic_buffer, Tensor(a!) routing_weights, Tensor(b!) expert_indices, "
+    "Tensor(c!) route_scores, Tensor(d!) selected_scores, Tensor(e!) normalization_denominator, "
+    "int top_k, float routed_scaling_factor, bool use_vision_bias) "
+    "-> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!))");
+  m.def(
     "mega_gate_route("
     "Tensor logits, "
     "Tensor text_bias, "
     "Tensor vision_bias, "
     "Tensor image_mask, "
     "Tensor runtime_config, "
-    "Tensor profile_buffer, "
+    "Tensor diagnostic_buffer, "
     "int top_k, "
     "float routed_scaling_factor, "
     "bool use_vision_bias"
@@ -29,7 +35,7 @@ TORCH_LIBRARY_FRAGMENT(hyper_parallel, m) {
     "Tensor expert_indices, "
     "Tensor grad_routing_weights, "
     "Tensor runtime_config, "
-    "Tensor profile_buffer, "
+    "Tensor diagnostic_buffer, "
     "int top_k, "
     "float routed_scaling_factor"
     ") -> Tensor");

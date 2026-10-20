@@ -41,12 +41,12 @@ extern "C" {
 aclnnStatus aclnnHyperMegaGateRouteGradGetWorkspaceSize(
   const aclTensor *logits, const aclTensor *route_scores, const aclTensor *selected_scores,
   const aclTensor *normalization_denominator, const aclTensor *expert_indices, const aclTensor *grad_routing_weights,
-  const aclTensor *runtime_config, const aclTensor *profile_buffer, const aclTensor *grad_logits, int64_t top_k,
+  const aclTensor *runtime_config, const aclTensor *diagnostic_buffer, const aclTensor *grad_logits, int64_t top_k,
   double routed_scaling_factor, uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   L2_DFX_PHASE_1(aclnnHyperMegaGateRouteGrad,
                  DFX_IN(logits, route_scores, selected_scores, normalization_denominator, expert_indices,
-                        grad_routing_weights, runtime_config, profile_buffer, top_k, routed_scaling_factor),
+                        grad_routing_weights, runtime_config, diagnostic_buffer, top_k, routed_scaling_factor),
                  DFX_OUT(grad_logits));
   CHECK_RET(logits != nullptr && logits->GetViewShape().GetDimNum() == 2, ACLNN_ERR_PARAM_INVALID);
   const int64_t tokens = logits->GetViewShape().GetDim(0);
@@ -55,7 +55,7 @@ aclnnStatus aclnnHyperMegaGateRouteGradGetWorkspaceSize(
               HasShape(route_scores, tokens, expert_count) && HasShape(selected_scores, tokens, top_k) &&
               HasShape(normalization_denominator, tokens, 1) && HasShape(expert_indices, tokens, top_k) &&
               HasShape(grad_routing_weights, tokens, top_k) && HasShape(grad_logits, tokens, expert_count) &&
-              IsRuntimeResource(runtime_config) && IsRuntimeResource(profile_buffer) &&
+              IsRuntimeResource(runtime_config) && IsRuntimeResource(diagnostic_buffer) &&
               std::isfinite(routed_scaling_factor),
             ACLNN_ERR_PARAM_INVALID);
   CHECK_RET(AreTypesValid(logits, route_scores, selected_scores, normalization_denominator, expert_indices,
@@ -66,7 +66,7 @@ aclnnStatus aclnnHyperMegaGateRouteGradGetWorkspaceSize(
   CHECK_RET(executor_ptr != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
   const auto *result = l0op::HyperMegaGateRouteGrad(
     logits, route_scores, selected_scores, normalization_denominator, expert_indices, grad_routing_weights,
-    runtime_config, profile_buffer, top_k, static_cast<float>(routed_scaling_factor), grad_logits, executor_ptr);
+    runtime_config, diagnostic_buffer, top_k, static_cast<float>(routed_scaling_factor), grad_logits, executor_ptr);
   CHECK_RET(result != nullptr, ACLNN_ERR_INNER_NULLPTR);
   *workspaceSize = unique_executor->GetWorkspaceSize();
   unique_executor.ReleaseTo(executor);

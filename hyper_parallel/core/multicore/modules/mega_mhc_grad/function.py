@@ -17,11 +17,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Any
 
 import torch
 
-from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from ..mega_mhc_common import validate_mega_mhc_native_inputs, validate_mega_mhc_token_count
@@ -93,30 +91,6 @@ def _get_plan_for_shape(
         num_cube_cores,
         num_vector_cores,
         token_tile,
-    )
-
-
-def _launch_grad_kernel(
-    kernel_inputs: tuple[torch.Tensor, ...],
-    profile_call: Any,
-    hc_eps: float,
-) -> tuple[torch.Tensor, ...]:
-    """Launch the native backward kernel with profiler-owned runtime buffers.
-
-    Args:
-        kernel_inputs: Shape-normalized operator inputs.
-        profile_call: Prepared runtime and profiling buffers.
-        hc_eps: RMSNorm epsilon.
-
-    Returns:
-        Native operator outputs in ACLNN order.
-    """
-    return multicore_ops.hyper_mega_mhc_grad(
-        *kernel_inputs,
-        profile_call.runtime_config,
-        profile_call.event_counters,
-        profile_call.profile_buffer,
-        hc_eps=hc_eps,
     )
 
 
@@ -215,37 +189,34 @@ def hyper_mega_mhc_grad(
     leading_shape, hidden_size = residual.shape[:-2], residual.shape[-1]
     token_count = residual.numel() // (4 * hidden_size)
     plan = _get_plan_for_shape(token_count, hidden_size, residual.device, token_tile)
-    profile_call = prepare_mega_kernel_call(
-        plan.runtime,
-        direction="backward",
-        fallback_event_counters=torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device),
+    events = torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device)
+    kernel_inputs = (
+        grad_block_input.reshape(1, token_count, hidden_size).contiguous(),
+        grad_next_post_mix.reshape(1, token_count, 4).contiguous(),
+        grad_next_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
+        cache.new_residual.reshape(1, token_count, 4, hidden_size).contiguous(),
+        phi.contiguous(),
+        alpha.contiguous(),
+        bias.contiguous(),
+        previous_pre_mix.reshape(1, token_count, 4).contiguous(),
+        cache.hc_before_norm.contiguous(),
+        cache.inv_rms.contiguous(),
+        cache.sum_out.contiguous(),
+        cache.norm_out.contiguous(),
+        grad_next_pre_mix.reshape(1, token_count, 4).contiguous(),
+        cache.mixed_input.reshape(1, token_count, hidden_size).contiguous(),
+        cache.rms_rstd.contiguous(),
+        norm_weight.contiguous(),
+        grad_new_residual.reshape(1, token_count, 4, hidden_size).contiguous(),
+        residual.reshape(1, token_count, 4, hidden_size).contiguous(),
+        previous_output.reshape(1, token_count, hidden_size).contiguous(),
+        previous_post_mix.reshape(1, token_count, 4).contiguous(),
+        previous_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
     )
-    try:
-        kernel_inputs = (
-            grad_block_input.reshape(1, token_count, hidden_size).contiguous(),
-            grad_next_post_mix.reshape(1, token_count, 4).contiguous(),
-            grad_next_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
-            cache.new_residual.reshape(1, token_count, 4, hidden_size).contiguous(),
-            phi.contiguous(),
-            alpha.contiguous(),
-            bias.contiguous(),
-            previous_pre_mix.reshape(1, token_count, 4).contiguous(),
-            cache.hc_before_norm.contiguous(),
-            cache.inv_rms.contiguous(),
-            cache.sum_out.contiguous(),
-            cache.norm_out.contiguous(),
-            grad_next_pre_mix.reshape(1, token_count, 4).contiguous(),
-            cache.mixed_input.reshape(1, token_count, hidden_size).contiguous(),
-            cache.rms_rstd.contiguous(),
-            norm_weight.contiguous(),
-            grad_new_residual.reshape(1, token_count, 4, hidden_size).contiguous(),
-            residual.reshape(1, token_count, 4, hidden_size).contiguous(),
-            previous_output.reshape(1, token_count, hidden_size).contiguous(),
-            previous_post_mix.reshape(1, token_count, 4).contiguous(),
-            previous_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
-        )
-        outputs = _launch_grad_kernel(kernel_inputs, profile_call, hc_eps)
-        profile_call.complete()
-    finally:
-        profile_call.cancel()
+    options = {"hc_eps": hc_eps}
+    if plan.runtime.is_active:
+        options["diagnostics"] = plan.runtime
+    outputs = multicore_ops.hyper_mega_mhc_grad(
+        *kernel_inputs, plan.runtime.runtime_config, events, events, **options,
+    )
     return _restore_output_shapes(outputs, leading_shape, hidden_size)

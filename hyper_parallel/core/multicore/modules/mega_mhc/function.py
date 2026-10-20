@@ -17,12 +17,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Any
 
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_mhc_grad.common import MegaMhcGradCache
 from hyper_parallel.core.multicore.modules.mega_mhc_grad.function import _resolve_core_counts, hyper_mega_mhc_grad
-from hyper_parallel.core.multicore.profiler.profiler import prepare_mega_kernel_call
 from hyper_parallel.core.multicore.torch import ops as multicore_ops
 
 from ..mega_mhc_common import (
@@ -156,33 +156,29 @@ def _hyper_mega_mhc_forward(
         num_cube_cores,
         token_tile,
     )
-    profile_call = prepare_mega_kernel_call(
-        plan.runtime,
-        direction="forward",
-        fallback_event_counters=torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device),
+    events = torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device)
+    options = {}
+    if plan.runtime.is_active:
+        options["diagnostics"] = plan.runtime
+    outputs = multicore_ops.hyper_mega_mhc(
+        previous_output.reshape(1, token_count, hidden_size).contiguous(),
+        residual.reshape(1, token_count, 4, hidden_size).contiguous(),
+        previous_pre_mix.reshape(1, token_count, 4).contiguous(),
+        previous_post_mix.reshape(1, token_count, 4).contiguous(),
+        previous_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
+        phi.contiguous(),
+        alpha.contiguous(),
+        bias.contiguous(),
+        norm_weight.contiguous(),
+        plan.runtime.runtime_config,
+        events,
+        events,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        num_iters=num_iters,
+        need_backward=need_backward,
+        **options,
     )
-    try:
-        outputs = multicore_ops.hyper_mega_mhc(
-            previous_output.reshape(1, token_count, hidden_size).contiguous(),
-            residual.reshape(1, token_count, 4, hidden_size).contiguous(),
-            previous_pre_mix.reshape(1, token_count, 4).contiguous(),
-            previous_post_mix.reshape(1, token_count, 4).contiguous(),
-            previous_residual_mix.reshape(1, token_count, 4, 4).contiguous(),
-            phi.contiguous(),
-            alpha.contiguous(),
-            bias.contiguous(),
-            norm_weight.contiguous(),
-            profile_call.runtime_config,
-            profile_call.event_counters,
-            profile_call.profile_buffer,
-            hc_eps=hc_eps,
-            norm_eps=norm_eps,
-            num_iters=num_iters,
-            need_backward=need_backward,
-        )
-        profile_call.complete()
-    finally:
-        profile_call.cancel()
     return _restore_forward_outputs(outputs, leading_shape, hidden_size)
 
 
@@ -191,7 +187,7 @@ class _HyperMegaMhcFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
+        ctx: Any,
         previous_output: torch.Tensor,
         residual: torch.Tensor,
         previous_pre_mix: torch.Tensor,
@@ -206,7 +202,24 @@ class _HyperMegaMhcFunction(torch.autograd.Function):
         num_iters: int,
         token_tile: int,
     ) -> MegaMhcOutputs:
-        """Launch HyperMegaMhc and save its explicit native cache."""
+        """Launch HyperMegaMhc and save its explicit native cache.
+
+        Args:
+            ctx: Autograd context retaining only the state required for backward.
+            previous_output: Previous block output tensor.
+            residual: Residual streams supplied to the current block.
+            previous_pre_mix: Previous block's input mixing coefficients.
+            previous_post_mix: Previous block's output mixing coefficients.
+            previous_residual_mix: Previous block's residual mixing matrix.
+            phi: Projection weight used to generate mixing coefficients.
+            alpha: Scaling parameters for the projected mixing coefficients.
+            bias: Bias parameters for the projected mixing coefficients.
+            norm_weight: RMS normalization weight.
+            hc_eps: Numerical epsilon used by mixing coefficient normalization.
+            norm_eps: Numerical epsilon used by RMS normalization.
+            num_iters: Number of Sinkhorn normalization iterations.
+            token_tile: Number of token rows assigned to a task tile.
+        """
         outputs, cache = _hyper_mega_mhc_forward(
             previous_output,
             residual,
@@ -246,8 +259,13 @@ class _HyperMegaMhcFunction(torch.autograd.Function):
         return outputs
 
     @staticmethod
-    def backward(ctx, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
-        """Differentiate the boundary with HyperMegaMhcGrad."""
+    def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
+        """Differentiate the boundary with HyperMegaMhcGrad.
+
+        Args:
+            ctx: Autograd context retaining only the state required for backward.
+            grad_outputs: Upstream gradients for the differentiable forward results.
+        """
         (
             previous_output,
             residual,

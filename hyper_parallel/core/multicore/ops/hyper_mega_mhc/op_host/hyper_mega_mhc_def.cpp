@@ -21,7 +21,7 @@ class HyperMegaMhc : public OpDef {
     AddInput("norm_weight", {ge::DT_BF16});
     AddInput("runtime_config", {ge::DT_UINT8});
     AddInput("all_event_counters", {ge::DT_UINT8});
-    AddInput("profile_buffer", {ge::DT_UINT8});
+    AddInput("diagnostic_buffer", {ge::DT_UINT8});
     AddInput("new_residual_out", {ge::DT_BF16});
     AddInput("next_pre_mix_out", {ge::DT_FLOAT});
     AddInput("next_post_mix_out", {ge::DT_FLOAT});

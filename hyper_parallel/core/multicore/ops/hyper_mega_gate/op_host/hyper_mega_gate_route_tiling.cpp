@@ -220,7 +220,7 @@ ge::graphStatus TilingFunc(gert::TilingContext *context) {
   tiling.set_stageCount(kRouteStageCount);
   tiling.set_useVisionBias(inputs.use_vision_bias ? 1U : 0U);
   tiling.set_runtimeConfigBytes(inputs.runtime_bytes);
-  tiling.set_profileBufferBytes(inputs.profile_bytes);
+  tiling.set_diagnosticBufferBytes(inputs.profile_bytes);
   uint64_t route_workspace = 0;
   const uint64_t score_bytes = static_cast<uint64_t>(inputs.tokens) * inputs.expert_count * sizeof(float);
   const uint64_t selected_float_bytes = static_cast<uint64_t>(inputs.tokens) * inputs.top_k * sizeof(float);

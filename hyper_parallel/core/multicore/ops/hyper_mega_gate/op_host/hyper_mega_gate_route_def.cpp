@@ -16,7 +16,7 @@ class HyperMegaGateRoute : public OpDef {
     this->Input("vision_bias").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
     this->Input("image_mask").ParamType(REQUIRED).DataType({ge::DT_BOOL}).Format({ge::FORMAT_ND});
     this->Input("runtime_config").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
-    this->Input("profile_buffer").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
+    this->Input("diagnostic_buffer").ParamType(REQUIRED).DataType({ge::DT_UINT8}).Format({ge::FORMAT_ND});
     this->Output("routing_weights").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});
     this->Output("expert_indices").ParamType(REQUIRED).DataType({ge::DT_INT64}).Format({ge::FORMAT_ND});
     this->Output("route_scores").ParamType(REQUIRED).DataType({ge::DT_FLOAT}).Format({ge::FORMAT_ND});

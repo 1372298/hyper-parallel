@@ -22,7 +22,6 @@ import torch
 from torch.autograd.function import once_differentiable
 from torch.nn import functional
 
-from hyper_parallel.core.multicore.profiler.profiler import prepare_eventless_mega_kernel_call
 
 from .plan import MegaGatePlan
 
@@ -51,30 +50,14 @@ def _launch_route(
     routed_scaling_factor: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch the eventless Route pipeline on FP32 logits."""
-    profile_call = prepare_eventless_mega_kernel_call(
-        plan.route_runtime,
-        direction="forward",
+    runtime = plan.route_runtime
+    options = {}
+    if runtime.is_active:
+        options["diagnostics"] = runtime
+    return _native_ops()._mega_gate_route(  # pylint: disable=protected-access
+        logits, text_bias, vision_bias, image_mask, runtime.runtime_config, runtime.runtime_config,
+        top_k=top_k, routed_scaling_factor=routed_scaling_factor, use_vision_bias=use_vision_bias, **options,
     )
-    runtime_config = plan.route_runtime.normal_tensor if profile_call is None else profile_call.runtime_config
-    profile_buffer = plan.route_runtime.normal_tensor if profile_call is None else profile_call.profile_buffer
-    try:
-        outputs = _native_ops()._mega_gate_route(  # pylint: disable=protected-access
-            logits,
-            text_bias,
-            vision_bias,
-            image_mask,
-            runtime_config,
-            profile_buffer,
-            top_k=top_k,
-            routed_scaling_factor=routed_scaling_factor,
-            use_vision_bias=use_vision_bias,
-        )
-        if profile_call is not None:
-            profile_call.complete()
-        return outputs
-    finally:
-        if profile_call is not None:
-            profile_call.cancel()
 
 
 def _launch_route_grad(
@@ -91,31 +74,23 @@ def _launch_route_grad(
 ) -> torch.Tensor:
     """Launch RouteGrad without combining the direct logits gradient."""
     runtime = plan.route_grad_k1_runtime if top_k == 1 else plan.route_grad_runtime
-    profile_call = prepare_eventless_mega_kernel_call(
-        runtime,
-        direction="backward",
-    )
-    runtime_config = runtime.normal_tensor if profile_call is None else profile_call.runtime_config
-    profile_buffer = runtime.normal_tensor if profile_call is None else profile_call.profile_buffer
-    try:
-        route_grad = _native_ops()._mega_gate_route_grad(  # pylint: disable=protected-access
-            logits,
-            route_scores,
-            selected_scores,
-            normalization_denominator,
-            expert_indices,
-            grad_routing_weights,
-            runtime_config,
-            profile_buffer,
-            top_k=top_k,
-            routed_scaling_factor=routed_scaling_factor,
+    inputs = (logits, route_scores, selected_scores, normalization_denominator, expert_indices, grad_routing_weights)
+    if not runtime.is_active:
+        return _native_ops()._mega_gate_route_grad(  # pylint: disable=protected-access
+            *inputs, runtime.runtime_config, runtime.runtime_config,
+            top_k=top_k, routed_scaling_factor=routed_scaling_factor,
         )
-        if profile_call is not None:
-            profile_call.complete()
-        return route_grad
-    finally:
-        if profile_call is not None:
-            profile_call.cancel()
+    # Positions 0..6 mirror the internal RouteGrad MegaKernel ABI. The zero-task
+    # ACLNN tail node only uses Host positions 9/10, never Device workspace pointers.
+    parameters = [selected_scores, normalization_denominator, grad_routing_weights, route_scores, expert_indices,
+                  runtime.runtime_config, runtime.runtime_config, None, None, None, logits]
+    with runtime.launch(parameters, direction="backward") as call:
+        result = _native_ops()._mega_gate_route_grad(  # pylint: disable=protected-access
+            *inputs, call.runtime_config, call.diagnostic_buffer,
+            top_k=top_k, routed_scaling_factor=routed_scaling_factor,
+        )
+        parameters[9] = result
+        return result
 
 
 class _MegaGateRouteFunction(torch.autograd.Function):  # pylint: disable=abstract-method,arguments-differ

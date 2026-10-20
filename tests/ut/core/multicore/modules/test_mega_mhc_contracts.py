@@ -113,6 +113,8 @@ class TestMegaMhcContracts(unittest.TestCase):
             value.dtype, value.device = tensor.dtype, device
             value.numel.return_value = math.prod(value.shape)
             inputs.append(value)
+        inputs = (inputs[0], inputs[1], inputs[2], inputs[3], inputs[4],
+                  inputs[5], inputs[6], inputs[7], inputs[8])
         validate_mega_mhc_native_inputs(*inputs, need_backward=True, token_tile=32)
         for index, value in enumerate(inputs):
             with self.subTest(index=index, invalid="dtype"):
@@ -204,26 +206,24 @@ class TestMegaMhcInvocationState(unittest.TestCase):
         package = "mega_mhc_grad" if backward else "mega_mhc"
         function = importlib.import_module(f"hyper_parallel.core.multicore.modules.{package}.function")
         inputs, cache, buffers = _make_inputs(), _make_cache(), []
-        plan = SimpleNamespace(runtime=object(), event_capacity=1024)
+        plan = SimpleNamespace(runtime=SimpleNamespace(runtime_config=object(), is_active=False), event_capacity=1024)
 
-        def prepare(runtime, *, direction, fallback_event_counters):
-            self.assertIs(runtime, plan.runtime)
-            self.assertEqual(direction, "backward" if backward else "forward")
-            self.assertEqual(torch.count_nonzero(fallback_event_counters).item(), 0)
-            buffers.append(fallback_event_counters)
+        def _launch(*native_args, **options):
+            """Retain and mutate counters as an in-flight native invocation would."""
+            events = native_args[22 if backward else 10]
+            self.assertNotIn("diagnostics", options)
+            self.assertEqual(torch.count_nonzero(events).item(), 0)
+            buffers.append(events)
             # Simulate counters mutated by an in-flight native invocation.
-            fallback_event_counters.fill_(1)
-            return SimpleNamespace(
-                runtime_config=object(), event_counters=fallback_event_counters, profile_buffer=object(),
-                complete=Mock(), cancel=Mock(),
-            )
+            events.fill_(1)
+            return native_outputs
 
         if backward:
             native_outputs = (inputs[1], inputs[5], inputs[6], inputs[7], inputs[0],
                               inputs[2], inputs[3], inputs[4], inputs[8])
             target = function.hyper_mega_mhc_grad
             args = (*_make_gradients(), *inputs, cache)
-            launch_name = "_launch_grad_kernel"
+            launch_name = "multicore_ops.hyper_mega_mhc_grad"
         else:
             native_outputs = (cache.new_residual, inputs[2], inputs[3], inputs[4], inputs[0],
                               cache.hc_before_norm, cache.inv_rms, cache.sum_out, cache.norm_out,
@@ -235,9 +235,8 @@ class TestMegaMhcInvocationState(unittest.TestCase):
             patch.object(function, "validate_mega_mhc_native_inputs"),
             patch.object(function, "_resolve_core_counts", return_value=(20, 40)),
             patch.object(function, "_get_cached_plan", return_value=plan),
-            patch.object(function, "prepare_mega_kernel_call", side_effect=prepare),
             patch.object(torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True),
-            patch(f"{function.__name__}.{launch_name}", return_value=native_outputs),
+            patch(f"{function.__name__}.{launch_name}", side_effect=_launch),
         ):
             target(*args)
             target(*args)

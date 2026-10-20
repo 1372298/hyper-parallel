@@ -22,7 +22,7 @@ extern "C" {
  * logits and route_scores are FP32 [tokens, experts]; selected_scores,
  * grad_routing_weights and INT64 expert_indices are [tokens, top_k];
  * normalization_denominator is FP32 [tokens, 1]. runtime_config and
- * profile_buffer are borrowed contiguous UINT8 vectors on the same device.
+ * diagnostic_buffer are borrowed contiguous UINT8 vectors on the same device.
  * grad_logits is caller-owned contiguous FP32 [tokens, experts] storage.
  *
  * @param top_k Number of selected experts in [1, experts].
@@ -34,7 +34,7 @@ extern "C" {
 ACLNN_API aclnnStatus aclnnHyperMegaGateRouteGradGetWorkspaceSize(
   const aclTensor *logits, const aclTensor *route_scores, const aclTensor *selected_scores,
   const aclTensor *normalization_denominator, const aclTensor *expert_indices, const aclTensor *grad_routing_weights,
-  const aclTensor *runtime_config, const aclTensor *profile_buffer, const aclTensor *grad_logits, int64_t top_k,
+  const aclTensor *runtime_config, const aclTensor *diagnostic_buffer, const aclTensor *grad_logits, int64_t top_k,
   double routed_scaling_factor, uint64_t *workspaceSize, aclOpExecutor **executor);
 
 /**
