@@ -20,25 +20,25 @@ against the key it is given. Simulating every CP rank on one host, the folded re
 must reproduce a single full-sequence call -- outputs row by row, the key gradient
 after summing the ranks, and the loss after summing the ranks.
 """
+import importlib
 import os
 from collections import namedtuple
+from typing import Any
 
 import numpy as np
 import pytest
 
-pytest.importorskip("mindspore")
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
-from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
+from tests.ut.platform.mindspore._ensure_mindspore_platform import (
     ensure_mindspore_platform_for_context_parallel,
 )
 
+ms = pytest.importorskip("mindspore")
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 ensure_mindspore_platform_for_context_parallel()
+# Bind fold ops only after the optional backend and its cached globals are reset.
+fold = importlib.import_module("hyper_parallel.core.shard.ops.dsa_cp_fold")
+Tensor, ops = ms.Tensor, ms.ops
 
-import mindspore as ms  # noqa: E402
-from mindspore import Tensor, ops  # noqa: E402
-
-from hyper_parallel.core.shard.ops import dsa_cp_fold as fold  # noqa: E402
 
 B, N_HEADS, D = 1, 2, 4
 
@@ -73,7 +73,8 @@ def _causal_mask(q_len, k_len):
     return j <= (k_len - q_len + i)
 
 
-def toy_attention(query, key, value, topk, scale, *rest, query_rope=None, key_rope=None, **kwargs):
+def toy_attention(query: Any, key: Any, value: Any, topk: Any, scale: Any, *rest: Any,
+                  query_rope: Any = None, key_rope: Any = None, **kwargs: Any) -> Any:
     """Dense stand-in for sparse_flash_attention: causal softmax(q k^T) v on the given key.
 
     Shapes follow the BSND kernel: q (B, S1, N, D), k/v (B, S2, 1, D); returns
@@ -93,14 +94,15 @@ def toy_attention(query, key, value, topk, scale, *rest, query_rope=None, key_ro
     ssum = probs.sum(axis=-1, keepdims=True)
     v_h = ops.transpose(value, (0, 2, 1, 3))                # (B, 1, S2, D)
     out = ops.transpose(ops.matmul(probs / ssum, v_h), (0, 2, 1, 3))
-    def stats(t):
+    def stats(t: Any) -> Any:
         """Toy kernel 的统计量布局：(B, N, S1, 1) -> (B, 1, S1, N)。"""
         return ops.transpose(t[..., 0], (0, 2, 1)).expand_dims(1)
 
     return out, stats(smax), stats(ssum)
 
 
-def toy_kl_loss(query, key, q_idx, k_idx, weights, topk, smax, ssum, scale, q_rope, k_rope, *opts):
+def toy_kl_loss(query: Any, key: Any, q_idx: Any, k_idx: Any, weights: Any, topk: Any,
+                smax: Any, ssum: Any, scale: Any, q_rope: Any, k_rope: Any, *opts: Any) -> Any:
     """Stand-in for the fused sparse indexer KL loss: returns its own grads plus a loss.
 
     Per query ``i`` with visible keys ``V(i)``:  d_q_idx[i] = q_idx[i] * sum_{j in V(i)} k_idx[j],
@@ -178,7 +180,7 @@ def test_folded_attention_matches_full_sequence(cp_size):
     topk = np.zeros((B, seq, 1, 1), np.int32)
     scale = 0.5
 
-    def ref_loss(k_t, kr_t):
+    def ref_loss(k_t: Any, kr_t: Any) -> Any:
 
         """整序列一次调用的参考损失（对输出加权求和，便于取梯度）。"""
         out, smax, ssum = toy_attention(Tensor(q), k_t, k_t, Tensor(topk), scale,
@@ -191,7 +193,7 @@ def test_folded_attention_matches_full_sequence(cp_size):
 
     k_fold, kr_fold = Tensor(_folded_full(k, cp_size)), Tensor(_folded_full(kr, cp_size))
 
-    def rank_call(r, k_t, kr_t):
+    def rank_call(r: Any, k_t: Any, kr_t: Any) -> Any:
 
         """单个 CP rank 的折叠调用：query 侧取本 rank 的两块，key 走折叠序。"""
         return fold.fold_sparse_flash_attention(
@@ -199,7 +201,7 @@ def test_folded_attention_matches_full_sequence(cp_size):
             Tensor(_fold_rows(q, r, cp_size)), k_t, k_t, Tensor(_fold_rows(topk, r, cp_size)), scale,
             query_rope=Tensor(_fold_rows(qr, r, cp_size)), key_rope=kr_t)
 
-    def folded_loss(k_t, kr_t):
+    def folded_loss(k_t: Any, kr_t: Any) -> Any:
 
         """把各 rank 的折叠结果按自然序拼回去后的损失，应与参考一致。"""
         total = 0
@@ -229,7 +231,7 @@ def test_folded_indexer_matches_full_sequence(cp_size):
     ki = rng.standard_normal((B, seq, 1, D)).astype(np.float32)
     w = rng.standard_normal((B, seq, N_HEADS)).astype(np.float32)
 
-    def toy_indexer(q_t, k_t, w_t, **kwargs):
+    def toy_indexer(q_t: Any, k_t: Any, w_t: Any, **kwargs: Any) -> Any:
 
         """契约与 ops.lightning_indexer 相同的 toy 实现（无需 NPU）。"""
         del kwargs
@@ -274,7 +276,7 @@ def test_folded_kl_loss_matches_full_sequence(cp_size):
     folded_k = [Tensor(_folded_full(x, cp_size)) for x in (k, ki, kr)]
     d_k_sum, loss_sum = 0, 0
     for r in range(cp_size):
-        def local(x, axis=1, r=r):
+        def local(x: Any, axis: Any=1, r: Any=r) -> Any:
             """本 rank 的折叠切片（r 用默认参数绑定，避免闭包捕获循环变量）。"""
             return Tensor(_fold_rows(x, r, cp_size, axis))
         d_q, d_k, d_w, loss = fold.fold_sparse_indexer_kl_loss(
@@ -312,7 +314,7 @@ def test_unfold_prefix_backward_matches_index_add(cp_size):
             prefix = fold.build_prefix_order(r, cp_size, block)
             w = rng.standard_normal((1, len(prefix) * sf, 1, 5)).astype(np.float32)
 
-            def loss(t, w=w, r=r, block=block):
+            def loss(t: Any, w: Any=w, r: Any=r, block: Any=block) -> Any:
 
                 """对输出加权求和，用来取 key 侧梯度。"""
                 return (fold.unfold_prefix(t, r, cp_size, block) * Tensor(w)).sum()
@@ -336,13 +338,13 @@ def test_unfold_prefix_pair_matches_single(cp_size, used):
               for b in (0, 1)]
         use = {"both": (0, 1), "block0": (0,), "block1": (1,)}[used]
 
-        def pair_loss(t, r=r, ws=ws, use=use):
+        def pair_loss(t: Any, r: Any=r, ws: Any=ws, use: Any=use) -> Any:
 
             """两块前缀合并反向那条路径的损失。"""
             p = fold.unfold_prefix_pair(t, r, cp_size)
             return sum((p[b] * Tensor(ws[b])).sum() for b in use)
 
-        def single_loss(t, r=r, ws=ws, use=use):
+        def single_loss(t: Any, r: Any=r, ws: Any=ws, use: Any=use) -> Any:
 
             """两块各自单独 un-fold 的损失，用作 pair 版本的参考。"""
             return sum((fold.unfold_prefix(t, r, cp_size, b) * Tensor(ws[b])).sum() for b in use)
@@ -354,7 +356,7 @@ def test_unfold_prefix_pair_matches_single(cp_size, used):
                                    ms.grad(single_loss)(Tensor(x)).asnumpy(), rtol=0, atol=1e-6)
 
 
-def toy_dense_lse(q_idx, k_idx, weights, *opts):
+def toy_dense_lse(q_idx: Any, k_idx: Any, weights: Any, *opts: Any) -> Any:
     """Stand-in for the dense stage-1 softmax_lse forward: per-query stats over visible keys.
 
     Returns ``(softmax_max_index, softmax_sum_index)`` as ``(B, 1, S1)``, the layout the
@@ -369,8 +371,8 @@ def toy_dense_lse(q_idx, k_idx, weights, *opts):
     return (seen + w_tok).expand_dims(1), (seen * 2.0).expand_dims(1)
 
 
-def toy_dense_kl_loss(query, key, q_idx, k_idx, weights, smax, ssum,
-                      smax_idx, ssum_idx, scale, q_rope, k_rope, *opts):
+def toy_dense_kl_loss(query: Any, key: Any, q_idx: Any, k_idx: Any, weights: Any, smax: Any, ssum: Any,
+                      smax_idx: Any, ssum_idx: Any, scale: Any, q_rope: Any, k_rope: Any, *opts: Any) -> Any:
     """Stand-in for the fused dense indexer KL loss (18-arg MindSpore form).
 
     Same contract as :func:`toy_kl_loss`, plus the two indexer statistics ``(B, 1, S1)``
@@ -403,7 +405,7 @@ def test_folded_dense_lse_matches_full_sequence(cp_size):
     ref = toy_dense_lse(Tensor(qi), Tensor(ki), Tensor(w), *opts)
     natural_ki = Tensor(ki)  # stage 1 folds the query side only; the key stays in natural order
     for r in range(cp_size):
-        def local(x, axis=1, r=r):
+        def local(x: Any, axis: Any=1, r: Any=r) -> Any:
             """本 rank 的折叠切片（r 用默认参数绑定，避免闭包捕获循环变量）。"""
             return Tensor(_fold_rows(x, r, cp_size, axis))
         out = fold.fold_dense_lightning_indexer_softmax_lse(
@@ -435,7 +437,7 @@ def test_folded_dense_kl_loss_matches_full_sequence(cp_size):
     natural_k = [Tensor(x) for x in (k, ki, kr)]  # stage 1 folds the query side only; the key stays in natural order
     d_k_sum, loss_sum = 0, 0
     for r in range(cp_size):
-        def local(x, axis=1, r=r):
+        def local(x: Any, axis: Any=1, r: Any=r) -> Any:
             """本 rank 的折叠切片（r 用默认参数绑定，避免闭包捕获循环变量）。"""
             return Tensor(_fold_rows(x, r, cp_size, axis))
         d_q, d_k, d_w, loss = fold.fold_dense_indexer_kl_loss(
@@ -540,3 +542,25 @@ def test_same_sequence_type_rebuilds_a_namedtuple():
     assert out == pair(10, 20)
     assert fold._same_sequence_type([1, 2], (value * 10 for value in [1, 2])) == [10, 20]
     assert fold._same_sequence_type((1, 2), (value * 10 for value in (1, 2))) == (10, 20)
+
+
+@pytest.mark.parametrize("intervals", [((1, 6), (17, 24)), ((1, 12), (5, 24)), ((1, 24), (8, 12))])
+def test_compact_prefix_pair_mindspore_backward(intervals):
+    """Exercise the actual MindSpore custom Function bridge, including partial chunks."""
+    order = (2, 5, 1, 0, 7, 3, 6, 4)
+    natural = np.arange(48, dtype=np.float32).reshape(24, 2) / 16
+    folded = np.empty_like(natural)
+    expected = np.zeros_like(natural)
+    for chunk, slot in enumerate(order):
+        folded[slot*3:(slot+1)*3] = natural[chunk*3:(chunk+1)*3]
+    for start, stop in intervals:
+        expected[start:stop] += 2 * natural[start:stop]
+
+    def loss(x: Any) -> Any:
+        """Differentiate the sum of squared compact KV intervals."""
+        a, b = fold._CompactPrefixPair.apply(x, intervals, order)
+        return (a*a).sum() + (b*b).sum()
+
+    grad = ms.grad(loss)(Tensor(folded)).asnumpy()
+    for chunk, slot in enumerate(order):
+        np.testing.assert_allclose(grad[slot*3:(slot+1)*3], expected[chunk*3:(chunk+1)*3])
