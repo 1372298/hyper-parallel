@@ -168,7 +168,7 @@ def _qwen3_npu_rms_norm_forward(module: Any, hidden_states: Any) -> Any:
 
 
 def _install_qwen3_npu_rms_norm() -> None:
-    """Install the shared Trainer and Hyper-vLLM Qwen3 RMSNorm path."""
+    """Install the shared Trainer and adapted vLLM Qwen3 RMSNorm path."""
     if _runtime.npu_rms_norm is not None:
         return
     try:
@@ -273,7 +273,7 @@ def validate_consistency_model_identity(config: Mapping[str, Any], model_registr
     if profile == CONSISTENCY_PROFILE_OFF:
         return
     identity = (
-        model_registration.hyper_model_name,
+        model_registration.builder_model_name,
         model_registration.hf_architecture,
         model_registration.model_type,
         model_registration.text_model_type,

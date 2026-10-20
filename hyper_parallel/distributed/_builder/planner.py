@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+# pylint: disable=missing-apache-license-header
 """planner: ShardingPlanner 6-phase derivation pipeline (05 §3.6 canonical).
 
 Phase 1  parameter role classification (ParameterClassifier + the family's
@@ -285,10 +286,26 @@ class ShardingPlanner:
         if enabled:
             logger.info("ShardingPlan explain:\n%s", plan.explain())
 
-    def _classify_boundary_groups(self, model: Any, arch: str):
+    @staticmethod
+    def _resolve_isolated_roots(model: Any, arch: str) -> tuple[str, ...]:
+        """Find subtrees whose activation layout is owned by a separate runtime."""
+        from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
+
+        adapter = get_model_adapter(arch)
+        if adapter is None or adapter.encoder_parallel is None:
+            return ()
+        spec = adapter.encoder_parallel()
+        names = {name for name, _ in model.named_modules()}
+        return tuple(root for root in spec.isolated_subtrees if root in names)
+
+    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=()):
         """Classify model parameters and group them into candidate boundaries."""
         param_roles = self._classify_all_params(model, arch)
-        return param_roles, self._group_by_boundary(param_roles)
+        regular_roles = {
+            name: role for name, role in param_roles.items()
+            if not any(name.startswith(root + ".") for root in isolated_roots)
+        }
+        return param_roles, self._group_by_boundary(regular_roles)
 
     def plan(
         self,
@@ -400,7 +417,8 @@ class ShardingPlanner:
         # MoE (pre-stacked EP-aware modules use their own dispatcher and
         # are not subject to this constraint)
         # Phase 1: parameter role classification
-        param_roles, boundary_groups = self._classify_boundary_groups(model, arch)
+        isolated_roots = self._resolve_isolated_roots(model, arch) if self._derive else ()
+        param_roles, boundary_groups = self._classify_boundary_groups(model, arch, isolated_roots)
 
         # Phase 3+4: semantic inference + template-fills I/O
         # F4a/F4b: full shapes + requires_grad for the plan-time lints
@@ -426,6 +444,12 @@ class ShardingPlanner:
             model=model,
             param_ndims=param_metadata[0],
         )
+
+        for root in isolated_roots:
+            module = model.get_submodule(root)
+            params = {name: {TP: Replicate()} for name, parameter in module.named_parameters()
+                      if parameter.requires_grad}
+            plan.modules[root] = ModuleShardingSpec(params=params, in_src={}, in_dst={}, is_boundary=False)
 
         # Phase 4.5: merge derived matches and expand fully declared globs
         # against the final model tree to insert new boundaries.
@@ -1190,6 +1214,15 @@ class ShardingPlanner:
         )
 
     @staticmethod
+    def _bias_owner_path(param_name: str) -> Optional[str]:
+        """Return a bias owner's module path, or ``None`` for other params."""
+        if param_name == "bias":
+            return ""
+        if param_name.endswith(".bias"):
+            return param_name[: -len(".bias")]
+        return None
+
+    @staticmethod
     def _collect_deferred_biases(module_fqn: str, spec: ModuleShardingSpec, module: nn.Module) -> List[str]:
         """Validate one boundary's biases and collect rowwise deferred names."""
         named_params = dict(module.named_parameters())
@@ -1199,11 +1232,8 @@ class ShardingPlanner:
         ]
         deferred: List[str] = []
         for param_name, param in named_params.items():
-            if param_name == "bias":
-                owner_path = ""
-            elif param_name.endswith(".bias"):
-                owner_path = param_name[: -len(".bias")]
-            else:
+            owner_path = ShardingPlanner._bias_owner_path(param_name)
+            if owner_path is None:
                 continue
             weight_path = f"{owner_path}.weight" if owner_path else "weight"
             weight = named_params.get(weight_path)
@@ -1405,6 +1435,19 @@ class ShardingPlanner:
                     fqn, prefix, pname, placement, param_shapes, ep_stack, axis_sizes
                 )
 
+    @staticmethod
+    def _declared_parameter_names(plan: ShardingPlan) -> set[str]:
+        """Collect full names covered by placements and special handlers."""
+        covered = set()
+        for fqn, spec in plan.modules.items():
+            prefix = fqn + "." if fqn else ""
+            for pname in (spec.params or {}):
+                covered.add(prefix + pname)
+            for sources in (getattr(spec, "_ep_stack", None) or {}).values():
+                covered.update(prefix + source for source in sources)
+        covered.update(plan.special_handlers or {})
+        return covered
+
     def _check_all_trainable_params_covered(self, plan: ShardingPlan, model) -> None:
         """F4b: every ``requires_grad=True`` parameter must appear in some
         spec.params (resolved to a full FQN) or in special_handlers —
@@ -1428,14 +1471,7 @@ class ShardingPlanner:
         """
         if not self._derive:
             return
-        covered = set()
-        for fqn, spec in plan.modules.items():
-            prefix = fqn + "." if fqn else ""
-            for pname in (spec.params or {}):
-                covered.add(prefix + pname)
-            for sources in (getattr(spec, "_ep_stack", None) or {}).values():
-                covered.update(prefix + s for s in sources)
-        covered.update(plan.special_handlers or {})
+        covered = self._declared_parameter_names(plan)
         uncovered = [
             name for name, p in model.named_parameters()
             if p.requires_grad and name not in covered
@@ -1472,9 +1508,8 @@ class ShardingPlanner:
         removed; only ``_is_terminal`` marking is kept — the last boundary
         in forward order (each module vouches for its own propagation in
         validate mode; adjacent-contract checks no longer exist)."""
-        sorted_fqns = self._topological_sort_by_forward_order(
-            list(plan.modules.keys()), model
-        )
+        boundaries = [fqn for fqn, spec in plan.modules.items() if spec.is_boundary]
+        sorted_fqns = self._topological_sort_by_forward_order(boundaries, model)
         terminal = sorted_fqns[-1] if sorted_fqns else None
         for fqn, spec in plan.modules.items():
             # The planner owns the spec DSL internals.
@@ -1528,33 +1563,56 @@ class ShardingPlanner:
         return []
 
 
+def _validate_tp_model_compatibility(config: Any, tp_size: int, ep_size: int) -> None:
+    """Check model head and expert width divisibility on the TP axis."""
+    heads = getattr(config, "num_attention_heads", None)
+    if heads is not None and heads % tp_size != 0:
+        raise ValueError(
+            f"num_attention_heads ({heads}) must be divisible by TP ({tp_size})"
+        )
+    kv_heads = getattr(config, "num_key_value_heads", None)
+    if kv_heads is not None and kv_heads % tp_size != 0:
+        raise ValueError(
+            f"num_key_value_heads ({kv_heads}) must be divisible by TP ({tp_size})"
+        )
+    moe_inter = getattr(config, "moe_intermediate_size", None)
+    if ep_size > 1 and moe_inter is not None and moe_inter % tp_size != 0:
+        raise ValueError(
+            f"moe_intermediate_size ({moe_inter}) must be divisible by TP ({tp_size})"
+        )
+
+
+def _validate_ep_model_compatibility(config: Any, ep_size: int) -> None:
+    """Check that the model has a divisible routed-expert count."""
+    num_experts = (getattr(config, "num_experts", None)
+                   or getattr(config, "n_routed_experts", None) or 0)
+    if num_experts <= 0:
+        raise ValueError("EP>1 requires MoE model (num_experts > 0)")
+    if num_experts % ep_size != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by EP ({ep_size})"
+        )
+
+
 def validate_model_compatibility(
     model: Any, *, tp_size: int = 1, cp_size: int = 1, ep_size: int = 1,
     seq_len: Optional[int] = None,
 ) -> None:
-    """Model-side compatibility validation (05 §6.5; division of labor
-    with 06's topology validation — this only inspects the model
-    config)."""
+    """Validate model config against requested TP, CP, and EP degrees.
+
+    Args:
+        model: Model whose configuration declares attention and expert sizes.
+        tp_size: Requested decoder tensor-parallel degree.
+        cp_size: Requested decoder context-parallel degree.
+        ep_size: Requested expert-parallel degree.
+        seq_len: Optional global decoder token length.
+    """
     config = getattr(model, "config", None)
     if config is None:
         return
 
     if tp_size > 1:
-        heads = getattr(config, "num_attention_heads", None)
-        if heads is not None and heads % tp_size != 0:
-            raise ValueError(
-                f"num_attention_heads ({heads}) must be divisible by TP ({tp_size})"
-            )
-        kv_heads = getattr(config, "num_key_value_heads", None)
-        if kv_heads is not None and kv_heads % tp_size != 0:
-            raise ValueError(
-                f"num_key_value_heads ({kv_heads}) must be divisible by TP ({tp_size})"
-            )
-        moe_inter = getattr(config, "moe_intermediate_size", None)
-        if ep_size > 1 and moe_inter is not None and moe_inter % tp_size != 0:
-            raise ValueError(
-                f"moe_intermediate_size ({moe_inter}) must be divisible by TP ({tp_size})"
-            )
+        _validate_tp_model_compatibility(config, tp_size, ep_size)
 
     if cp_size > 1 and seq_len is not None and seq_len % (cp_size * 2) != 0:
         raise ValueError(
@@ -1562,11 +1620,4 @@ def validate_model_compatibility(
         )
 
     if ep_size > 1:
-        num_experts = (getattr(config, "num_experts", None)
-                       or getattr(config, "n_routed_experts", None) or 0)
-        if num_experts <= 0:
-            raise ValueError("EP>1 requires MoE model (num_experts > 0)")
-        if num_experts % ep_size != 0:
-            raise ValueError(
-                f"num_experts ({num_experts}) must be divisible by EP ({ep_size})"
-            )
+        _validate_ep_model_compatibility(config, ep_size)

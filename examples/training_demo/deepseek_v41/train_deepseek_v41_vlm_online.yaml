@@ -52,6 +52,8 @@ accelerator:
   pp_size: 1
   sequence_parallel: false
   loss_parallel: false
+  encoder_parallel:
+    enabled: false
 
 fsdp_config:
   dp_shard_size: 8
@@ -69,8 +71,12 @@ fsdp_config:
   comm_fusion: false
 
 plan_overrides:
-  # These replacements are optimizations only: the registered architecture is
-  # executable before the Trainer applies any of them.
+  # The registered architecture runs without replacements. When Encoder
+  # Parallel is enabled, its runtime requires the ViT attention wrapper.
+  - match: "model.vision.blocks.*.attn"
+    module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
+    replace_module:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
   - match:
       - "model.layers.*.attn_hc"
       - "model.layers.*.ffn_hc"
@@ -101,15 +107,6 @@ plan_overrides:
       image_start: {tp: replicate}
       image_end: {tp: replicate}
       image_newline: {tp: replicate}
-  # Complete image grids are replicated across TP×CP before local decoder
-  # insertion. The two-layer aligner therefore stays parameter-replicated and
-  # is not an attention boundary that needs a CP K/V-gather wrapper.
-  - match: "model.aligner"
-    params:
-      w1.weight: {tp: replicate}
-      w1.bias: {tp: replicate}
-      w2.weight: {tp: replicate}
-      w2.bias: {tp: replicate}
   # Fully declared globs create the mHC/Engram boundaries from the final
   # model tree, independent of model depth and Engram layer IDs.
   - match: "model.layers.*.*_hc"
@@ -151,32 +148,17 @@ plan_overrides:
       embed.weight: {ep: "shard(0)"}
       wkv.weight: {tp: replicate}
   - match: "model.layers.*.engram"
-    when: ep
     region_dispatch: false
     local_compute_fn:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_engram_compute_fn
-  # The native vision crop is TP1 in this recipe. Declare its custom linear
-  # weights explicitly so FSDP owns them, and keep them out of decoder-MoE EP.
-  - match: "model.vision.patch_embed.proj"
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: "model.vision.blocks.*.attn.wqkv"
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
-  - match: "model.vision.blocks.*.attn.wo"
-    params:
-      weight: {tp: replicate}
-      bias: {tp: replicate}
   - match: "model.layers.*.mlp"
     when: ep
     region_dispatch: false
     local_compute_fn:
       _target_: >-
         hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
-      use_grouped_gemm: false
+      use_grouped_gemm: true
 
 mixed_precision:
   enabled: false
@@ -213,7 +195,6 @@ dataloader:
     _target_: hyper_parallel.data.batching.build_omni_collate_fn
   get_batch:
     _target_: hyper_parallel.data.batching.OmniParallelBatch
-    encoder_dp: false  # Replicate complete images across TP×CP; bucket routing is not implemented.
     runtime_input_adapter:
       _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
   sampler_type: single
@@ -251,9 +232,21 @@ lr_scheduler:
     min_lr: 0.0
 
 checkpoint:
-  save_ckpt: false
-  checkpoint_dir: ./output/training_demo/deepseek_v41/vlm_checkpoints
-  restore_from: null
+  save_ckpt: true
+  checkpoint_dir: ./output/deepseek_v41/vlm_checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: true
+  save_optimizer: true
+  save_train_state: true
+  # DeepSeek-V4.1 VLM (24.54B) verified: per_rank=true layout works with sync/async
+  # save, full-state resume, weights-only restore, and async checkpoint resume across
+  # 8-card EP8/FSDP8 with text_parameter_divisor=2, vision_parameter_divisor=2, 64 experts.
+  save_extra_state_per_rank: true
+  restore_from: LATEST
+  restore_optimizer: true
+  restore_train_state: true
+  restore_dataloader_state: true
 
 debug:
   check_nan_inf: false

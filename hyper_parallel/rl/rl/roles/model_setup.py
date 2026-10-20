@@ -15,12 +15,13 @@
 """Model identity and role construction shared by training and rollout."""
 
 __all__ = [
-    "HYPER_MODEL_IMPLEMENTATION",
-    "HYPER_QWEN3_ARCHITECTURE",
+    "ADAPTED_MODEL_IMPLEMENTATION",
+    "ADAPTED_QWEN3_ARCHITECTURE",
     "ModelRegistration",
     "NATIVE_MODEL_IMPLEMENTATION",
     "NATIVE_QWEN3_ARCHITECTURE",
     "NATIVE_QWEN3_MOE_ARCHITECTURE",
+    "NATIVE_QWEN3_5_ARCHITECTURE",
     "SUPPORTED_MODEL_IMPLEMENTATIONS",
     "VLLMModelRegistration",
     "architecture_for_implementation",
@@ -40,18 +41,21 @@ from typing import Any, Iterator, Mapping, Optional
 import torch
 
 from hyper_parallel import HSDPModule
+from hyper_parallel.models.qwen3_5.adapter.selected_log_probs import bind_token_log_probs
 
 _TRANSFORMERS_BUILTIN_ATTENTION = "transformers_builtin"
 
-HYPER_MODEL_IMPLEMENTATION = "hyper"
+# Existing recipes and vLLM registrations depend on these public identifiers.
+ADAPTED_MODEL_IMPLEMENTATION = "hyper"
 NATIVE_MODEL_IMPLEMENTATION = "native"
 SUPPORTED_MODEL_IMPLEMENTATIONS = (
-    HYPER_MODEL_IMPLEMENTATION,
+    ADAPTED_MODEL_IMPLEMENTATION,
     NATIVE_MODEL_IMPLEMENTATION,
 )
-HYPER_QWEN3_ARCHITECTURE = "HyperQwen3ForCausalLM"
+ADAPTED_QWEN3_ARCHITECTURE = "HyperQwen3ForCausalLM"
 NATIVE_QWEN3_ARCHITECTURE = "Qwen3ForCausalLM"
 NATIVE_QWEN3_MOE_ARCHITECTURE = "Qwen3MoeForCausalLM"
+NATIVE_QWEN3_5_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
 
 
 @dataclass(frozen=True)
@@ -59,7 +63,7 @@ class ModelRegistration:
     """Resolved logical model, HF identity, and local artifacts."""
 
     name: str
-    hyper_model_name: str
+    builder_model_name: str
     weights_path: str
     tokenizer_path: str
     hf_architecture: str
@@ -77,6 +81,9 @@ class ModelRegistration:
             return "qwen3"
         if self.hf_architecture == NATIVE_QWEN3_MOE_ARCHITECTURE and self.model_type == "qwen3_moe":
             return "qwen3_moe"
+        if (self.hf_architecture == NATIVE_QWEN3_5_ARCHITECTURE
+                and self.model_type == "qwen3_5" and self.text_model_type == "qwen3_5_text"):
+            return "qwen3_5"
         raise ValueError(
             "Unsupported RL model identity: "
             f"architecture={self.hf_architecture!r}, model_type={self.model_type!r}, "
@@ -86,7 +93,7 @@ class ModelRegistration:
 
 @dataclass(frozen=True)
 class VLLMModelRegistration:
-    """Resolved native or Hyper model contract shared by all vLLM paths."""
+    """Resolved native or adapted model contract shared by all vLLM paths."""
 
     model: ModelRegistration
     implementation: str
@@ -98,14 +105,20 @@ class VLLMModelRegistration:
         return self.model.family
 
     @property
-    def is_hyper(self) -> bool:
-        """Return whether rollout uses the Hyper adapter."""
-        return self.implementation == HYPER_MODEL_IMPLEMENTATION
+    def is_adapted(self) -> bool:
+        """Return whether rollout uses the model adapter."""
+        return self.implementation == ADAPTED_MODEL_IMPLEMENTATION
 
     def actor_weight_name(self, name: str) -> Optional[str]:
         """Map one canonical Actor parameter name into the rollout namespace."""
         if name == "lm_head.weight" and self.model.tie_word_embeddings:
             return None
+        if self.family == "qwen3_5":
+            if name == "lm_head.weight":
+                return name
+            if name.startswith(("model.layers.", "model.embed_tokens.", "model.norm.")):
+                return "model.language_model." + name.removeprefix("model.")
+            raise ValueError(f"Expected a text-only Qwen3.5 Actor parameter, got {name!r}")
         return name
 
 
@@ -128,11 +141,12 @@ def architecture_for_implementation(
     normalized = normalize_model_implementation(implementation)
     architectures = {
         "qwen3": {
-            HYPER_MODEL_IMPLEMENTATION: HYPER_QWEN3_ARCHITECTURE,
+            ADAPTED_MODEL_IMPLEMENTATION: ADAPTED_QWEN3_ARCHITECTURE,
             NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_ARCHITECTURE,
         },
     }
     architectures["qwen3_moe"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_MOE_ARCHITECTURE}
+    architectures["qwen3_5"] = {NATIVE_MODEL_IMPLEMENTATION: NATIVE_QWEN3_5_ARCHITECTURE}
     try:
         return architectures[model_family][normalized]
     except KeyError as error:
@@ -158,13 +172,15 @@ def resolve_vllm_model(
 
 
 def build_role_model(runtime_config: object, distributed_setup: object, *, frozen: bool) -> torch.nn.Module:
-    """Build one finalized role model through the HyperAutoModel atomic loader."""
+    """Build one finalized role model through the shared atomic model loader."""
     activation_checkpoint = getattr(runtime_config.activation_checkpoint, "mode", "off")
     model = runtime_config.model.build(
         distributed_setup=distributed_setup,
         activation_checkpoint=activation_checkpoint,
         peft_config=runtime_config.peft,
     )
+    if getattr(getattr(model, "config", None), "model_type", None) == "qwen3_5_text":
+        bind_token_log_probs(model)
     if frozen:
         for parameter in model.parameters():
             parameter.requires_grad_(False)
@@ -248,7 +264,7 @@ def resolve_model(model: Mapping[str, Any]) -> ModelRegistration:
         raise ValueError("Model text_config must be a mapping when present")
     registration = ModelRegistration(
         name=name,
-        hyper_model_name=str(model["name"]),
+        builder_model_name=str(model["name"]),
         weights_path=str(model["weights_path"]),
         tokenizer_path=str(model["tokenizer_path"]),
         hf_architecture=str(architectures[0]),

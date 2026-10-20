@@ -85,6 +85,22 @@ Codex Gateway 按 `agentic.max_turns` 预留模型调用额度，成功、失败
 Codex 可按配置启动 MCP stdio server。`rl/agentic/mcp_server.py` 只是把现有 `ToolRegistry` 暴露为 MCP
 `tools/list` 和 `tools/call`，不会复制或改写工具实现。
 
+### 仓库型 Codex Code Agent
+
+`agentic.codex.program_callable=examples.swe_smith.agent:SWESmithProgram` 选择仓库任务，
+复用 Search-R1 的程序扩展方式。`admin_auth=true` 显式启用管理鉴权，任务编排和评分由示例持有。
+候选与 grader 各使用固定镜像的离线 Docker 工作区，不挂载 NPU 或 Docker socket。
+控制侧管理接口鉴权，候选仅持有会话 token，通过 relay 调用共享模型；原始请求与转发后的
+容器上下文分别保留，固定 CLI 的工具 schema 和压缩请求均校验。
+
+CLI 正常退出并确认 `turn.completed` 后，停止候选、冻结提交，再由独立 grader 给出奖励。
+仓库任务允许没有文字总结；已完成的调用预算耗尽也可在核验终止证据后冻结判题。
+这不改变普通文本 Codex 对最终回答和调用预算的合同。基础设施或不完整轨迹不能降为零奖励。
+
+SWE-Smith 子集/全量准备、Qwen3.5/3.8 配方及运行命令见
+[仓库示例](../examples/swe_smith/README.md)；CPU 合同与待完成的镜像/NPU 验收见
+[验证范围](../examples/swe_smith/README.md#图执行与验证范围)。
+
 ## Hyper-RL 如何消费 Agentic 结果
 
 一次训练 step 的真实顺序位于 `SyncTrainer._train_step()`：
@@ -131,7 +147,7 @@ DP rank 的调用行数不同会追加 `dp_padding` 行，保留合法上下文�
 
 ## 工具失败归因与收尾
 
-固定版本 vLLM/Hermes 只读采集原始 token、engine text、parser 输入和结果，不修改采样动作。
+固定版本 vLLM 的 Hermes（Qwen3）或 Qwen3Coder XML（Qwen3.5 家族）只读采集原始 token、engine text、parser 输入和结果，不修改采样动作。
 归因规则为：
 
 - 原始证据一致且模型 JSON 或工具调用封装结构不合法：模型失败，保留该次动作及概率；在剩余调用额度内可重新生成。
@@ -179,7 +195,8 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 - `rollout.engine` 必须是 `vllm`。
 - `rollout.vllm.logprobs_mode` 必须是 `raw_logprobs`。
 - `rollout.vllm.enable_auto_tool_choice` 必须为 `true`。
-- `rollout.vllm.tool_call_parser` 必须是 `hermes`，原始解析证据仅适配固定镜像中的该解析器。
+- `rollout.vllm.tool_call_parser` 按模型家族选择：Qwen3 为 `hermes`，Qwen3.5 家族为 `qwen3_coder`。
+  原始解析证据须来自固定运行时中对应的 parser。
 - Gateway 端口不能与 vLLM 端口相同。
 - Codex CLI 当前固定验证版本为 `0.152.1`。
 - DeepSeek Harness SDK 当前固定验证版本为 `0.1.1rc1`。
@@ -208,12 +225,12 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 
 ## 当前实现边界
 
-- 当前支持的训练算法是 GRPO 和 PPO；实际验证范围以[特性清单](current_feature_inventory.md)及
-  [系统测试指南](hyper-rl-st.md)为准。多节点和异步 rollout 不在本文描述的实现范围内。
+- 当前支持的训练算法是 GRPO、PPO 和 GSPO；外部逐调用轨迹限定 GRPO。实际验证范围以[RL 支持范围](../README.md)及
+  [系统测试指南](../README.md#系统测试)为准。多节点和异步 rollout 不在本文描述的实现范围内。
 - 外部 runner 复用唯一共享 vLLM endpoint，不创建第二个 rollout Router 或 rank-local server。
 - External harness 的语义循环可以不同，但必须返回标准、token 对齐且策略身份一致的 `Trajectory`。
 - Agentic UT 可从仓库根目录运行 `pytest -q tests/ut/rl/agentic/agentic_ut.py`；
-  独立脚本的 coverage 门槛及已有缺口见 [UT 指南](hyper_rl_ut.md)。
+  完整 CPU 回归与合同分组见 [Code Agent 验证范围](../examples/swe_smith/README.md#图执行与验证范围)。
 
 ## 验证入口
 

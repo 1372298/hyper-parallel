@@ -155,17 +155,20 @@ lr_scheduler:
     min_lr: 0.0
 
 checkpoint:
-  save_ckpt: false
+  save_ckpt: true
   checkpoint_dir: ./outputs/qwen3_moe/checkpoints
   save_steps: 10
   save_epochs: 1
-  is_async: false
+  is_async: true
   save_optimizer: true
   save_train_state: true
+  # Qwen3-30B-A3B verified: per_rank=false layout works with sync/async save,
+  # full-state resume, and weights-only restore across 8-card EP8/FSDP8.
   save_extra_state_per_rank: false
-  restore_from: null
+  restore_from: LATEST
   restore_optimizer: true
   restore_train_state: true
+  restore_dataloader_state: true
 
 debug:
   check_nan_inf: false

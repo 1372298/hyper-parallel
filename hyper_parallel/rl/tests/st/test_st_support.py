@@ -226,7 +226,7 @@ def test_agent_requires_roundtrip_and_release(tmp_path: Path, damage: str, logpr
 @pytest.mark.parametrize("damage", ["none", "runtime", "hf-config", "hf-architecture", "hf-tokenizer",
                                    "hf-shard", "hf-index"])
 @pytest.mark.parametrize("scenario", ["checkpoint-resume", "ppo-checkpoint-resume", "dense-tp1-full"])
-def test_checkpoint_uses_current_hyperparallel_format(tmp_path: Path, damage: str, scenario: str) -> None:
+def test_checkpoint_uses_current_distributed_format(tmp_path: Path, damage: str, scenario: str) -> None:
     """Checkpoint evidence requires resumable state and a complete final HF export."""
     case = Case(scenario, strategy="direct_reshard", resume=scenario != "dense-tp1-full",
                 algorithm="ppo" if scenario.startswith("ppo") else "grpo")

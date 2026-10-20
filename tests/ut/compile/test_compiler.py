@@ -80,7 +80,7 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
             device=torch.device("cpu"),
         )
 
-        loss = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        loss, _ = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsNotNone(
             comp._joint_graph, "compile should populate the joint graph"
@@ -101,7 +101,7 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
         )
 
         comp.compile(x=torch.randn(2, 4), y=torch.randn(2, 4))
-        loss = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+        loss, _ = comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
 
         self.assertIsInstance(loss, torch.Tensor)
         self.assertIsNotNone(model.weight.grad)
@@ -160,6 +160,21 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
 class TestGraphCompilerDevice(unittest.TestCase):
     """``to`` (device move)."""
 
+    def test_pytree_pre_hook_runs_before_lazy_compile(self):
+        """The compiler should run tracer setup before its first lazy compile."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=False),
+            device=torch.device("cpu"),
+        )
+        calls = []
+        comp.set_pytree_pre_hook(lambda: calls.append("hook"))
+
+        comp.forward_backward(x=torch.randn(2, 4), y=torch.randn(2, 4))
+
+        self.assertEqual(calls, ["hook"])
+
     def test_to_moves_model_and_device(self):
         """Test ``to`` moves the model and records the device."""
         comp = GraphCompiler(
@@ -213,8 +228,8 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
         mock_init_mesh.assert_called_once()
         self.assertEqual(
             fake_mesh.__getitem__.call_args.args,
-            ("fsdp",),
-            "the 1-D fallback mesh must be indexed by its 'fsdp' dim",
+            ("fsdp_shard",),
+            "the 1-D fallback mesh must be indexed by its 'fsdp_shard' dim",
         )
         self.assertEqual(
             mock_register.call_args.args[0],
@@ -334,6 +349,222 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
             "a mesh without fsdp_shard should use the dp axis",
         )
         self.assertEqual(mock_register.call_args.args[1], "DPPG")
+
+    def test_init_device_mesh_fallback_ddp_registers_replicate(self):
+        """Test ``dp_mode='ddp'`` builds a 1-D ``dp_replicate`` mesh."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True, dp_mode="ddp"),
+            device=torch.device("cpu"),
+        )
+        mock_dist = MagicMock()
+        mock_dist.get_world_size.return_value = 4
+        fake_sub = MagicMock()
+        fake_sub.size.return_value = 4
+        fake_sub.get_group.return_value = "REPL_PG"
+        fake_mesh = MagicMock()
+        fake_mesh.__getitem__.return_value = fake_sub
+        mock_init_mesh = MagicMock(return_value=fake_mesh)
+        mock_register = MagicMock()
+
+        with (
+            patch("hyper_parallel.compile.compiler.dist", mock_dist),
+            patch(
+                "hyper_parallel.compile.compiler._register_process_group",
+                mock_register,
+            ),
+            patch("hyper_parallel.compile.compiler.init_device_mesh", mock_init_mesh),
+        ):
+            comp._init_device_mesh(None)
+
+        self.assertEqual(
+            fake_mesh.__getitem__.call_args.args,
+            ("fsdp_replicate",),
+            "the DDP fallback mesh must be indexed by its 'fsdp_replicate' dim",
+        )
+        self.assertEqual(mock_register.call_args.args[0], "dp_replicate")
+        self.assertEqual(mock_register.call_args.args[1], "REPL_PG")
+        self.assertEqual(comp.pass_config.dp_replicate_degree, 4)
+
+    def test_init_device_mesh_fallback_hsdp_builds_2d(self):
+        """Test ``dp_mode='hsdp'`` builds a 2-D ``(dp_replicate, fsdp)`` mesh."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(
+                fsdp_enabled=True,
+                dp_mode="hsdp",
+                fsdp_degree=2,
+                dp_replicate_degree=2,
+            ),
+            device=torch.device("cpu"),
+        )
+        mock_dist = MagicMock()
+        mock_dist.get_world_size.return_value = 4
+        repl_sub = MagicMock()
+        repl_sub.size.return_value = 2
+        repl_sub.get_group.return_value = "REPL_PG"
+        shard_sub = MagicMock()
+        shard_sub.size.return_value = 2
+        shard_sub.get_group.return_value = "SHARD_PG"
+        fake_mesh = MagicMock()
+        fake_mesh.__getitem__.side_effect = {
+            "fsdp_replicate": repl_sub,
+            "fsdp_shard": shard_sub,
+        }.__getitem__
+        mock_init_mesh = MagicMock(return_value=fake_mesh)
+        mock_register = MagicMock()
+
+        with (
+            patch("hyper_parallel.compile.compiler.dist", mock_dist),
+            patch(
+                "hyper_parallel.compile.compiler._register_process_group",
+                mock_register,
+            ),
+            patch("hyper_parallel.compile.compiler.init_device_mesh", mock_init_mesh),
+        ):
+            comp._init_device_mesh(None)
+
+        call = mock_init_mesh.call_args
+        self.assertEqual(
+            call.args[1],
+            (2, 2),
+            "HSDP fallback must build a (replicate, shard) 2-D mesh",
+        )
+        self.assertEqual(
+            call.kwargs.get("mesh_dim_names"),
+            ("fsdp_replicate", "fsdp_shard"),
+            "HSDP mesh axes must match automodel (fsdp_replicate / fsdp_shard)",
+        )
+        registered = {c.args[0]: c.args[1] for c in mock_register.call_args_list}
+        self.assertEqual(
+            registered,
+            {"dp_replicate": "REPL_PG", "fsdp": "SHARD_PG"},
+            "both HSDP groups must be registered",
+        )
+        self.assertEqual(comp.pass_config.dp_replicate_degree, 2)
+        self.assertEqual(comp.pass_config.fsdp_degree, 2)
+
+    def test_init_device_mesh_fallback_rejects_tp(self):
+        """Test the fallback refuses a TP topology (needs a MeshContext)."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True, tp_size=2),
+            device=torch.device("cpu"),
+        )
+        mock_dist = MagicMock()
+        mock_dist.get_world_size.return_value = 4
+        with patch("hyper_parallel.compile.compiler.dist", mock_dist):
+            with self.assertRaises(ValueError) as ctx:
+                comp._init_device_mesh(None)
+        self.assertIn("tp_size", str(ctx.exception))
+
+    def test_init_device_mesh_fallback_rejects_pp(self):
+        """Test the fallback refuses a PP topology (needs a MeshContext)."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True, pp_enabled=True),
+            device=torch.device("cpu"),
+        )
+        mock_dist = MagicMock()
+        mock_dist.get_world_size.return_value = 4
+        with patch("hyper_parallel.compile.compiler.dist", mock_dist):
+            with self.assertRaises(ValueError) as ctx:
+                comp._init_device_mesh(None)
+        self.assertIn("pp_enabled", str(ctx.exception))
+
+    def test_init_device_mesh_context_upgrades_fsdp_to_hsdp(self):
+        """Test a replicate axis > 1 upgrades ``dp_mode='fsdp'`` to ``'hsdp'``.
+
+        Eager ``fully_shard`` picks HSDP from ``dp_replicate_size > 1``; the
+        graph path must not silently treat such a mesh as plain FSDP.
+        """
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True),  # dp_mode defaults "fsdp"
+            device=torch.device("cpu"),
+        )
+        repl_sub = MagicMock()
+        repl_sub.size.return_value = 2
+        repl_sub.get_group.return_value = "REPL_PG"
+        shard_sub = MagicMock()
+        shard_sub.size.return_value = 2
+        shard_sub.get_group.return_value = "SHARD_PG"
+        mock_non_moe = MagicMock()
+        mock_non_moe.mesh_dim_names = ("fsdp_replicate", "fsdp_shard", "tp")
+        mock_non_moe.__getitem__.side_effect = {
+            "fsdp_replicate": repl_sub,
+            "fsdp_shard": shard_sub,
+        }.__getitem__
+        mesh_context = MagicMock()
+        mesh_context.fsdp_non_moe_mesh = mock_non_moe
+        mesh_context.device_mesh = None
+        mesh_context.dp_replicate_size = 2
+        mesh_context.dp_shard_size = 2
+
+        mock_register = MagicMock()
+        with patch(
+            "hyper_parallel.compile.compiler._register_process_group", mock_register
+        ):
+            comp._init_device_mesh(mesh_context)
+
+        self.assertEqual(comp.pass_config.dp_mode, "hsdp")
+        registered = {c.args[0]: c.args[1] for c in mock_register.call_args_list}
+        self.assertEqual(registered, {"dp_replicate": "REPL_PG", "fsdp": "SHARD_PG"})
+        self.assertEqual(comp.pass_config.fsdp_degree, 2)
+        self.assertEqual(comp.pass_config.dp_replicate_degree, 2)
+
+    def test_init_device_mesh_context_downgrades_hsdp_to_fsdp(self):
+        """Test a 1-wide replicate axis downgrades ``'hsdp'`` to ``'fsdp'``."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True, dp_mode="hsdp"),
+            device=torch.device("cpu"),
+        )
+        shard_sub = MagicMock()
+        shard_sub.size.return_value = 4
+        shard_sub.get_group.return_value = "SHARD_PG"
+        mock_non_moe = MagicMock()
+        mock_non_moe.mesh_dim_names = ("fsdp_replicate", "fsdp_shard", "tp")
+        mock_non_moe.__getitem__.side_effect = {"fsdp_shard": shard_sub}.__getitem__
+        mesh_context = MagicMock()
+        mesh_context.fsdp_non_moe_mesh = mock_non_moe
+        mesh_context.device_mesh = None
+        mesh_context.dp_replicate_size = 1
+        mesh_context.dp_shard_size = 4
+
+        mock_register = MagicMock()
+        with patch(
+            "hyper_parallel.compile.compiler._register_process_group", mock_register
+        ):
+            comp._init_device_mesh(mesh_context)
+
+        self.assertEqual(comp.pass_config.dp_mode, "fsdp")
+        self.assertEqual(mock_register.call_args.args[0], "fsdp")
+        self.assertEqual(comp.pass_config.fsdp_degree, 4)
+
+    def test_init_device_mesh_context_ddp_rejects_sharding(self):
+        """Test ``dp_mode='ddp'`` with a sharding mesh raises (use ``hsdp``)."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(fsdp_enabled=True, dp_mode="ddp"),
+            device=torch.device("cpu"),
+        )
+        mesh_context = MagicMock()
+        mesh_context.fsdp_non_moe_mesh = None
+        mesh_context.device_mesh = MagicMock()
+        mesh_context.dp_replicate_size = 1
+        mesh_context.dp_shard_size = 2
+
+        with self.assertRaises(ValueError) as ctx:
+            comp._init_device_mesh(mesh_context)
+        self.assertIn("dp_shard_size", str(ctx.exception))
 
 
 if __name__ == "__main__":

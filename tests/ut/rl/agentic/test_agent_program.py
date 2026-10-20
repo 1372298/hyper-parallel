@@ -217,7 +217,9 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
         args = _arguments()
         captured = {"policy_version": 3, "completions": [_record(0, [1], [2])]}
         with patch.object(harness, "_load_reward_callable", return_value=lambda *values: 1.0):
-            program = harness.CodexAgentProgram(args["prompt"], 3, 0, "http://gateway", {}, 9)
+            program = harness.CodexAgentProgram(
+                args["prompt"], 3, 0, "http://gateway", {"reward_callable": "example:reward"}, 9,
+            )
         with (
             patch.object(program, "_write_codex_config"),
             patch.object(program, "_validate_version", new=AsyncMock()),
@@ -243,7 +245,10 @@ class TestAgentProgram(unittest.IsolatedAsyncioTestCase):
                    "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
                    "print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'done'}}))"]
         with patch.object(harness, "_load_reward_callable", return_value=lambda *values: 1.0):
-            program = harness.CodexAgentProgram(args["prompt"], 3, 0, "http://gateway", {"timeout_seconds": 2}, 9)
+            program = harness.CodexAgentProgram(
+                args["prompt"], 3, 0, "http://gateway",
+                {"timeout_seconds": 2, "reward_callable": "example:reward"}, 9,
+            )
         with tempfile.TemporaryDirectory() as directory, patch.object(program, "_codex_command", return_value=command):
             path = Path(directory)
             result = await asyncio.wait_for(program._run_codex("test", path, path, path), 5)

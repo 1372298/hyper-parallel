@@ -21,7 +21,7 @@
 # The maintainers of hyper_parallel/core.
 /hyper_parallel/core/ @yangzhenzhang02
 /hyper_parallel/core/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
-/hyper_parallel/core/fully_shard/ @Meng107
+/hyper_parallel/core/fully_shard/ @mxysfive
 /hyper_parallel/core/pipeline_parallel/ @lichen666
 /hyper_parallel/core/shard/ @yangzhenzhang02
 /hyper_parallel/core/shard/ops/ @davidhe91
@@ -40,7 +40,7 @@
 /tests/torch/ @yangzhenzhang02
 /tests/torch/activation_memory/ @DavidFFFan
 /tests/torch/distributed_checkpoint/ @zhangbuxue @xiaoyuxing-010818
-/tests/torch/fully_shard/ @Meng107
+/tests/torch/fully_shard/ @mxysfive
 /tests/torch/pipeline_parallel/ @lichen666
 /tests/torch/process_group/ @changzherui1 @changzherui
 /tests/torch/shard/ @yangzhenzhang02

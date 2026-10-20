@@ -25,7 +25,9 @@ real sharder without a process group.
 # pylint: disable=wrong-import-position
 
 import os
+import importlib
 import unittest
+from math import lcm
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -47,10 +49,9 @@ def _has_vlm_chain() -> bool:
     install without libhccl).
     """
     try:
-        from transformers import AutoProcessor  # noqa: F401
+        return bool(importlib.import_module("transformers").AutoProcessor)
     except ImportError:
         return False
-    return True
 
 
 _HAS_VLM_CHAIN = _has_vlm_chain()
@@ -89,14 +90,43 @@ def _build_sharder(cp_size, cp_rank=0):
     return CPBatchSharder(_FakeParallelContext(cp_size, cp_rank), token_pad_values=token_pad_values)
 
 
+def _build_sp_sharder(cp_size, tp_size, cp_rank=0):
+    """Build an Omni sharder with the compact-attention/SP alignment."""
+    token_pad_values = {field: OMNI_CP_PAD_VALUES.get(field, 0) for field in OMNI_CP_TOKEN_FIELDS}
+    alignment = lcm(2 * cp_size, cp_size * tp_size)
+    return CPBatchSharder(_FakeParallelContext(cp_size, cp_rank), token_pad_values=token_pad_values,
+                          required_global_alignment=alignment)
+
+
 @unittest.skipIf(not _HAS_VLM_CHAIN, "transformers AutoProcessor import chain unavailable")
 class TestOmniBatchCpSharding(unittest.TestCase):
     """Token fields shard per CP rank; modality metadata stays complete."""
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_sp_alignment_cp1_and_cp2(self):
+        """Feature: Omni token padding for decoder sequence parallelism.
+
+        Description: Shard an eleven-token packed batch with CP1 and CP2 at TP4.
+        Expectation: Token fields and final segment boundary follow the LCM alignment.
+        """
+        batch = _make_batch(seq_len=11, pad_tail=0)
+        for cp_size, expected_length in ((1, 12), (2, 8)):
+            for cp_rank in range(cp_size):
+                with self.subTest(cp_size=cp_size, cp_rank=cp_rank):
+                    sharded = _build_sp_sharder(cp_size, 4, cp_rank).shard(batch)
+                    self.assertEqual(sharded["input_ids"].shape[1], expected_length)
+                    self.assertEqual(sharded["labels"].shape[1], expected_length)
+                    self.assertEqual(int(sharded["cu_seq_lens"][-1]), expected_length * cp_size)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_cp1_keeps_the_batch_untouched(self):
-        """Without CP the sharder is a pass-through (regression guard)."""
+        """Feature: single-rank CP batching.
+
+        Description: Shard an already aligned batch with CP size one.
+        Expectation: Token and media fields remain unchanged.
+        """
         batch = _make_batch()
         sharded = _build_sharder(1).shard(batch)
 
@@ -108,7 +138,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp2_slices_token_fields_to_the_rank_window(self):
-        """Each rank keeps its own contiguous window of every token field."""
+        """Feature: CP token-field sharding.
+
+        Description: Shard eight token rows across two CP ranks.
+        Expectation: Each rank receives its contiguous window for every token field.
+        """
         seq_len = 8
         batch = _make_batch(seq_len=seq_len)
         for cp_rank in (0, 1):
@@ -123,7 +157,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_keeps_media_fields_complete(self):
-        """The vision inputs stay full-length so the media scatter is unsharded."""
+        """Feature: CP multimodal metadata preservation.
+
+        Description: Shard token fields while retaining image payloads.
+        Expectation: Vision tensors and grid metadata remain complete.
+        """
         batch = _make_batch()
         sharded = _build_sharder(2, 1).shard(batch)
 
@@ -135,7 +173,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_pads_an_indivisible_sequence_length(self):
-        """A sequence that ``2 * cp_size`` does not divide is padded, not rejected."""
+        """Feature: CP sequence alignment.
+
+        Description: Shard eight tokens across three CP ranks.
+        Expectation: Token and segment metadata pad to twelve rows.
+        """
         seq_len = 8
         batch = _make_batch(seq_len=seq_len)
         sharded = _build_sharder(3, cp_rank=0).shard(batch)
@@ -149,7 +191,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_a_multi_row_batch(self):
-        """Configured CP sharding requires the packed single-row layout."""
+        """Feature: packed Omni batch shape validation.
+
+        Description: Pass a two-row input batch to CP sharding.
+        Expectation: The single-row contract rejects it.
+        """
         batch = _make_batch()
         batch["input_ids"] = torch.cat((batch["input_ids"], batch["input_ids"]), dim=0)
         batch["labels"] = torch.cat((batch["labels"], batch["labels"]), dim=0)
@@ -159,7 +205,11 @@ class TestOmniBatchCpSharding(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_cp_rejects_token_fields_that_do_not_match_input_ids(self):
-        """A token field with the wrong shape is a collator bug, not silent padding."""
+        """Feature: CP token-field shape validation.
+
+        Description: Provide labels shorter than input IDs.
+        Expectation: The mismatched field fails before padding.
+        """
         batch = _make_batch()
         batch["labels"] = batch["labels"][:, :4]
         with self.assertRaisesRegex(ValueError, "must match input_ids shape"):

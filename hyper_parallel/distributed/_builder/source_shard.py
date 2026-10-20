@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple, TypeAlias
 
 from torch.nn import Module as ModuleClass
 from torch.nn import Parameter as ParameterClass
+from torch.utils.weak import WeakIdKeyDictionary
 
 import hyper_parallel.core.fully_shard.utils as fully_shard_utils
 from hyper_parallel import DeviceMesh, DTensor, Replicate
@@ -374,16 +375,22 @@ def _build_managed_source_shard_info(
 
 def _source_infos_for_fully_shard(
     managed_source_shard_info: SourceShardInfoByParam | None,
-) -> SourceShardInfoByParam | None:
-    """Return explicit metadata only for plain source-layout parameters.
+) -> Mapping[ParameterClass, fully_shard_utils.SourceShardMetaInfo] | None:
+    """Return non-owning metadata only for plain source-layout parameters.
 
     Validate-mode parameters remain native DTensors. The FSDP
     state derives their source layouts from each parameter directly and
     rejects duplicate explicit metadata.
+
+    The adapter keeps its construction-local mapping for post-wrap gradient
+    configuration. FSDP receives weak identity keys so its scheduler and state
+    cannot keep the replaced original parameters and their storage alive.
     """
+    if managed_source_shard_info is None:
+        return None
     if managed_source_shard_info and all(
         source_shard_info.origin_is_dtensor
         for source_shard_info in managed_source_shard_info.values()
     ):
         return None
-    return managed_source_shard_info
+    return WeakIdKeyDictionary(managed_source_shard_info)

@@ -265,6 +265,41 @@ class TestReshardStructure(unittest.TestCase):
         self.assertEqual(_count_nodes(graph, "fsdp_all_gather_backward"), 1)
         self.assertEqual(_count_nodes(graph, "fsdp_reshard_free_backward"), 1)
 
+    def test_backward_nodes_carry_backward_phase_tag(self):
+        """Backward re-gather/free are tagged ``autograd_backward``.
+
+        Downstream passes (e.g. PpPass phase classification) derive a node's
+        phase from ``meta['autograd_backward']``. The re-gather's only input is
+        a forward state placeholder, so without the tag it (and its wait, and
+        the backward free) would be mistaken for forward nodes. The forward
+        gather/free must stay untagged.
+        """
+        graph, _ = _trace_and_run(self.model, reshard=True)
+
+        backward_nodes = [
+            n for n in graph.graph.nodes if n.meta.get("autograd_backward", False)
+        ]
+        comm_types = [n.meta.get("comm_type") for n in backward_nodes]
+        self.assertIn("fsdp_all_gather_backward", comm_types)
+        self.assertIn("fsdp_reshard_free_backward", comm_types)
+
+        backward_ag = next(
+            n
+            for n in graph.graph.nodes
+            if n.meta.get("comm_type") == "fsdp_all_gather_backward"
+        )
+        backward_wait = next(
+            n for n in backward_ag.users if "wait_tensor" in str(n.target)
+        )
+        self.assertTrue(backward_wait.meta.get("autograd_backward", False))
+
+        forward_gathers = [
+            n for n in graph.graph.nodes if n.meta.get("comm_type") == "fsdp_all_gather"
+        ]
+        self.assertTrue(forward_gathers)
+        for node in forward_gathers:
+            self.assertFalse(node.meta.get("autograd_backward", False))
+
     def test_forward_gather_is_sunk_to_first_use(self):
         """The last layer's gather lands after earlier compute, not at the top.
 

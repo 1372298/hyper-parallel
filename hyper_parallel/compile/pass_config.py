@@ -25,16 +25,41 @@ mode. The explicit field fixes that. Pipeline-parallel (``pp_enabled``)
 follows the same contract: intent here, runtime guard in ``PpPass``.
 """
 
-__all__ = ["PassConfig", "PP_SCHEDULES"]
+__all__ = ["PassConfig", "PP_SCHEDULES", "DP_MODES", "normalize_dp_mode"]
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 # Pipeline schedule names accepted by ``pp_schedule``. Kept torch-free here so
 # the config dataclass stays importable anywhere; ``pp_schedule``'s registry
 # (which does import torch) must expose exactly these keys.
 PP_SCHEDULES = ("gpipe", "1f1b")
+
+# Data-parallel modes, mirroring simplefsdp's ``data_parallel`` modes:
+#   "fsdp" -> fully_shard        (Shard(0) on the fsdp axis)
+#   "ddp"  -> replicate          (Replicate; grads all-reduced)
+#   "hsdp" -> hybrid_shard       (Replicate x Shard(0); rs + all-reduce)
+DP_MODES = ("fsdp", "ddp", "hsdp")
+
+# simplefsdp / fully_shard spellings accepted as aliases.
+_DP_MODE_ALIASES = {
+    "fully_shard": "fsdp",
+    "replicate": "ddp",
+    "hybrid_shard": "hsdp",
+}
+
+
+def normalize_dp_mode(mode: str) -> str:
+    """Return the canonical DP mode for ``mode`` (accepts simplefsdp aliases).
+
+    Raises:
+        ValueError: When ``mode`` is not a string or is unknown.
+    """
+    if not isinstance(mode, str):
+        raise ValueError(f"dp_mode must be a string, got {type(mode).__name__}")
+    key = mode.strip().lower()
+    return _DP_MODE_ALIASES.get(key, key)
 
 
 @dataclass
@@ -44,12 +69,12 @@ class PassConfig:
     Attributes:
         enable_overlap: Drive ``AutoOverlapPass`` to move ``wait_tensor`` for
             communication/compute overlap.
-        fsdp_enabled: Drive ``FSDPPass`` (parameter all_gather + gradient
-            reduce_scatter + live-model sharding). ``False`` skips FSDP
-            entirely — set this for pure-TP / pure-PP graph-mode runs.
-            ``FSDPPass`` itself still early-returns when distributed is not
-            initialized or ``world_size == 1``, so single-card runs are a
-            no-op regardless.
+        fsdp_enabled: Drive ``FSDPPass`` (data-parallel partitioning: parameter
+            all_gather + gradient reduction + live-model sharding, selected by
+            ``dp_mode``). ``False`` skips data parallelism entirely — set this
+            for pure-TP / pure-PP graph-mode runs. ``FSDPPass`` itself still
+            early-returns when distributed is not initialized or
+            ``world_size == 1``, so single-card runs are a no-op regardless.
         fsdp_reshard_after_forward: Drive the FSDP reshard optimization.
             When ``True`` (default, matching FSDP's ``reshard_after_forward``)
             ``FSDPPass`` sinks each param's all_gather to its first forward
@@ -67,6 +92,19 @@ class PassConfig:
             to ``world_size`` for the FSDP-only path. Mutating this after
             construction is supported but discouraged — prefer passing the
             resolved degree at construction time (see ``GraphTrainer``).
+            For ``dp_mode="hsdp"`` this is the *shard* axis degree.
+        dp_mode: Data-parallel mode, one of ``DP_MODES``: ``"fsdp"``
+            (fully_shard, the default), ``"ddp"`` (replicate; no parameter
+            sharding, gradients all-reduced), or ``"hsdp"`` (hybrid_shard;
+            parameters replicated on the ``dp_replicate`` axis and sharded on
+            the ``fsdp`` axis, gradients reduce-scattered then all-reduced).
+            simplefsdp spellings ``"fully_shard"`` / ``"replicate"`` /
+            ``"hybrid_shard"`` are accepted as aliases and normalized.
+        dp_replicate_degree: Size of the replicate axis for ``"ddp"`` /
+            ``"hsdp"``. ``None`` means "resolve at runtime" (from the mesh,
+            or ``world_size // fsdp_degree`` for HSDP / ``world_size`` for
+            DDP). Kept separate from ``fsdp_degree`` (the shard axis) so an
+            HSDP mesh is unambiguous.
         tp_size: Tensor-parallel degree. Informational today (TP collectives
             live inside boundary forwards baked by automodel, not in the
             graph-mode passes); kept so a future TP-aware pass can read it
@@ -114,6 +152,8 @@ class PassConfig:
     fsdp_enabled: bool = True
     fsdp_reshard_after_forward: bool = True
     fsdp_degree: Optional[int] = None
+    dp_mode: str = "fsdp"
+    dp_replicate_degree: Optional[int] = None
     tp_size: int = 1
     sequence_parallel: bool = False
     loss_parallel: bool = False
@@ -123,6 +163,7 @@ class PassConfig:
     pp_schedule: str = "gpipe"
 
     def __post_init__(self) -> None:
+        self.dp_mode = normalize_dp_mode(self.dp_mode)
         self.validate()
 
     def validate(self) -> None:
@@ -131,13 +172,24 @@ class PassConfig:
         Raises:
             ValueError: On a negative ``tp_size``, a non-positive explicit
                 ``fsdp_degree`` / ``pp_degree``, a non-positive
-                ``pp_microbatch_size``, or an unknown ``pp_schedule``.
+                ``pp_microbatch_size``, an unknown ``pp_schedule`` /
+                ``dp_mode``, or a non-positive ``dp_replicate_degree``.
         """
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
             raise ValueError(
                 f"fsdp_degree must be None or a positive int, got {self.fsdp_degree}"
+            )
+        if self.dp_mode not in DP_MODES:
+            raise ValueError(
+                f"dp_mode must be one of {DP_MODES} "
+                f"(aliases: {tuple(_DP_MODE_ALIASES)}), got {self.dp_mode!r}"
+            )
+        if self.dp_replicate_degree is not None and self.dp_replicate_degree < 1:
+            raise ValueError(
+                f"dp_replicate_degree must be None or a positive int, "
+                f"got {self.dp_replicate_degree}"
             )
         if self.pp_degree is not None and self.pp_degree < 1:
             raise ValueError(
@@ -153,3 +205,36 @@ class PassConfig:
             raise ValueError(
                 f"pp_schedule must be one of {PP_SCHEDULES}, got {self.pp_schedule!r}"
             )
+
+
+def build_pass_config_from_trainer_config(
+    config: Any,
+    *,
+    fsdp_enabled: Optional[bool] = None,
+    enable_overlap: bool = False,
+) -> PassConfig:
+    """Project trainer topology intent onto graph-mode pass config.
+
+    This helper stays in the pass-config module because it computes the
+    graph-pass surface from the trainer topology without altering runtime
+    objects. Accepting ``Any`` keeps this module importable without the
+    trainer package.
+    """
+    accelerator = config.accelerator
+    if fsdp_enabled is None:
+        fsdp_enabled = (
+            config.fsdp_config.dp_shard_size > 1
+            or config.fsdp_config.edp_shard_size > 1
+        )
+    fsdp_degree = config.fsdp_config.dp_shard_size if fsdp_enabled else None
+    return PassConfig(
+        enable_overlap=enable_overlap,
+        fsdp_enabled=fsdp_enabled,
+        fsdp_degree=fsdp_degree,
+        tp_size=accelerator.tp_size,
+        sequence_parallel=accelerator.sequence_parallel,
+        loss_parallel=accelerator.loss_parallel,
+    )
+
+
+__all__ = ["PassConfig", "build_pass_config_from_trainer_config"]

@@ -186,10 +186,9 @@ and gate only explicitly named summary metrics, such as
 `parameters.summary.l2_norm_relative` (and optional `l2_norm_max_abs`). Never label
 the largest aggregate-statistic delta as `max_abs`.
 
-Keep module-parity and same-topology parameter limits strict when cross-topology
-BF16 needs a wider scale-aware policy. Put strict inherited defaults directly
-under `acceptance.parameters`, and declare only the justified override under
-`parameters.cross_topology` (or, when genuinely needed, `module_parity` and
-`same_topology`). The selected case acceptance class must select the matching
-parameter profile; a global relaxation that also weakens same-topology resume is
-not acceptable.
+Keep authoritative module-parity parameter checks separate from full-model VLM
+curve acceptance. Cross-layout parameter/main-gradient probes may use a wider,
+scale-aware diagnostic profile; their mismatch alone does not fail a VLM case
+whose loss and pre-clip norm pass. Preserve exact identity, finite-state, and
+checkpoint requirements. Same-topology resume may still require stronger state
+identity under its separately declared contract.

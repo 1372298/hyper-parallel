@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Read-only Hermes evidence and fail-closed rollout attribution."""
+"""Read-only tool parser evidence and fail-closed rollout attribution."""
 
 from contextvars import ContextVar
 from functools import wraps
 import hashlib
+import inspect
 import json
 import re
 from typing import Any, Iterable, Mapping
+
+from rl.tool_xml import inspect_xml_calls
 
 
 class InfrastructureRolloutError(RuntimeError):
@@ -91,7 +94,11 @@ def inspect_tool_response(response: dict) -> dict:
         category = "model_invalid_json" if reason == "invalid_json" else "model_invalid_tool_call"
         stage = "generation"
     elif reason in {"parser_result_mismatch", "missing_parser_result"}:
-        category, stage = "parser_error", "hermes_parse"
+        evidence = response.get("hyper_tool_protocol")
+        xml_parser = (isinstance(evidence, list) and len(evidence) == 1
+                      and isinstance(evidence[0], dict)
+                      and evidence[0].get("source") == "Qwen3CoderToolParser.extract_tool_calls")
+        category, stage = "parser_error", "qwen3_coder_parse" if xml_parser else "hermes_parse"
     elif reason in {"parser_input_mismatch", "incomplete_parser_evidence"}:
         category, stage = "unknown_json_error", "serialization"
     elif reason == "missing_parser_evidence":
@@ -133,15 +140,37 @@ def _inspect_tool_response(response: dict) -> dict:
         if message.get("tool_calls"):
             return {"failure_origin": "unknown", "failure_reason": "missing_raw_tool_call", "trainable": False}
         return result
-    calls, error = _raw_calls(blocks)
+    calls, error, xml_format = _evidence_calls(item, blocks)
     if error is not None:
         return error
     parsed_result = item.get("parser_result")
     if not isinstance(parsed_result, dict):
         return {"failure_origin": "unknown", "failure_reason": "missing_parser_result", "trainable": False}
-    if _parsed_calls(message.get("tool_calls")) != calls or _parsed_calls(parsed_result.get("tool_calls")) != calls:
+    parsed_message = _parsed_calls(message.get("tool_calls"))
+    captured_calls = _parsed_calls(parsed_result.get("tool_calls"))
+    if not _calls_equal(parsed_message, calls, xml_format) or not _calls_equal(captured_calls, calls, xml_format):
         result.update(failure_origin="infrastructure", failure_reason="parser_result_mismatch", trainable=False)
     return result
+
+
+def _evidence_calls(item: dict, blocks: list[str]) -> tuple[list, Any, bool]:
+    """Select the captured parser format without repairing generated arguments."""
+    source = item.get("source")
+    xml_format = source == "Qwen3CoderToolParser.extract_tool_calls"
+    if xml_format:
+        if item.get("parser_format") != "qwen3_xml":
+            return [], {"failure_origin": "unknown", "failure_reason": "unsupported_parser_format",
+                        "trainable": False}, xml_format
+        calls, error = inspect_xml_calls(item["parser_input"], item.get("request_tools"))
+    elif source not in (None, "Hermes2ProToolParser.extract_tool_calls"):
+        return [], {"failure_origin": "unknown", "failure_reason": "unsupported_parser_source",
+                    "trainable": False}, xml_format
+    elif any(block.lstrip().startswith("<function=") for block in blocks):
+        return [], {"failure_origin": "infrastructure", "failure_reason": "parser_format_mismatch",
+                    "trainable": False}, xml_format
+    else:
+        calls, error = _raw_calls(blocks)
+    return calls, error, xml_format
 
 
 def _validate_source_evidence(item: dict, choice: dict) -> Any:
@@ -149,11 +178,36 @@ def _validate_source_evidence(item: dict, choice: dict) -> Any:
     if not all(isinstance(item.get(key), str) for key in ("parser_input", "decoded_tokens", "engine_text")):
         return {"failure_origin": "unknown", "failure_reason": "incomplete_parser_evidence", "trainable": False}
     blocks = _BLOCK.findall(item["parser_input"])
+    engine_blocks = _BLOCK.findall(item["engine_text"])
+    decoded = item["decoded_tokens"]
+    if any(decoded == item["engine_text"] + ending for ending in ("<|im_end|>", "<|endoftext|>")):
+        decoded = item["engine_text"]
     if (not isinstance(item.get("token_ids"), list) or not item["token_ids"]
             or item["token_ids"] != choice.get("token_ids")
-            or blocks != _BLOCK.findall(item["decoded_tokens"])
-            or blocks != _BLOCK.findall(item["engine_text"])):
+            or engine_blocks != _BLOCK.findall(decoded)):
         return {"failure_origin": "unknown", "failure_reason": "parser_input_mismatch", "trainable": False}
+    if "reasoning_parser" in item:
+        return _validate_reasoning_evidence(item, choice)
+    if blocks != engine_blocks:
+        return {"failure_origin": "unknown", "failure_reason": "parser_input_mismatch", "trainable": False}
+    return None
+
+
+def _validate_reasoning_evidence(item: dict, choice: dict) -> Any:
+    """Match reasoning-only output and source text to immutable parser evidence."""
+    evidence = item["reasoning_parser"]
+    message = choice.get("message", {})
+    # The unified vLLM parser feeds empty text to tools for reasoning-only output.
+    content = evidence.get("content") if isinstance(evidence, dict) else None
+    if (not isinstance(evidence, dict)
+            or evidence.get("source") != "Qwen3ReasoningParser.extract_reasoning"
+            or not isinstance(evidence.get("reasoning"), str)
+            or evidence.get("parser_input") != item["engine_text"]
+            or "content" not in evidence
+            or ("" if content is None else content) != item["parser_input"]
+            or any(message.get(key) is not None and message[key] != evidence["reasoning"]
+                   for key in ("reasoning", "reasoning_content"))):
+        return {"failure_origin": "unknown", "failure_reason": "reasoning_parser_mismatch", "trainable": False}
     return None
 
 
@@ -183,33 +237,99 @@ def _parsed_calls(parsed: Any) -> list:
         return []
 
 
+def _calls_equal(parsed: list, expected: list, typed: bool) -> bool:
+    """Retain XML argument type identity rather than accepting Python bool/int equality."""
+    if not typed:
+        return parsed == expected
+    try:
+        parsed_json = json.dumps(parsed, sort_keys=True, allow_nan=False)
+        return parsed_json == json.dumps(expected, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+
+
+def _tool_parser_capture(parser_cls: type, source: str, *, xml_format: bool = False) -> Any:
+    """Build one instrumented delegate with its original parser and schema provenance."""
+    original = parser_cls.extract_tool_calls
+
+    @wraps(original)
+    def capture_parser(self: Any, model_output: str, request: Any) -> Any:
+        """Record input/result without replacing sampled tokens or parser output."""
+        original_tools = None
+        context = _CAPTURE.get()
+        if xml_format and context is not None and request is context["request"]:
+            tools = getattr(request, "tools", None)
+            if isinstance(tools, list):
+                try:
+                    original_tools = json.loads(json.dumps([
+                        tool.model_dump(mode="json") if hasattr(tool, "model_dump") else tool for tool in tools
+                    ], allow_nan=False))
+                except (TypeError, ValueError):
+                    pass
+        result = original(self, model_output, request)
+        capture = _CAPTURE.get()
+        if capture is not None:
+            evidence = {"invalid": "cross_request_tool_capture"}
+            if request is capture["request"]:
+                evidence = {"parser_input": model_output, "parser_result": result.model_dump(), "source": source}
+                if xml_format:
+                    evidence["parser_format"] = "qwen3_xml"
+                    evidence["request_tools"] = original_tools
+            capture["tools"].append(evidence)
+        return result
+
+    return capture_parser
+
+
 def install_tool_evidence() -> None:
     """Instrument the pinned vLLM non-streaming path without changing its output tokens."""
     # Optional server dependency: this module is also used by CPU-only training code.
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat  # pylint: disable=C0415
     from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser  # pylint: disable=C0415
+    from vllm.reasoning.qwen3_reasoning_parser import Qwen3ReasoningParser  # pylint: disable=C0415
 
     original = OpenAIServingChat.chat_completion_full_generator
     if getattr(original, "hyper_tool_evidence", False):
         return
-    parse = Hermes2ProToolParser.extract_tool_calls
+    generator_signature = inspect.signature(original)
+    if "parser" in generator_signature.parameters:
+        parser_parameter = "parser"
+    elif "reasoning_parser" in generator_signature.parameters:
+        parser_parameter = "reasoning_parser"
+    else:
+        raise ValueError("vLLM full-generator interface has no supported parser parameter")
+    parsers = [(Hermes2ProToolParser, False, "Hermes2ProToolParser.extract_tool_calls")]
+    if parser_parameter == "parser":
+        # Qwen3Coder is a reviewed 0.23 delegate; legacy 0.22 Hermes behavior stays unchanged.
+        from vllm.tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser  # pylint: disable=C0415
+        parsers.append((Qwen3CoderToolParser, True, "Qwen3CoderToolParser.extract_tool_calls"))
+    extract_reasoning = Qwen3ReasoningParser.extract_reasoning
 
-    @wraps(parse)
-    def capture_parser(self: Any, model_output: str, request: Any) -> Any:
-        """Record Hermes input/result without replacing sampled tokens or parser output."""
-        result = parse(self, model_output, request)
+    @wraps(extract_reasoning)
+    def capture_reasoning(self: Any, model_output: str, request: Any) -> Any:
+        """Record the actual Qwen3 split, never derive a new split from output strings."""
+        result = extract_reasoning(self, model_output, request)
         capture = _CAPTURE.get()
         if capture is not None:
-            capture.append({"parser_input": model_output, "parser_result": result.model_dump(),
-                            "source": "Hermes2ProToolParser.extract_tool_calls"})
+            evidence = {"invalid": "cross_request_reasoning_capture"}
+            if request is capture["request"]:
+                evidence = {"source": "Qwen3ReasoningParser.extract_reasoning", "parser_input": model_output,
+                            "reasoning": result[0], "content": result[1]}
+            capture["reasoning"].append(evidence)
         return result
 
     @wraps(original)
     async def capture_response(self: Any, request: Any, result_generator: Any, request_id: str, model_name: str,
                                conversation: Any, tokenizer: Any, request_metadata: Any,
-                               reasoning_parser: Any = None) -> Any:
+                               *parser_args: Any, **parser_kwargs: Any) -> Any:
         """Attach one-call evidence only when both engine output and parser capture are unambiguous."""
+        bound = generator_signature.bind(self, request, result_generator, request_id, model_name,
+                                         conversation, tokenizer, request_metadata, *parser_args, **parser_kwargs)
+        selected_parser = bound.arguments.get(parser_parameter)
+        reasoning_parser = (getattr(selected_parser, "reasoning_parser", None)
+                            if parser_parameter == "parser" else selected_parser)
         capture = []
+        reasoning_capture = []
         outputs = []
 
         async def observe() -> Any:
@@ -218,21 +338,29 @@ def install_tool_evidence() -> None:
                 outputs[:] = result.outputs
                 yield result
 
-        token = _CAPTURE.set(capture if request.return_token_ids else None)
+        context = {"request": request, "tools": capture, "reasoning": reasoning_capture}
+        token = _CAPTURE.set(context if request.return_token_ids else None)
         try:
             response = await original(self, request, observe(), request_id, model_name,
-                                      conversation, tokenizer, request_metadata, reasoning_parser)
+                                      conversation, tokenizer, request_metadata, *parser_args, **parser_kwargs)
             if capture and len(outputs) == len(capture) == 1:
                 output = outputs[0]
                 capture[0].update(
                     engine_text=output.text, token_ids=list(output.token_ids), request_id=request_id,
                     decoded_tokens=tokenizer.decode(output.token_ids, skip_special_tokens=False),
                 )
+                if reasoning_parser is not None or reasoning_capture:
+                    evidence = (reasoning_capture[0] if len(reasoning_capture) == 1
+                                else {"invalid": "missing_or_ambiguous_reasoning_capture"})
+                    if evidence.get("reasoning") is not None or "invalid" in evidence:
+                        capture[0]["reasoning_parser"] = evidence
                 response.__pydantic_extra__ = {**(response.model_extra or {}), "hyper_tool_protocol": capture}
             return response
         finally:
             _CAPTURE.reset(token)
 
     capture_response.hyper_tool_evidence = True
-    Hermes2ProToolParser.extract_tool_calls = capture_parser
+    for parser_cls, xml_format, source in parsers:
+        parser_cls.extract_tool_calls = _tool_parser_capture(parser_cls, source, xml_format=xml_format)
+    Qwen3ReasoningParser.extract_reasoning = capture_reasoning
     OpenAIServingChat.chat_completion_full_generator = capture_response

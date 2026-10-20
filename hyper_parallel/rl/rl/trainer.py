@@ -474,6 +474,8 @@ class SyncTrainer:
             collect_diagnostics,
             timings,
         )
+        # Detached inference targets no longer need the full role parameters.
+        self._release_training_state_for_rollout()
         stage_started = time.perf_counter()
         actor_update = self.actor.update(experience)
         timings["update_actor"] = time.perf_counter() - stage_started
@@ -1038,10 +1040,13 @@ class SyncTrainer:
 
     @staticmethod
     def _reshard_model(model: Optional[Any]) -> None:
-        """Explicitly release every nested full FSDP parameter allocation."""
+        """Initialize loaded shards and release nested full FSDP parameter allocations."""
         if model is None:
             return
         for hsdp_root in iter_hsdp_roots(model):
+            # Meta builds defer CPU offload initialization until the first forward,
+            # while colocated rollout can allocate its weights before that forward.
+            hsdp_root.hsdp_scheduler.hsdp_state.lazy_init()
             hsdp_root.reshard()
 
     @staticmethod

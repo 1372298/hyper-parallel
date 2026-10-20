@@ -186,8 +186,8 @@ def test_full_gather_restores_every_hf_weight(monkeypatch):
 
 @pytest.mark.parametrize("trainer_tp,dp_shards", [(1, 1), (1, 3), (2, 1), (2, 3)])
 @pytest.mark.parametrize("rollout_tp", [1, 2])
-@pytest.mark.parametrize("is_hyper", [True, False])
-def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, dp_shards, rollout_tp, is_hyper):
+@pytest.mark.parametrize("is_adapted", [True, False])
+def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, dp_shards, rollout_tp, is_adapted):
     """Copy actual fused shards through the production direct bucket packer."""
 
     config = tiny_config()
@@ -258,7 +258,7 @@ def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, d
                 local = full.chunk(rollout_tp, dim=axis)[tp_rank]
             placements[name] = (placement,)
             expected_map[name] = local
-        if not is_hyper:
+        if not is_adapted:
             for layer in range(config.num_hidden_layers):
                 prefix = f"model.layers.{layer}."
                 qkv = [expected_map.pop(prefix + "self_attn." + projection + ".weight")
@@ -274,7 +274,7 @@ def test_direct_reshard_fused_sources_match_canonical_destinations(trainer_tp, d
         worker_descriptions.append({
             "tp_rank": tp_rank, "tp_size": rollout_tp,
             "tensors": rollout_tensor_descriptions(
-                worker_model, config, is_hyper=is_hyper, tp_rank=tp_rank, tp_size=rollout_tp,
+                worker_model, config, is_adapted=is_adapted, tp_rank=tp_rank, tp_size=rollout_tp,
             ),
         })
         destination_maps.append(parameters)
