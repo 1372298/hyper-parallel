@@ -18,6 +18,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import torch
+
 from hyper_parallel.core.multicore.shmem import _lifecycle
 from tests.common.mark_utils import arg_mark
 
@@ -42,13 +44,21 @@ class TestRuntimeLifecycle(unittest.TestCase):
             all_gather_object=Mock(
                 side_effect=lambda output, value, **_kw: output.__setitem__(slice(None), [value] * 2)),
         )
-        self.torch = SimpleNamespace(npu=SimpleNamespace(synchronize=Mock()))
+        self.torch = SimpleNamespace(npu=SimpleNamespace(
+            synchronize=Mock(),
+            is_current_stream_capturing=Mock(return_value=False),
+            current_device=Mock(return_value=0),
+        ), device=lambda device_type, index: f"{device_type}:{index}")
         self.native = SimpleNamespace(
             _initialize=Mock(),
             _get_unique_id=Mock(return_value=b"group-bootstrap"),
             _validate_shutdown=Mock(),
             _shutdown=Mock(),
-            _debug_state=Mock(return_value={"config": {"heap_size_bytes": 128}}),
+            _debug_state=Mock(return_value={
+                "config": {"heap_size_bytes": 128},
+                "device_index": 0,
+                "active_allocations": [],
+            }),
         )
         self.framework_patch = patch.object(_lifecycle, "_torch_modules", return_value=(self.torch, self.dist))
         self.native_patch = patch.object(_lifecycle, "_load_native", return_value=self.native)
@@ -62,12 +72,12 @@ class TestRuntimeLifecycle(unittest.TestCase):
     @staticmethod
     def _reset_runtime() -> None:
         """Reset private process state after each isolated test."""
-        _lifecycle._retained_users = 0  # pylint: disable=protected-access
         _lifecycle._users = 0  # pylint: disable=protected-access
         _lifecycle._root_group = None  # pylint: disable=protected-access
         _lifecycle._root_uses_distributed = None  # pylint: disable=protected-access
         _lifecycle._root_ranks = None  # pylint: disable=protected-access
         _lifecycle._root_size = None  # pylint: disable=protected-access
+        _lifecycle._device_index = None  # pylint: disable=protected-access
         _lifecycle._shutdown_failed = False  # pylint: disable=protected-access
 
     def test_single_process_runtime_is_reference_counted(self) -> None:
@@ -266,27 +276,178 @@ class TestRuntimeLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no active reference"):
             _lifecycle.release()
 
-    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
-              card_mark="allcards", essential_mark="essential")
-    def test_retained_reference_commits_only_after_success(self) -> None:
-        """Feature: retained reference commits only after success.
-        Description: Retain a root pin and fail its final release before retrying.
-        Expectation: Distinguish a registered root pin from ordinary owners and retain failed-release ownership.
-        """
+    def test_runtime_restart_preserves_collective_operation_order(self) -> None:
+        """Rebuild explicit Allocations around one Native restart."""
         _lifecycle.acquire()
-        release_pin = _lifecycle.retain_runtime(self.world)
-        self.assertEqual(_lifecycle._retained_users, 1)
-        self.assertEqual(_lifecycle._reference_count(), 2)
+        operations = []
+        clock = [10.0]
+        self.torch.npu.synchronize.side_effect = lambda _device: operations.append("quiesce")
+
+        def validate_shutdown() -> None:
+            """Record validation and advance the deterministic stage clock."""
+            operations.append("validate")
+            clock[0] += 0.002
+
+        def shutdown() -> None:
+            """Record shutdown and advance the deterministic stage clock."""
+            operations.append("finalize")
+            clock[0] += 0.003
+
+        self.native._validate_shutdown.side_effect = validate_shutdown
+        self.native._shutdown.side_effect = shutdown
+        current = Mock(shape=(4,), dtype=torch.float32, _base=None)
+        current.data_ptr.return_value = 100
+        current.numel.return_value = 4
+        current.element_size.return_value = 4
+        current.is_contiguous.return_value = True
+        replacement = torch.empty(8, dtype=torch.float32)
+        active_allocations = [{"allocation_base": 100, "allocation_bytes": 16}]
+
+        def debug_state() -> dict:
+            """Expose the mutable mocked Allocation registry."""
+            return {
+                "config": {"heap_size_bytes": 256},
+                "device_index": 0,
+                "active_allocations": list(active_allocations),
+            }
+
+        self.native._debug_state.side_effect = debug_state
+
+        def bootstrap() -> bytes:
+            """Record bootstrap ordering and return one group identifier."""
+            operations.append("bootstrap")
+            return b"replacement-bootstrap"
+
+        def initialize(*_args: object) -> None:
+            """Record Native initialize ordering."""
+            operations.append("initialize")
+
+        self.native._get_unique_id.side_effect = bootstrap
+        self.native._initialize.side_effect = initialize
+        allocation = _lifecycle._AllocationReplacement(  # pylint: disable=protected-access
+            current,
+            _lifecycle._AllocationSpec((8,), torch.float32, 16),  # pylint: disable=protected-access
+        )
+
+        def free(tensor: object) -> None:
+            """Record release ordering and clear the mocked registry."""
+            del tensor
+            operations.append("free")
+            active_allocations.clear()
+
+        with (
+            patch("hyper_parallel.core.multicore.shmem._api.free", side_effect=free),
+            patch("hyper_parallel.core.multicore.shmem._api.empty", side_effect=lambda *_a, **_k: replacement),
+            patch.object(_lifecycle.time, "perf_counter", side_effect=lambda: clock[0]),
+        ):
+            result = _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(allocation,),
+                preflight_hook=lambda: ("layout", 1),
+            )
+
+        self.assertEqual(
+            operations,
+            ["quiesce", "free", "validate", "finalize", "bootstrap", "initialize"],
+        )
+        self.assertEqual(
+            set(result.stages_ms),
+            {
+                "preflight_ms", "quiesce_ms", "release_ms", "finalize_ms",
+                "bootstrap_ms", "initialize_ms", "restore_ms", "commit_ms",
+            },
+        )
+        self.assertEqual(result.tensors, (replacement,))
+        self.assertAlmostEqual(result.stages_ms["finalize_ms"], 5.0)
+        self.assertFalse(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
+
+    def test_runtime_restart_preflight_failure_preserves_runtime(self) -> None:
+        """Converge ownership, device, Allocation and hook failures before teardown."""
+        _lifecycle.acquire()
+        _lifecycle.acquire()
+        with self.assertRaisesRegex(RuntimeError, "one healthy Runtime user"):
+            _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(),
+                preflight_hook=lambda: "state",
+            )
         _lifecycle.release()
-        self.native._validate_shutdown.side_effect = RuntimeError("busy")
-        with self.assertRaisesRegex(RuntimeError, "busy"):
-            release_pin()
-        self.assertEqual(_lifecycle._retained_users, 1)
-        self.assertEqual(_lifecycle._reference_count(), 1)
-        self.native._validate_shutdown.side_effect = None
-        release_pin()
-        self.assertEqual(_lifecycle._retained_users, 0)
-        self.assertEqual(_lifecycle._reference_count(), 0)
+        self.assertFalse(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
+
+        self.torch.npu.current_device.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, "current NPU device"):
+            _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(),
+                preflight_hook=lambda: "state",
+            )
+        self.torch.npu.current_device.return_value = 0
+
+        self.native._debug_state.return_value = {
+            "config": {"heap_size_bytes": 128},
+            "device_index": 0,
+            "active_allocations": [{"allocation_base": 1234, "allocation_bytes": 16}],
+        }
+        with self.assertRaisesRegex(RuntimeError, "cover every active"):
+            _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(),
+                preflight_hook=lambda: "state",
+            )
+        current = Mock(shape=(4,), dtype=torch.float32, _base=None)
+        current.data_ptr.return_value = 1234
+        current.numel.return_value = 4
+        current.element_size.return_value = 4
+        current.is_contiguous.return_value = True
+        for alignment in (None, 0, 3):
+            with self.subTest(alignment=alignment), self.assertRaisesRegex(RuntimeError, "alignment_bytes"):
+                invalid_target = _lifecycle._AllocationSpec(  # type: ignore[arg-type]
+                    (8,), torch.float32, alignment,
+                )
+                replacement = _lifecycle._AllocationReplacement(current, invalid_target)
+                _lifecycle._restart(  # pylint: disable=protected-access
+                    heap_size_bytes=256,
+                    replacements=(replacement,),
+                    preflight_hook=lambda: "state",
+                )
+        self.torch.npu.is_current_stream_capturing.return_value = True
+        with self.assertRaisesRegex(RuntimeError, "graph capture"):
+            _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(),
+                preflight_hook=lambda: "state",
+            )
+        self.torch.npu.is_current_stream_capturing.return_value = False
+        self.native._debug_state.return_value = {
+            "config": {"heap_size_bytes": 128}, "device_index": 0, "active_allocations": [],
+        }
+
+        def peer_preflight_error(output: list, value: object, **_kwargs: object) -> None:
+            """Inject one peer-side preflight failure."""
+            output[:] = [value, (None, "RuntimeError: peer preflight failed")]
+
+        self.dist.all_gather_object.side_effect = peer_preflight_error
+        with self.assertRaisesRegex(RuntimeError, "peer preflight failed"):
+            _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(),
+                preflight_hook=lambda: "state",
+            )
+        self.torch.npu.synchronize.assert_not_called()
+        self.native._shutdown.assert_not_called()
+        self.assertFalse(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
+
+    def test_runtime_restart_destructive_failure_is_terminal(self) -> None:
+        """Invalidate the Runtime after Allocation release begins and fails."""
+        _lifecycle.acquire()
+        self.native._shutdown.side_effect = RuntimeError("finalize failed")
+        with self.assertRaisesRegex(RuntimeError, "finalize failed"):
+            _lifecycle._restart(  # pylint: disable=protected-access
+                heap_size_bytes=256,
+                replacements=(),
+                preflight_hook=lambda: "state",
+            )
+        self.assertTrue(_lifecycle._shutdown_failed)  # pylint: disable=protected-access
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")

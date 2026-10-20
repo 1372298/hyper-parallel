@@ -162,7 +162,7 @@ pytest -q tests/torch/multicore/test_deepseek_v41_megamoe.py -k megamoe_parallel
   输入、专家权重和路由权重梯度参与策略。实际长度和梯度参与策略随路由计数一起交换。
   调度范围取组内最大实际长度并向上对齐到 128；全组输入为空时，最小调度范围仍为 128。
   每个资源组最多缓存四份调度计划；autograd 会保留每次调用所用的计划，直到对应反向完成。
-  pull 模式下，空输入仍保留其对称内存基址；仅改变实际输入长度不会重建 SHMEM。
+  pull模式下，空输入仍保留其对称内存基址；仅改变实际输入长度不会触发Runtime restart。
 - `hidden_states` 扁平后的 token 数为 `T`，`topk_ids`、`topk_weights` 均为 `[T, K]`，
   ID 使用全局专家编号，同一个 token 的 K 个 ID 必须互不重复。
 - 可选的 `tokens_per_expert` 是同 device 上 `[E]` 的精确本 rank histogram。
@@ -216,7 +216,7 @@ C_new = min(EP * T * K, align128(max(R_max, ceil(capacity_growth_factor * C))))
 ```
 
 同一 EP root 的所有 rank 完成在途工作，释放全部受管对称 buffer，finalize 旧 runtime，
-再使用 fresh bootstrap ID 初始化更大的 heap 并重建 workspace，继续本次 forward；回落时不缩容。
+再使用 fresh bootstrap ID 按目标heap大小初始化Runtime并恢复workspace，继续本次 forward；回落时不缩容。
 该路径复用已有路由 counts，未溢出的 forward 不增加负载 collective。
 增长倍数作用于接收容量，不是整个 heap；返回区仍固定为 `T * K` 行，总 heap 向上取整到2 MiB。
 
@@ -231,8 +231,9 @@ pull 的 SHMEM 仅包含 `T * K` 行发送区和返回区，接收区位于普�
 外部持有的专家参数不属于 heap，扩容不会移动它们。
 
 若显式设置 `HYPER_PARALLEL_SHMEM_HEAP_SIZE`，物理 heap 直接按此固定预算初始化；push 只在预算内增加逻辑容量。
-当增长余量放不下、而实际需求能放下时，退到最小必要容量。预算不足、未知 owner/allocation 或活动租约
-会在销毁前阻止扩容；开始释放后若重建失败，runtime 不可继续使用，需退出并重启训练进程。
+当增长余量放不下、而实际需求能放下时，退到最小必要容量。预算不足、存在第二个SHMEM user、
+Allocation清单不完整或活动租约
+会在销毁前阻止扩容；开始释放后若Runtime restart失败，runtime不可继续使用，需退出并重启训练进程。
 自动预算不写入环境变量；实际大小读取 `shmem.debug_state()["config"]["heap_size_bytes"]`。
 扩容有一次性同步和初始化开销，可通过增加初始因子或增长因子减少重建次数。
 
@@ -265,16 +266,12 @@ GC 时机不一致或仍有反向图会延后回收；持续保持活模型/图�
 只有所有 rank 均成功后才移除资源记录；对称内存部分释放状态不一致或原生 shutdown 失败须重启。
 自动清理失败会阻止显式通信域销毁继续执行；进程退出时仅记录失败并继续框架退出流程，不能保证释放成功。
 
-SHMEM Python层以进程级引用计数统一管理Runtime生命周期。每个MegaMoe执行资源组建立时配对调用一次
-内部`shmem.acquire()`，关闭时在workspace释放全部对称Tensor后调用一次`shmem.release()`；
-`share_execution_resources`的相同配置层共享同一组及workspace，因此只形成一个资源组SHMEM引用。
-资源池另外持有一个Runtime引用，使不同配置的孤儿workspace替换不会触发Runtime反复终结/重建；
-该引用存活时保留原 heap manager；更大模型首次绑定会根据实际物理 heap 容量集体扩容，
-包括旧 owner 已全部回收后的 push 或 pull 模型替换。
-显式关闭全部已绑定资源或自动关停时释放该引用。非最后一个
-`release()`只减少本地计数，进程内最后一个引用才执行跨rank关闭（仅丢弃模块对象不会触发释放）。未来
-MegaMHC、MegaDSA等Multicore特性复用同一SHMEM Runtime时，也通过同一配对接口共享这套进程级计数，
-不在各消费者内重复实现生命周期协调。
+SHMEM Python层以进程级引用计数统一管理Runtime生命周期。整个MegaMoe子系统通过进程内私有Heap Manager
+持有一份`shmem.acquire()`引用；execution resource只提交workspace reservation，不分别增减Runtime引用。
+单个resource关闭时释放其workspace，资源池完成全部集体清理后再调用一次`shmem.release()`。
+因此不同配置的孤儿workspace替换不会触发Runtime反复关闭和初始化；更大模型首次绑定可在这份引用内根据
+实际物理heap容量执行Runtime restart。其他Multicore组件直接使用SHMEM时各自持有独立引用；存在第二个user
+时MegaMoe不能独占并重启Runtime。
 重新开启生命周期时，所有 rank 完成关闭后使用新的 `HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT`，
 `HYPER_PARALLEL_SHMEM_HEAP_SIZE` 等堆配置在下一生命周期首次获取引用时重新生效。
 

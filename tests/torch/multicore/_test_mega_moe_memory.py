@@ -226,7 +226,7 @@ def _check_unknown_owner(mega: MegaMoeExperts, shape: baseline.MoeShape) -> None
     try:
         resources.ensure_capacity(shape.local_num_tokens * shape.top_k + 1)
     except RuntimeError as error:
-        assert "unmanaged SHMEM owner" in str(error), error
+        assert "one healthy Runtime user" in str(error), error
     else:
         raise AssertionError("Unknown owner did not prevent growth")
     finally:
@@ -284,9 +284,9 @@ def test_mega_moe_heap_growth() -> None:
         assert epochs[:2] == [0, 1] and all(epoch == 1 for epoch in epochs[2:]), observations
         assert observations[1][2] > observations[0][2], observations
         assert old_buffers[0].untyped_storage().nbytes() == 0
-        # Count one execution owner and the automatic root pin.
+        # The process Heap Manager owns the sole SHMEM Runtime reference.
         reference_count = shmem.debug_state()["reference_count"]
-        assert reference_count == 2, reference_count
+        assert reference_count == 1, reference_count
         resources = mega._resource_group.resources  # pylint: disable=protected-access
         write_evidence({"variant": variant, "observations": observations,
                         "growth": resources.heap_manager.growth_records, "reference_count": reference_count})

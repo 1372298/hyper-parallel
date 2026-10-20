@@ -21,23 +21,24 @@ __all__ = ["MegaMoeExperts"]
 import math
 import struct
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore import shmem
+from hyper_parallel.core.multicore import _automatic, shmem
 
 from ..module import MulticoreModule
 from .function import execute_mega_moe_with_permutation
+from .heap_manager import _get_heap_manager, _workspace_layout
 from .plan import build_mega_moe_plan
 from .route import prepare_topk_route, restore_topk_output
 from .spec import (
-    _COMMUNICATION_SPLIT, _align_capacity, _grow_receive_capacity, _resolve_capacity_factors,
-    _resolve_receive_capacity, bind_mega_moe_spec,
+    _COMMUNICATION_SPLIT, _align_capacity, _resolve_capacity_factors, bind_mega_moe_spec,
 )
-from .workspace import MegaMoeWorkspace, _spec_workspace_bytes
+from .workspace import MegaMoeWorkspace
 
 
 def _validate_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -106,16 +107,6 @@ def _create_mega_moe_parameters(
     return gate_up_weight, down_weight
 
 
-def _heap_layout(specification: dict[str, Any], element_size: int, capacity: int | None = None) -> tuple[Any, ...]:
-    """Describe byte demand and deterministic configuration with an opaque capacity payload."""
-    if capacity is None:
-        capacity = _resolve_receive_capacity(specification["initial_capacity_factor"],
-                                             specification["local_num_tokens"] * specification["top_k"],
-                                             specification["ep_size"])
-    signature = tuple(sorted((key, value) for key, value in specification.items() if key != "ep_group"))
-    return _spec_workspace_bytes(specification, element_size, receive_capacity=capacity), signature, capacity
-
-
 class _MegaMoeExecutionResources:
     """Own one shape-bound plan and workspace in the shared SHMEM lifecycle."""
 
@@ -125,29 +116,38 @@ class _MegaMoeExecutionResources:
         tensor: torch.Tensor,
         *,
         shared: bool,
-        active_specifications: tuple[Any, ...],
+        active_specifications: tuple[Mapping[str, Any], ...],
     ) -> None:
         """Bind resources once to the first NPU tensor."""
         self.spec = bind_mega_moe_spec(specification, tensor)
         self._plans = OrderedDict()
         if dist.is_initialized():
             self._validate_distributed_configuration(active_specifications)
-        self.specification = specification
-        self.dtype, self.device, self.element_size = tensor.dtype, tensor.device, tensor.element_size()
-        reservations = tuple((item, _heap_layout(item, self.element_size)) for item in active_specifications)
-        self.heap_manager = shmem.get_heap_manager(
-            self.spec.ep_group, tensor, reservations,
-            allow_rebuild=any(item.get("dispatch_mode", "push") == "push" for item in active_specifications))
-        shmem.acquire(self.spec.ep_group, heap_size_bytes=self.heap_manager.heap_bytes)
+        reservations = tuple((item, _workspace_layout(item, tensor.dtype)) for item in active_specifications)
+        self.heap_manager = _get_heap_manager(self.spec.ep_group, tensor)
+        added_specifications = self.heap_manager.reserve(
+            reservations,
+            allow_resize=any(item.get("dispatch_mode", "push") == "push" for item in active_specifications),
+        )
+        attached = False
+        self.plan = None
+        self.workspace = None
         try:
-            self.plan = (build_mega_moe_plan(self.spec, tensor.device)
-                         if self.spec.max_local_num_tokens is None else None)
-            self.workspace = MegaMoeWorkspace(shared=shared)
-            self.workspace.capacity_floor = self.heap_manager.bind(self, specification)
-            self.workspace.heap_manager = self.heap_manager
-            self._record_capacities()
+            attached = self.heap_manager.attach_runtime()
+
+            def construct() -> None:
+                """Build and bind local resources before collective commit."""
+                self.plan = (build_mega_moe_plan(self.spec, tensor.device)
+                             if self.spec.max_local_num_tokens is None else None)
+                self.workspace = MegaMoeWorkspace(shared=shared)
+                self.workspace.capacity_floor = self.heap_manager.bind(self.workspace, self.spec, specification)
+                self.workspace.heap_manager = self.heap_manager
+
+            _automatic.collective_call(construct)
         except Exception:
-            shmem.release()
+            self.heap_manager.rollback_reservations(added_specifications, self.workspace)
+            if attached and not self.heap_manager.workspaces:
+                self.heap_manager.detach_runtime()
             raise
         self._closed = False
         self._workspace_closed = False
@@ -158,41 +158,7 @@ class _MegaMoeExecutionResources:
         Args:
             maximum_received_slots: Maximum destination load from the root count exchange.
         """
-        if maximum_received_slots <= self.workspace.capacity_floor:
-            return
-        with self.heap_manager.access():
-            capacity, minimum = _grow_receive_capacity(self.spec, self.workspace.capacity_floor, maximum_received_slots)
-            layout = _heap_layout(self.specification, self.element_size, capacity)
-            layouts = [layout if entry.resource is self else entry.layout for entry in self.heap_manager.entries]
-            if (self.heap_manager.heap_limit is not None
-                    and self.heap_manager.required_bytes(layouts) > self.heap_manager.heap_limit):
-                layout = _heap_layout(self.specification, self.element_size, minimum)
-            self.heap_manager.replace(self, layout)
-            self._record_capacities()
-
-    def _record_capacities(self) -> None:
-        if self.heap_manager.growth_records and "capacities" not in self.heap_manager.growth_records[-1]:
-            capacities = [entry.layout[2] for entry in self.heap_manager.entries]
-            self.heap_manager.growth_records[-1]["capacities"] = capacities
-
-    def heap_state(self) -> tuple[set[int], bool, bool]:
-        """Expose workspace ownership to the root heap coordinator."""
-        return self.workspace.heap_state()
-
-    def release_heap(self) -> None:
-        """Release physical buffers while retaining the workspace and graph leases."""
-        self.workspace.close(for_rebuild=True)
-
-    def restore_heap(self, capacity: int, allocated: bool) -> None:
-        """Apply the new capacity and restore buffers only for previously allocated owners.
-
-        Args:
-            capacity: Target receive rows selected by the capacity policy.
-            allocated: Whether this owner had physical buffers before the rebuild.
-        """
-        self.workspace.capacity_floor = capacity
-        if allocated:
-            self.workspace.ensure(self.spec, self.dtype, self.device)
+        self.heap_manager.ensure_capacity(self.workspace, maximum_received_slots)
 
     def lifecycle_signature(self) -> tuple[Any, ...]:
         """Identify allocations independently of process-local group addresses."""
@@ -208,7 +174,7 @@ class _MegaMoeExecutionResources:
         """Report whether neither an active call nor a backward graph needs buffers."""
         return self._workspace_closed or self.workspace.can_close()
 
-    def _validate_distributed_configuration(self, specifications: tuple[Any, ...]) -> None:
+    def _validate_distributed_configuration(self, specifications: tuple[Mapping[str, Any], ...]) -> None:
         """Reject different allocation manifests before acquiring symmetric memory."""
         if self.spec.ep_size == 1:
             return
@@ -239,14 +205,11 @@ class _MegaMoeExecutionResources:
         """Release the workspace and leave the shared SHMEM lifecycle."""
         if self._closed:
             return
-        with self.heap_manager.access():
-            if not self._workspace_closed:
-                self.workspace.close()
-                self._workspace_closed = True
-            shmem.release()
-            self.heap_manager.remove(self)
-            self._plans.clear()
-            self._closed = True
+        if not self._workspace_closed:
+            self.heap_manager.close_workspace(self.workspace)
+            self._workspace_closed = True
+        self._plans.clear()
+        self._closed = True
 
 
 class MegaMoeExperts(MulticoreModule):
@@ -264,10 +227,9 @@ class MegaMoeExperts(MulticoreModule):
         return (super()._resource_signature(tensor), configuration,
                 self._resource_group.shared)
 
-    def _retain_runtime(self, manager: Any) -> None:
-        """Pin SHMEM while the resource pool can replace orphan workspaces."""
-        # Keep SHMEM initialized when replacing the last orphan with a new shape.
-        manager.runtime_release = shmem.retain_runtime(self._ep_group)
+    def _register_runtime_release(self, manager: Any, resources: Any) -> None:
+        """Register the Heap Manager's sole Runtime reference for final cleanup."""
+        manager.runtime_release = resources.heap_manager.detach_runtime
 
     def __init__(
         self,
@@ -612,7 +574,7 @@ class MegaMoeExperts(MulticoreModule):
         tensor: torch.Tensor,
         *,
         shared: bool,
-        active_specifications: tuple[Any, ...],
+        active_specifications: tuple[Mapping[str, Any], ...],
     ) -> _MegaMoeExecutionResources:
         """Create the plan and workspace owned by this resource group."""
         return _MegaMoeExecutionResources(

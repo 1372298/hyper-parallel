@@ -14,6 +14,7 @@
 # ============================================================================
 """Unit tests for MegaMoe workspace sizing and stream ordering."""
 
+import math
 import os
 import unittest
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from hyper_parallel.core.multicore.modules.mega_moe import workspace as workspace_module
+from hyper_parallel.core.multicore.modules.mega_moe.heap_manager import _HeapManager, _workspace_layout
 from hyper_parallel.core.multicore.modules.mega_moe.spec import (
     _resolve_receive_capacity,
 )
@@ -29,9 +31,9 @@ from hyper_parallel.core.multicore.modules.mega_moe.workspace import (
     _WORKSPACE_ALIGNMENT,
     MegaMoeWorkspace,
     _spec_workspace_bytes,
+    _workspace_allocation_specs,
 )
 from hyper_parallel.core.multicore.scheduler.config import event_workspace_bytes
-from hyper_parallel.core.multicore.shmem._heap_manager import ShmemHeapManager
 from tests.common.mark_utils import arg_mark
 
 
@@ -60,17 +62,22 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         }
 
     def test_capacity_planning_defaults_aligns_and_caps_initial_factor(self) -> None:
-        """Align the default initial factor and cap finite factors at the EP maximum."""
+        """Use one ordered Allocation specification for aligned capacity planning."""
         specification = self._specification(None)
         routed_slots = 256
         expected_capacity = 384
-        element_size = 2
-        expected_bytes = (
-            (expected_capacity + routed_slots)
-            * specification["hidden_size"]
-            * element_size
-            + 2 * event_workspace_bytes(specification["ep_size"], specification["num_experts"])
-            + 4 * (_WORKSPACE_ALIGNMENT - 1)
+        allocations = _workspace_allocation_specs(
+            dispatch_mode="push",
+            routed_slots=routed_slots,
+            receive_capacity=expected_capacity,
+            hidden_size=specification["hidden_size"],
+            ep_size=specification["ep_size"],
+            num_experts=specification["num_experts"],
+            dtype=torch.bfloat16,
+        )
+        expected_bytes = sum(
+            spec.dtype.itemsize * math.prod(spec.shape) + spec.alignment_bytes - 1
+            for _, spec in allocations
         )
 
         actual_capacity = _resolve_receive_capacity(
@@ -78,10 +85,14 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
             routed_slots,
             specification["ep_size"],
         )
-        actual_bytes = _spec_workspace_bytes(specification, element_size)
+        actual_bytes = _spec_workspace_bytes(specification, torch.bfloat16)
 
         self.assertEqual(actual_capacity, expected_capacity)
         self.assertEqual(actual_bytes, expected_bytes)
+        self.assertEqual(
+            tuple(name for name, _ in allocations),
+            ("expert_buffer", "routed_buffer", "forward_event_counters", "backward_event_counters"),
+        )
         self.assertEqual(_resolve_receive_capacity(1e308, routed_slots, 8), 2048)
         self.assertEqual(
             _resolve_receive_capacity(
@@ -105,11 +116,13 @@ class TestMegaMoeWorkspaceSizing(unittest.TestCase):
         for mib, error in ((1602, None), (1664, None), (1600, RuntimeError), (1603, ValueError), (0, ValueError)):
             with self.subTest(mib=mib), patch.dict(os.environ, {"HYPER_PARALLEL_SHMEM_HEAP_SIZE": str(mib * 1024**2)}):
                 if error is None:
-                    manager = ShmemHeapManager(None, reference, ((spec, (_spec_workspace_bytes(spec, 2), (), None)),))
+                    manager = _HeapManager(None, reference)
+                    manager.reserve(((spec, _workspace_layout(spec, reference.dtype)),), allow_resize=True)
                     self.assertEqual(manager.heap_bytes, mib * 1024**2)
                 else:
                     with self.assertRaises(error):
-                        ShmemHeapManager(None, reference, ((spec, (_spec_workspace_bytes(spec, 2), (), None)),))
+                        manager = _HeapManager(None, reference)
+                        manager.reserve(((spec, _workspace_layout(spec, reference.dtype)),), allow_resize=True)
 
     def test_allocation_covers_dynamic_events_and_ready_tail(self) -> None:
         """Retain expanded event storage when allocating through the SHMEM API."""

@@ -361,7 +361,7 @@ class MulticoreModule(torch.nn.Module):
             group.binding = binding
             group.binding_id = next(_RESOURCE_MANAGER._next_binding_id)  # pylint: disable=protected-access
             if _RESOURCE_MANAGER.runtime_release is None:
-                self._retain_runtime(_RESOURCE_MANAGER)
+                self._register_runtime_release(_RESOURCE_MANAGER, group.resources)
         elif binding != group.binding:
             raise ValueError(
                 "multicore resources are bound to the first input device/dtype "
@@ -373,8 +373,12 @@ class MulticoreModule(torch.nn.Module):
         """Identify a collective first binding without rank-local device indices."""
         return type(self).__module__, type(self).__qualname__, str(tensor.dtype)
 
-    def _retain_runtime(self, manager: _MulticoreResourceManager) -> None:
-        """Optionally pin the runtime across orphan replacement allocations."""
+    def _register_runtime_release(
+        self,
+        manager: _MulticoreResourceManager,
+        resources: Any,
+    ) -> None:
+        """Optionally register a final release for resources with a shared Runtime."""
 
     def _root_group(self) -> Any:
         """Return the communication dependency used by these resources."""

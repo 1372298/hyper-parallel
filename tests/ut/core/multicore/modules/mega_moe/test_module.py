@@ -15,7 +15,6 @@
 """Unit tests for the model-facing MegaMoe module."""
 
 import unittest
-from contextlib import nullcontext
 from collections import OrderedDict
 from dataclasses import replace
 from types import SimpleNamespace
@@ -308,10 +307,10 @@ class TestMegaMoeExperts(unittest.TestCase):
         mock_create_resources.assert_not_called()
 
     @patch.object(mega_moe_module, "_create_mega_moe_parameters")
-    @patch.object(MegaMoeExperts, "_retain_runtime", return_value=None)
+    @patch.object(MegaMoeExperts, "_register_runtime_release", return_value=None)
     def test_shared_layers_create_once_and_close_after_last_owner(
         self,
-        mock_retain_runtime: Mock,
+        mock_register_runtime_release: Mock,
         mock_create_parameters: Mock,
     ) -> None:
         """Keep parameters independent while one serial resource group is shared."""
@@ -346,7 +345,8 @@ class TestMegaMoeExperts(unittest.TestCase):
             resolved = [
                 layer._get_execution_resources(input_tensor) for layer in layers
             ]
-        mock_retain_runtime.assert_called_once()
+        mock_register_runtime_release.assert_called_once()
+        self.assertIs(mock_register_runtime_release.call_args.args[-1], resources)
 
         self.assertTrue(shared_group.shared)
         self.assertEqual(len(shared_group.members), len(layers))
@@ -368,15 +368,21 @@ class TestMegaMoeExperts(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_execution_resource_pairs_shmem_acquire_and_release(self) -> None:
-        """Feature: execution resource pairs shmem acquire and release.
-        Description: Create one execution resource and close it twice.
-        Expectation: Pair one SHMEM reference with one execution-resource lifetime.
+    def test_execution_resource_uses_manager_owned_runtime(self) -> None:
+        """Feature: execution resource uses manager-owned Runtime.
+        Description: Construct and close one execution resource twice.
+        Expectation: Reserve and attach through the manager while close only removes the workspace.
         """
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None)
         workspace = Mock()
+        manager = Mock(heap_bytes=1024, epoch=0, workspaces=[], growth_records=[])
+        manager.reserve.return_value = ({},)
+        manager.attach_runtime.return_value = True
+        manager.bind.return_value = 128
+        close_order = []
+        manager.close_workspace.side_effect = lambda _workspace: close_order.append("workspace")
 
         with (
             patch.object(
@@ -384,10 +390,7 @@ class TestMegaMoeExperts(unittest.TestCase):
                 "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module.shmem, "get_heap_manager",
-                         return_value=Mock(heap_bytes=1024, access=nullcontext, growth_records=[])),
-            patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
-            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
             patch.object(
                 mega_moe_module, "build_mega_moe_plan", return_value=object()
             ) as mock_build_plan,
@@ -399,36 +402,37 @@ class TestMegaMoeExperts(unittest.TestCase):
                 shared=False,
                 active_specifications=(),
             )
-            mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
+            manager.reserve.assert_called_once()
+            manager.attach_runtime.assert_called_once_with()
             mock_build_plan.assert_called_once_with(bound_spec, "npu:0")
-            mock_release.assert_not_called()
             resources.close()
             resources.close()
 
-        workspace.close.assert_called_once_with()
-        mock_release.assert_called_once_with()
+        manager.close_workspace.assert_called_once_with(workspace)
+        manager.detach_runtime.assert_not_called()
+        self.assertEqual(close_order, ["workspace"])
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
-    def test_execution_resource_construction_failure_releases_shmem(self) -> None:
-        """Feature: execution resource construction failure releases shmem.
-        Description: Fail plan creation after acquiring the native reference.
-        Expectation: Release the acquired SHMEM reference when resource construction fails.
+    def test_execution_resource_construction_failure_rolls_back_manager_state(self) -> None:
+        """Feature: construction failure rolls back manager state.
+        Description: Fail plan creation after attaching the sole Runtime reference.
+        Expectation: Remove new reservations and detach a newly acquired unused Runtime.
         """
         root_group = object()
         bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
                                      dispatch_mode="push", max_local_num_tokens=None)
 
+        manager = Mock(heap_bytes=1024, epoch=0, workspaces=[])
+        manager.reserve.return_value = ({},)
+        manager.attach_runtime.return_value = True
         with (
             patch.object(
                 mega_moe_module,
                 "bind_mega_moe_spec",
                 return_value=bound_spec,
             ),
-            patch.object(mega_moe_module.shmem, "get_heap_manager",
-                         return_value=Mock(heap_bytes=1024, access=nullcontext, growth_records=[])),
-            patch.object(mega_moe_module.shmem, "acquire") as mock_acquire,
-            patch.object(mega_moe_module.shmem, "release") as mock_release,
+            patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
             patch.object(
                 mega_moe_module,
                 "build_mega_moe_plan",
@@ -443,58 +447,66 @@ class TestMegaMoeExperts(unittest.TestCase):
                 active_specifications=(),
             )
 
-        mock_acquire.assert_called_once_with(root_group, heap_size_bytes=1024)
-        mock_release.assert_called_once_with()
+        manager.rollback_reservations.assert_called_once()
+        manager.detach_runtime.assert_called_once_with()
 
-    def test_workspace_close_failure_keeps_shmem_user(self) -> None:
-        """Do not leave SHMEM when a workspace cannot release its resources."""
+    def test_construction_failure_after_restart_preserves_committed_heap(self) -> None:
+        """Roll back only the new reservation after a successful Heap restart."""
+        root_group = object()
+        specification = {"name": "new resource"}
+        bound_spec = SimpleNamespace(ep_group=root_group, ep_size=1, local_num_tokens=128,
+                                     dispatch_mode="push", max_local_num_tokens=None)
+        growth_record = {"epoch": 1, "heap_bytes": 4096}
+        manager = Mock(heap_bytes=2048, epoch=0, workspaces=[object()], growth_records=[])
+        manager.attach_runtime.return_value = False
+
+        def reserve(*_args: object, **_kwargs: object) -> tuple[dict]:
+            """Simulate a committed restart while adding the new reservation."""
+            manager.heap_bytes = 4096
+            manager.epoch = 1
+            manager.growth_records.append(growth_record)
+            return (specification,)
+
+        manager.reserve.side_effect = reserve
+        with (
+            patch.object(mega_moe_module, "bind_mega_moe_spec", return_value=bound_spec),
+            patch.object(mega_moe_module, "_workspace_layout", return_value=object()),
+            patch.object(mega_moe_module, "_get_heap_manager", return_value=manager),
+            patch.object(mega_moe_module, "build_mega_moe_plan", side_effect=RuntimeError("plan failed")),
+            self.assertRaisesRegex(RuntimeError, "plan failed"),
+        ):
+            mega_moe_module._MegaMoeExecutionResources(  # pylint: disable=protected-access
+                specification,
+                SimpleNamespace(device="npu:0", dtype=torch.bfloat16, element_size=lambda: 2),
+                shared=False,
+                active_specifications=(specification,),
+            )
+
+        manager.rollback_reservations.assert_called_once_with((specification,), None)
+        manager.detach_runtime.assert_not_called()
+        self.assertEqual((manager.heap_bytes, manager.epoch), (4096, 1))
+        self.assertEqual(manager.growth_records, [growth_record])
+
+    def test_workspace_close_failure_is_retryable(self) -> None:
+        """Keep the resource open until manager-owned workspace close succeeds."""
         resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
             mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
         )
         resources.workspace = Mock()
-        resources.heap_manager = Mock(access=nullcontext)
-        resources.workspace.close.side_effect = RuntimeError("workspace busy")
         resources._workspace_closed = False  # pylint: disable=protected-access
+        resources.heap_manager = Mock()
         resources._plans = OrderedDict()
         resources._closed = False  # pylint: disable=protected-access
 
-        with (
-            patch.object(mega_moe_module.shmem, "release") as mock_release,
-            self.assertRaisesRegex(RuntimeError, "workspace busy"),
-        ):
+        resources.heap_manager.close_workspace.side_effect = RuntimeError("close failed")
+        with self.assertRaisesRegex(RuntimeError, "close failed"):
             resources.close()
 
-        mock_release.assert_not_called()
         self.assertFalse(resources._closed)  # pylint: disable=protected-access
 
-    def test_shmem_release_failure_keeps_execution_resource_open(self) -> None:
-        """Keep the resource open when its SHMEM reference cannot be released."""
-        resources = mega_moe_module._MegaMoeExecutionResources.__new__(  # pylint: disable=protected-access
-            mega_moe_module._MegaMoeExecutionResources  # pylint: disable=protected-access
-        )
-        resources.workspace = Mock()
-        resources._workspace_closed = False  # pylint: disable=protected-access
-        resources.heap_manager = Mock(access=nullcontext)
-        resources._plans = OrderedDict()
-        resources._closed = False  # pylint: disable=protected-access
-
-        with (
-            patch.object(
-                mega_moe_module.shmem,
-                "release",
-                side_effect=RuntimeError("release failed"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "release failed"),
-        ):
-            resources.close()
-
-        resources.workspace.close.assert_called_once_with()
-        self.assertFalse(resources._closed)  # pylint: disable=protected-access
-
-        with patch.object(mega_moe_module.shmem, "release") as release:
-            resources.close()
-        resources.workspace.close.assert_called_once_with()
-        release.assert_called_once_with()
+        resources.heap_manager.close_workspace.side_effect = None
+        resources.close()
+        self.assertEqual(resources.heap_manager.close_workspace.call_count, 2)
 
 
 if __name__ == "__main__":

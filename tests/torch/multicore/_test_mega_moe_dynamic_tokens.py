@@ -173,6 +173,46 @@ def _deferred(mega: MegaMoeExperts, weights: tuple, rank: int, device: torch.dev
             _check_gradients(mega, invocations[index], references[index], lengths[index], rank)
 
 
+def _pending_backward_across_restart(weights: tuple, rank: int, world: int, device: torch.device) -> None:
+    """Complete a pending backward after a hot-route forward restarts its workspace."""
+    if world == 1 or os.environ.get("HP_DYNAMIC_DISPATCH", "push") != "push":
+        return
+    experts, top_k = world * 6, min(world * 6, 6)
+    module = MegaMoeExperts(
+        max_local_num_tokens=129,
+        hidden_size=_HIDDEN,
+        intermediate_size=_INTERMEDIATE,
+        num_experts=experts,
+        top_k=top_k,
+        ep_size=world,
+        ep_group=dist.group.WORLD,
+        initial_capacity_factor=1.0,
+        dispatch_mode="push",
+    ).to(device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        module.gate_up_weight.copy_(weights[0][rank * 6:(rank + 1) * 6])
+        module.down_weight.copy_(weights[1][rank * 6:(rank + 1) * 6])
+
+    pending_lengths = [1] * world
+    pending_inputs = _inputs(pending_lengths, experts, top_k)
+    pending_expected = _rounded_oracle(weights, pending_inputs)
+    pending_invocation = _forward(module, pending_inputs, rank, device)
+    resources = module._resource_group.resources  # pylint: disable=protected-access
+    epoch_before = resources.heap_manager.epoch
+
+    growth_lengths = [129] * world
+    growth_inputs = _inputs(growth_lengths, experts, top_k, hot=True)
+    growth_invocation = _forward(module, growth_inputs, rank, device)
+    if resources.heap_manager.epoch <= epoch_before:
+        raise AssertionError("hot-route forward did not restart the SHMEM Heap")
+
+    _, _, growth_output, growth_upstream = growth_invocation
+    (growth_output * growth_upstream).sum().backward()
+    module.zero_grad(set_to_none=True)
+    _check_gradients(module, pending_invocation, pending_expected, pending_lengths, rank)
+    module.close()
+
+
 def _snapshot(mega: MegaMoeExperts, invocation: tuple) -> tuple:
     """Own outputs and every gradient before another invocation reuses resources."""
     x, probs, output, upstream = invocation
@@ -356,6 +396,7 @@ def test_dynamic_tokens() -> None:
     start_shmem_lifetime()
     experts, top_k = world * 6, min(world * 6, 6)
     weights = _weights(experts)
+    _pending_backward_across_restart(weights, rank, world, device)
     mega = MegaMoeExperts(max_local_num_tokens=_CAPACITY, hidden_size=_HIDDEN,
                           intermediate_size=_INTERMEDIATE, num_experts=experts,
                           top_k=top_k, ep_size=world,
