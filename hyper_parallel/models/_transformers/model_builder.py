@@ -29,7 +29,6 @@ from typing import Any, Dict, Literal, Optional, Union
 
 import torch
 from torch import nn
-from transformers import PreTrainedModel
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
 from hyper_parallel.components.checkpoint.weight_conversion import (
@@ -151,7 +150,7 @@ def _init_model(
     backend=None,
     codegen_artifact_dir: Optional[str] = None,
     **kwargs,
-) -> tuple[bool, PreTrainedModel]:
+) -> tuple[bool, nn.Module]:
     """Initialize model — dispatching to custom or HF path.
 
     Following design doc 01 §7.

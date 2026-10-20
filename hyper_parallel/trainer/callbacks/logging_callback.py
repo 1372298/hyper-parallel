@@ -84,7 +84,11 @@ class LoggingCallback(Callback):
         if self._last_logged_step == state.global_step:
             return
 
-        metrics = getattr(self.trainer, "step_env_metrics", {})
+        metrics = dict(getattr(self.trainer, "step_env_metrics", {}))
+        moe_monitor = getattr(self.trainer, "moe_monitor", None)
+        aux_loss = moe_monitor.last_mean_aux_loss if moe_monitor is not None else None
+        if aux_loss is not None:
+            metrics["training/router_aux_loss"] = aux_loss
         if not metrics:
             return
         self._write(self._format_message(state, metrics))

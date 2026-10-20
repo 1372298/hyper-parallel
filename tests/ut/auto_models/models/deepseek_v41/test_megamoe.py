@@ -16,7 +16,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -44,7 +44,9 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_pa
     deepseek_v41_megamoe_compute_fn, deepseek_v41_ep_compute_fn,
 )
 from hyper_parallel.models.deepseek_v41.adapter.distributed import moe_engram_expert_parallel as ep_adapter
-from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41TopKRouter
+from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
+    DeepseekV41TopKRouter, _v41_sparse_moe_forward,
+)
 from hyper_parallel.trainer.config import entries_to_module_replacements
 from tests.common.mark_utils import arg_mark
 
@@ -283,8 +285,8 @@ class TestDeepseekV41MegaMoe(unittest.TestCase):
         self.addCleanup(experts.close_runtime)
         shared = nn.Linear(8, 8)
         shared.limit = 10.0
-        module = SimpleNamespace(experts=experts, shared_experts=shared, gate=gate, is_hash=False,
-                                 forward=lambda hidden_states, input_ids=None, image_mask=None: hidden_states)
+        module = SimpleNamespace(experts=experts, shared_experts=shared, gate=gate, is_hash=False)
+        module.forward = MethodType(_v41_sparse_moe_forward, module)
         compute = deepseek_v41_megamoe_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None,
                                              ep_mesh=None)
         validate_local_compute_signature(compute, module.forward, owner='VLM MegaMoe')
