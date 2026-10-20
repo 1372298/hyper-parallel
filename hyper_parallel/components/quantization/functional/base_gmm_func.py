@@ -48,6 +48,7 @@ class GroupedLinear(ABC):
     """
 
     FORMAT_NAME: str
+    CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE = False
 
     def _validate_inputs(
         self,

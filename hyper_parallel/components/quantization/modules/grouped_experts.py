@@ -218,9 +218,11 @@ class GroupedExperts(nn.Module):
             )
         sorted_outputs = self._grouped_forward(sorted_inputs, tokens_per_expert)
         sorted_weights = top_k_weights.reshape(-1)[expert_order]
-        sorted_outputs = (
-            sorted_outputs * sorted_weights.unsqueeze(-1)
-        ).to(hidden_states.dtype)
+        sorted_outputs = sorted_outputs * sorted_weights.unsqueeze(-1)
+        # Only HiFloat8 historically rounded each routed contribution before
+        # reduction; the MX strategies kept promotion from routing weights.
+        if self.grouped_linear.CAST_ROUTED_OUTPUT_TO_INPUT_DTYPE:
+            sorted_outputs = sorted_outputs.to(hidden_states.dtype)
 
         inverse_order = torch.empty_like(expert_order)
         inverse_order[expert_order] = torch.arange(
