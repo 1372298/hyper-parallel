@@ -154,7 +154,8 @@ def _metadata_plan(values: Sequence[Any], attribute: str, description: str) -> O
     return plans[0]
 
 
-def _with_tensor_pairing(function):
+def _with_tensor_pairing(function: Callable) -> Callable:
+    """Decorate a kernel wrapper with its Q/K metadata scopes."""
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         """Scope the immutable metadata plan to one local kernel call."""
@@ -272,6 +273,7 @@ def _compact_plan(ends, full_len, rank, shards, pairs):
 
 
 def _current_compact_plan(full_len, rank, shards):
+    """Build the active document intervals for the current metadata scope."""
     ends = _COMPACT_ENDS.get()
     return None if ends is None else _compact_plan(ends, full_len, rank, shards, _PAIRING.get())
 
@@ -288,6 +290,7 @@ def _interval_select(x, interval, order):
 
 
 def _zero_tokens(ref, length):
+    """Allocate a zero token span matching the reference tensor."""
     return platform.zeros((length,) + tuple(ref.shape[1:]), dtype=ref.dtype, device=ref.device)
 
 
@@ -505,6 +508,7 @@ def split_half(x: Any, dim: int) -> Tuple[Optional[object], Optional[object]]:
 
 
 def _cat_pair(a, b, dim: int):
+    """Concatenate the two folded block outputs along their sequence axis."""
     return platform.cat([a, b], dim=dim)
 
 

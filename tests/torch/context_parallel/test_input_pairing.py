@@ -43,16 +43,21 @@ def attention(query: Any, key: Any, value: Any, indices: Any, scale: Any, **kwar
 
 
 class TestInputPairing(unittest.TestCase):
+    """Validate pairing metadata, natural prefixes and saved backward layouts."""
+
     def test_empty_document_padding_does_not_change_pairing(self):
+        """Empty documents and repeated padding ends must leave assignments unchanged."""
         cost = (0.75, 71.8, 5.4, 0.2, 0.7)
         short = (52, 110, 206, 612, 4096, 8192)
         padded = (0, 0) + short + (8192,) * 1024
         self.assertEqual(paired_owners(short, 4, 2048, cost), paired_owners(padded, 4, 2048, cost))
 
     def test_forward_backward_and_plan_lifetime(self):
+        """Interleaved noncompact calls retain their own backward permutation."""
         self._check_forward_backward(False)
 
     def test_compact_forward_backward_and_plan_lifetime(self):
+        """Interleaved compact calls retain their own backward intervals."""
         self._check_forward_backward(True)
 
     def _check_forward_backward(self, compact):
@@ -65,8 +70,8 @@ class TestInputPairing(unittest.TestCase):
         for pairs in layouts:
             ends = torch.tensor([0, 5, 5, 9, 24, 24], dtype=torch.int32)
             if compact:
-                ends._hp_compact_ends = (0, 5, 5, 9, 24, 24)
-            ends._hp_fold_pairs = pairs
+                setattr(ends, "_hp_compact_ends", (0, 5, 5, 9, 24, 24))
+            setattr(ends, "_hp_fold_pairs", pairs)
             q, k, v = [torch.randn(total, heads, 4, requires_grad=True) for heads in (2, 1, 1)]
             rq, rk, rv = [x.detach().clone().requires_grad_() for x in (q, k, v)]
             order = [t for row in pairs for chunk in row for t in range(chunk*width, (chunk+1)*width)]
@@ -94,22 +99,25 @@ class TestInputPairing(unittest.TestCase):
                 torch.testing.assert_close(a.grad, b.grad, rtol=2e-5, atol=2e-5)
 
     def test_mismatched_metadata_is_rejected(self):
+        """Reject conflicting Q/K pairing and document plans without leaking scopes."""
         first = torch.tensor([5, 9, 24], dtype=torch.int32)
         second = first.clone()
-        first._hp_fold_pairs = ((0, 7), (2, 5), (4, 3), (6, 1))
-        second._hp_fold_pairs = ((0, 2), (7, 4), (1, 5), (6, 3))
+        pairs = ((0, 7), (2, 5), (4, 3), (6, 1))
+        setattr(first, "_hp_fold_pairs", pairs)
+        setattr(second, "_hp_fold_pairs", ((0, 2), (7, 4), (1, 5), (6, 3)))
         with self.assertRaisesRegex(ValueError, "different fold plans"):
             fold.fold_sparse_flash_attention(
                 None, 0, 4, actual_seq_lengths_query=first, actual_seq_lengths_kv=second)
-        second._hp_fold_pairs = first._hp_fold_pairs
-        first._hp_compact_ends = (5, 9, 24)
-        second._hp_compact_ends = (4, 9, 24)
+        setattr(second, "_hp_fold_pairs", pairs)
+        setattr(first, "_hp_compact_ends", (5, 9, 24))
+        setattr(second, "_hp_compact_ends", (4, 9, 24))
         with self.assertRaisesRegex(ValueError, "different compact document plans"):
             fold.fold_sparse_flash_attention(
                 None, 0, 4, actual_seq_lengths_query=first, actual_seq_lengths_kv=second)
         self.assertEqual(fold.build_fold_order(4), [0, 7, 2, 5, 4, 3, 6, 1])
 
     def test_permutation_and_prefix_inverse(self):
+        """Restore every natural prefix for an arbitrary chunk assignment."""
         pairs = ((0, 2), (7, 4), (1, 5), (6, 3))
         x = torch.arange(24., requires_grad=True).reshape(24, 1)
         ids = [t for pair in pairs for c in pair for t in range(c*3, c*3+3)]
@@ -126,6 +134,8 @@ class TestInputPairing(unittest.TestCase):
 
 
 class TestCompactIntervals(unittest.TestCase):
+    """Validate compact document coordinates and their inverse gradients."""
+
     def test_interval_merge_and_missing_gradients(self):
         """Disjoint, touching, overlapping and nested intervals invert the gather."""
         order = (2, 5, 1, 0, 7, 3, 6, 4)
@@ -147,16 +157,34 @@ class TestCompactIntervals(unittest.TestCase):
         self.assertIsNone(fold.compact_pair_grad(None, None, ((0, 3), (3, 6)), order, 24))
 
     def test_compact_plan_removes_empty_documents(self):
-        plan = fold._compact_plan((0, 5, 5, 9, 24, 24), 24, 1, 4, None)
-        self.assertEqual(plan[0], ((5, 9), (3,), (4,)))
-        self.assertEqual(plan[1], ((9, 18), (3,), (9,)))
-        with self.assertRaises(ValueError):
-            fold._compact_plan((5, 23), 24, 1, 4, None)
+        """The public indexer path drops empty documents and validates total length."""
+        query = torch.ones(6, 1, 1)
+        key = torch.ones(24, 1, 1)
+        weights = torch.ones(6, 1)
+        seen = []
 
+        def indexer(q: Any, key_tensor: Any, selector_weights: Any, **kwargs: Any) -> Any:
+            """Record the normalized metadata delivered to the actual kernel."""
+            del key_tensor, selector_weights
+            seen.append((kwargs['actual_seq_lengths_query'].tolist(),
+                         kwargs['actual_seq_lengths_key'].tolist()))
+            return torch.zeros(len(q), 1, 1, dtype=torch.int32)
+
+        ends = torch.tensor([0, 5, 5, 9, 24, 24], dtype=torch.int32)
+        setattr(ends, "_hp_compact_ends", tuple(ends.tolist()))
+        fold.fold_lightning_indexer(indexer, 1, 4, query, key, weights,
+            fold_layout='TND', actual_seq_lengths_query=ends, actual_seq_lengths_key=ends)
+        self.assertEqual(seen, [([3], [4]), ([3], [9])])
+        invalid = torch.tensor([5, 23], dtype=torch.int32)
+        setattr(invalid, "_hp_compact_ends", (5, 23))
+        with self.assertRaises(ValueError):
+            fold.fold_lightning_indexer(indexer, 1, 4, query, key, weights,
+                fold_layout='TND', actual_seq_lengths_query=invalid, actual_seq_lengths_key=invalid)
 
     def test_three_kernel_paths_share_compact_coordinates(self):
+        """Indexer, attention and KL must use the same compact document coordinates."""
         ends = torch.tensor([5, 9, 24], dtype=torch.int32)
-        ends._hp_compact_ends = (5, 9, 24)
+        setattr(ends, "_hp_compact_ends", (5, 9, 24))
         order = fold.build_fold_order(4)
         natural = torch.arange(24.).reshape(24, 1, 1)
         key = natural.reshape(8, 3, 1, 1)[order].reshape(24, 1, 1)
@@ -164,8 +192,9 @@ class TestCompactIntervals(unittest.TestCase):
         weights = torch.ones(6, 1)
         seen = []
 
-        def indexer(q: Any, k: Any, _weights: Any, **kwargs: Any) -> Any:
+        def indexer(q: Any, k: Any, selector_weights: Any, **kwargs: Any) -> Any:
             """Record the compact coordinates passed to the selector."""
+            del selector_weights
             seen.append((k[:, 0, 0].tolist(), kwargs['actual_seq_lengths_key'].tolist()))
             return torch.zeros(len(q), 1, 1, dtype=torch.int32)
 
