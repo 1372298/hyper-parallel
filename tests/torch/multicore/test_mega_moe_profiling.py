@@ -17,17 +17,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.torch.multicore._evidence_helpers import capture_worker_logs
+from tests.common.port_utils import allocate_port
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
     without_inherited_rank_environment,
 )
-from tests.common.port_utils import allocate_port
-
 
 _WORKER = str(Path(__file__).resolve().parent / "_test_mega_moe_profiling.py")
 _WORLD_SIZE = 2
@@ -53,24 +54,18 @@ def test_mega_moe_standalone_profiler(monkeypatch, tmp_path: Path) -> None:
     Expectation: Mega moe standalone profiler.
     """
     _prepare_torch_multicore_test_environment()
+    result_dir = Path(os.getenv("HP_MEGA_MOE_EVIDENCE_DIR", str(tmp_path))) / "profiling"
     monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
     monkeypatch.setenv("HP_MEGA_MOE_WORLD_SIZE", str(_WORLD_SIZE))
-    monkeypatch.setenv("HP_MEGA_MOE_PROFILE_RESULT_DIR", str(tmp_path))
+    monkeypatch.setenv("HP_MEGA_MOE_PROFILE_RESULT_DIR", str(result_dir))
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    with without_inherited_rank_environment():
-        parallel_run(
-            [
-                TorchCase(
-                    _WORKER,
-                    "test_mega_moe_forward_profiling",
-                    num_proc=_WORLD_SIZE,
-                )
-            ],
-            global_num_proc=_WORLD_SIZE,
-        )
+    with without_inherited_rank_environment(), capture_worker_logs(
+        _WORKER, "test_mega_moe_forward_profiling", result_dir / "worker_logs",
+    ):
+        run_multicore_case(_WORKER, "test_mega_moe_forward_profiling", num_proc=_WORLD_SIZE)
 
     for rank in range(_WORLD_SIZE):
-        trace_path = tmp_path / f"rank{rank}_mega_kernel_trace.json"
+        trace_path = result_dir / f"rank{rank}_mega_kernel_trace.json"
         trace = json.loads(trace_path.read_text(encoding="utf-8"))
         metadata = trace["megaKernelCycleTrace"]
         assert metadata["invocationCount"] == 1

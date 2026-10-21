@@ -13,49 +13,43 @@
 # limitations under the License.
 # ============================================================================
 
-"""Lightweight launcher for the DSV4.1 fixed-capacity expert adapter."""
+"""Lightweight launchers for DSV4.1 dynamic experts and hybrid parallelism."""
 
 from pathlib import Path
 
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
-from tests.common.port_utils import allocate_port
-from tests.torch.multicore._test_env import (
-    prepare_multicore_test_environment, without_inherited_rank_environment,
-)
+from tests.torch.multicore._evidence_helpers import EXTENDED_LEVEL1
+from tests.torch.multicore.test_mega_moe import _run_acceptance_worker
+
+_PARALLEL_CASES = [(2, 1, False, "push"), (2, 1, True, "pull"),
+                   (1, 2, True, "push"), (1, 2, False, "pull"),
+                   (2, 2, False, "push"), (2, 2, True, "pull")]
+if EXTENDED_LEVEL1:
+    _PARALLEL_CASES = [(tp, cp, vision, mode) for tp, cp in ((2, 1), (1, 2), (2, 2))
+                       for vision in (False, True) for mode in ("push", "pull")]
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="essential")
 @pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-def test_deepseek_v41_megamoe(monkeypatch: pytest.MonkeyPatch, dispatch_mode: str) -> None:
+def test_deepseek_v41_megamoe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str) -> None:
     """Run EP8/E48 forward and all-gradient comparisons at limit 10."""
-    prepare_multicore_test_environment()
-    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
-    monkeypatch.setenv("HP_DYNAMIC_DISPATCH", dispatch_mode)
-    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    worker = str(Path(__file__).with_name("_test_deepseek_v41_dynamic_tokens.py"))
-    with without_inherited_rank_environment():
-        parallel_run([TorchCase(worker, "test_deepseek_v41_dynamic_tokens", num_proc=8)], global_num_proc=8)
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_dynamic_tokens", 8,
+                           "_test_deepseek_v41_dynamic_tokens.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards",
           essential_mark="essential")
-@pytest.mark.parametrize("dispatch_mode", ["push", "pull"])
-@pytest.mark.parametrize("tp,cp", [(2, 1), (1, 2), (2, 2)])
-@pytest.mark.parametrize("vision", [False, True])
-def test_deepseek_v41_megamoe_parallel(monkeypatch: pytest.MonkeyPatch, dispatch_mode: str,
+@pytest.mark.parametrize("tp,cp,vision,dispatch_mode", _PARALLEL_CASES)
+def test_deepseek_v41_megamoe_parallel(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dispatch_mode: str,
                                      tp: int, cp: int, vision: bool) -> None:
     """Run real TP/SP+EP and CP+EP boundaries, router, shared experts, and gradients."""
-    prepare_multicore_test_environment()
-    monkeypatch.delenv("HYPER_PARALLEL_SHMEM_HEAP_SIZE", raising=False)
-    monkeypatch.setenv("HP_DYNAMIC_DISPATCH", dispatch_mode)
     monkeypatch.setenv("HP_DSV41_TP", str(tp))
     monkeypatch.setenv("HP_DSV41_CP", str(cp))
     monkeypatch.setenv("HP_DSV41_VISION", str(int(vision)))
-    monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
-    worker = str(Path(__file__).with_name("_test_deepseek_v41_parallel.py"))
-    with without_inherited_rank_environment():
-        parallel_run([TorchCase(worker, "test_deepseek_v41_parallel", num_proc=8)], global_num_proc=8)
+    monkeypatch.setenv("HP_MEGA_MOE_DISPATCH_MODE", dispatch_mode)
+    _run_acceptance_worker(monkeypatch, tmp_path, "test_deepseek_v41_parallel", 8,
+                           "_test_deepseek_v41_parallel.py", variant=f"tp{tp}-cp{cp}-vision{int(vision)}")

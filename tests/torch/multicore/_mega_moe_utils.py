@@ -20,16 +20,15 @@ import importlib.util
 import json
 import os
 import platform
-import subprocess
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-
 import torch_npu
 
 from hyper_parallel.core.multicore import shmem
 from hyper_parallel.core.multicore._loader import get_multicore_paths
+from tests.torch.multicore._evidence_helpers import source_revision
 from tests.common.port_utils import allocate_port
 
 
@@ -86,9 +85,7 @@ def environment_identity() -> dict:
         raise RuntimeError("hyper_parallel_shmem_torch native module is not importable.")
     native_files.extend(Path(binding_spec.origin).parents[2].rglob("*.so"))
     return {
-        "source_sha": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True
-        ).strip(),
+        **source_revision(root),
         "worker_sha256": {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in Path(__file__).parent.glob("*mega_moe*.py")

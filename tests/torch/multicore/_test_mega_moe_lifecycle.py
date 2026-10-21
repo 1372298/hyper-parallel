@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Exercise peer-ready generations with delayed ranks and checkpoint replay."""
+"""Shared-resource training, ready generations and checkpoint lifecycle acceptance."""
 
+import os
 import time
+from dataclasses import asdict
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.multicore import MegaMoeExperts, shmem
@@ -26,8 +29,29 @@ from hyper_parallel.core.multicore.scheduler.config import (
     READY_CACHE_LINE_BYTES,
 )
 from tests.torch.multicore import _test_mega_moe as baseline
-from tests.torch.multicore import _test_mega_moe_resources as resources_test
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
+from tests.torch.multicore._mega_moe_utils import (
+    assert_stable_memory,
+    collect_memory,
+    start_shmem_lifetime,
+    write_evidence,
+)
+
+
+def _new_stack(shape: baseline.MoeShape, layers: int = 3) -> list[MegaMoeExperts]:
+    """Build distinct expert layers without initializing any native resource."""
+    return [
+        MegaMoeExperts(
+            local_num_tokens=shape.local_num_tokens,
+            hidden_size=shape.hidden_size,
+            intermediate_size=shape.intermediate_size,
+            num_experts=shape.num_experts,
+            top_k=shape.top_k,
+            ep_size=shape.ep_size,
+            ep_group=dist.group.WORLD,
+            dispatch_mode=os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
+        ).to(device=baseline.DEVICE, dtype=torch.bfloat16)
+        for _ in range(layers)
+    ]
 
 
 def _stack_step(layers: list, shape: baseline.MoeShape, streams: list, replay: bool, step: int) -> list:
@@ -65,7 +89,16 @@ def _stack_step(layers: list, shape: baseline.MoeShape, streams: list, replay: b
     for index, tensor in enumerate(tensors):
         assert tensor is not None, f"rank={baseline.RANK}: missing tensor {index}, expected a result or gradient."
         baseline.assert_finite(f"ready step={step} tensor={index}", tensor)
-    return [tensor.detach().cpu() for tensor in tensors]
+        assert torch.count_nonzero(tensor).item() > 0, (
+            f"rank={baseline.RANK}: lifecycle step={step} tensor={index} is entirely zero"
+        )
+    snapshots = [tensor.detach().cpu() for tensor in tensors]
+    with torch.no_grad():
+        for layer in layers:
+            for parameter in layer.parameters():
+                parameter.add_(parameter.grad, alpha=-1e-3)
+            layer.zero_grad(set_to_none=True)
+    return snapshots
 
 
 def _ready_generations(workspace, ep_size: int) -> tuple[int, int]:
@@ -77,19 +110,20 @@ def _ready_generations(workspace, ep_size: int) -> tuple[int, int]:
     )
 
 
-def _run_ready_case(replay: bool) -> dict:
+def _run_lifecycle_case(alternate_streams: bool, replay: bool) -> dict:
     """Compare shared checkpoint execution against independent ordinary layers."""
     start_shmem_lifetime()
-    shape = baseline.MoeShape(local_num_tokens=128)
-    independent = resources_test._new_stack(shape)  # pylint: disable=protected-access
-    shared = resources_test._new_stack(shape)  # pylint: disable=protected-access
+    shape = baseline.MoeShape(local_num_tokens=128 if replay else 1024)
+    independent = _new_stack(shape)
+    shared = _new_stack(shape)
     for source, target in zip(independent, shared):
         target.load_state_dict(source.state_dict())
     MegaMoeExperts.share_execution_resources(shared)
-    streams = [torch.npu.Stream() for _ in range(2)]
-    generations = []
+    streams = [torch.npu.Stream() for _ in range(2 if alternate_streams else 1)]
+    generations, samples = [], []
+    steps = 4 if replay else 6
     try:
-        for step in range(4):
+        for step in range(steps):
             reference = _stack_step(independent, shape, streams, False, step)
             if step == 0:
                 actual = _stack_step(shared, shape, streams, replay, step)
@@ -106,6 +140,13 @@ def _run_ready_case(replay: bool) -> dict:
                     observed, expected, rtol=2e-2, atol=1e-5,
                     msg=f"rank={baseline.RANK}: replay={replay} step={step} tensor={index}",
                 )
+            for source, target in zip(independent, shared):
+                for expected, observed in zip(source.parameters(), target.parameters()):
+                    baseline.assert_close("lifecycle updated parameter", observed, expected)
+            if not replay and step >= 3:
+                sample = collect_memory()
+                sample["shmem_allocations"] = shmem.debug_state()["allocated_count"]
+                samples.append(sample)
             workspace = shared[0]._resource_group.resources.workspace  # pylint: disable=protected-access
             current = _ready_generations(workspace, shape.ep_size)
             if generations:
@@ -114,6 +155,21 @@ def _run_ready_case(replay: bool) -> dict:
                 )
             generations.append(current)
 
+        if samples:
+            assert_stable_memory(samples)
+            allocations = [sample["shmem_allocations"] for sample in samples]
+            assert len(set(allocations)) == 1, f"rank={baseline.RANK}: unstable SHMEM allocations={allocations}"
+        # Sharing identity and numerical parity are separate contracts.
+        resources = shared[0]._resource_group.resources  # pylint: disable=protected-access
+        shared_resources = [layer._resource_group.resources for layer in shared]  # pylint: disable=protected-access
+        assert all(resource is resources for resource in shared_resources), (
+            f"rank={baseline.RANK}: shared layers did not share the same resources"
+        )
+        # Each independent layer must retain a distinct physical allocation group.
+        independent_ids = {
+            id(layer._resource_group.resources) for layer in independent  # pylint: disable=protected-access
+        }
+        assert len(independent_ids) == 3, f"rank={baseline.RANK}: independent resource count={len(independent_ids)}"
         source, _ = baseline.make_data(shape)
         ids, weights, counts = baseline.make_balanced_route(shape)
         with patch.object(
@@ -127,16 +183,17 @@ def _run_ready_case(replay: bool) -> dict:
             else:
                 raise AssertionError("Injected launch error was not propagated.")
         assert not workspace.in_use, f"rank={baseline.RANK}: failed launch left lease in_use={workspace.in_use}."
-        reference = _stack_step(independent, shape, streams, False, 4)
-        actual = _stack_step(shared, shape, streams, replay, 4)
+        reference = _stack_step(independent, shape, streams, False, steps)
+        actual = _stack_step(shared, shape, streams, replay, steps)
         for index, (expected, observed) in enumerate(zip(reference, actual)):
             torch.testing.assert_close(
                 observed, expected, rtol=2e-2, atol=1e-5,
                 msg=f"rank={baseline.RANK}: recovery tensor={index}",
             )
         return {
-            "checkpoint_replay": replay, "layers": 3, "microbatches": 2,
-            "alternating_streams": 2, "rank_staggered": True, "generations": generations,
+            "shape": asdict(shape), "checkpoint_replay": replay, "layers": 3, "microbatches": 2,
+            "steps": steps, "alternating_streams": len(streams), "rank_staggered": True,
+            "generations": generations, "stable_memory": samples, "parameter_updates_match": True,
             "steady_host_barriers": 0, "launch_exception_recovered": True,
             "outputs_and_all_gradients_match": True,
         }
@@ -145,7 +202,9 @@ def _run_ready_case(replay: bool) -> dict:
             layer.close()
 
 
-def test_mega_moe_device_ready_lifecycle() -> None:
-    """Recreate resources across plain and checkpointed staggered schedules."""
-    results = [_run_ready_case(replay) for replay in (False, True)]
-    write_evidence({"device_ready_lifecycle": results})
+def test_mega_moe_resource_lifecycle() -> None:
+    """Validate shared training and ready recovery in serial, alternating and replay schedules."""
+    results = [_run_lifecycle_case(alternate, replay) for alternate, replay in
+               ((False, False), (True, False), (True, True))]
+    write_evidence({"dispatch_mode": os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push"),
+                    "resource_lifecycle": results})

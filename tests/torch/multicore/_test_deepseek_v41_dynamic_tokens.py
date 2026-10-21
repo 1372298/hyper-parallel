@@ -21,14 +21,21 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch_npu  # pylint: disable=unused-import
 from torch import nn
 from torch.nn import functional
-import torch_npu  # pylint: disable=unused-import
 
 from hyper_parallel.core.multicore import MegaMoeExperts
-from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime
-from tests.torch.multicore._test_mega_moe_dynamic_tokens import _assert_close, _inputs, _weights
+from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
+    DeepseekV41MegaMoeExperts,
+)
+from tests.torch.multicore._evidence_helpers import EXTENDED_LEVEL1
+from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
+from tests.torch.multicore._test_mega_moe_dynamic_tokens import (
+    _assert_close,
+    _inputs,
+    _weights,
+)
 
 
 def _oracle(weights: tuple, inputs: tuple) -> tuple:
@@ -97,8 +104,9 @@ def test_deepseek_v41_dynamic_tokens() -> None:
         fixed.gate_up_weight.copy_(weights[0][experts])
         fixed.down_weight.copy_(weights[1][experts])
     reports = []
-    cases = ([224, 240] * 4, [0, 17, 17, 17, 17, 17, 17, 17], [0] * 8,
-             [127, 128, 129, 255, 256, 257, 1, 513], [4096, 1, 0, 129, 0, 240, 257, 128])
+    cases = [[0] * 8, [127, 128, 129, 255, 256, 257, 1, 513], [4096, 1, 0, 129, 0, 240, 257, 128]]
+    if EXTENDED_LEVEL1:
+        cases = [[224, 240] * 4, [0, 17, 17, 17, 17, 17, 17, 17], *cases]
     for lengths in cases:
         inputs = _inputs(lengths, 48, 6)
         # Saturation must occur on real routes so disabling the clamp cannot pass unnoticed.
@@ -122,11 +130,14 @@ def test_deepseek_v41_dynamic_tokens() -> None:
     dynamic.close_runtime()
     fixed.close()
     result = {"rank": rank, "limit": 10, "ep": world, "experts": 48,
+              "torch": torch.__version__, "torch_npu": torch_npu.__version__, "dispatch_mode": dispatch_mode,
               "passed": True, "cases": reports, "rtol": 2e-2, "atol": 2e-3}
-    if os.getenv("HP_DSV41_DYNAMIC_RESULT_DIR"):
-        output = Path(os.environ["HP_DSV41_DYNAMIC_RESULT_DIR"])
-        output.mkdir(parents=True, exist_ok=True)
-        (output / f"block-rank{rank}.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    if os.getenv("HP_MEGA_MOE_LEVEL1_RESULT"):
+        write_evidence(result)
+    elif os.getenv("HP_DSV41_DYNAMIC_RESULT_DIR"):
+        path = Path(os.environ["HP_DSV41_DYNAMIC_RESULT_DIR"])
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"block-rank{rank}.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result), flush=True)
     dist.barrier()
     dist.destroy_process_group()

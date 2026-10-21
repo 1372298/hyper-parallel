@@ -22,13 +22,13 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch_npu  # pylint: disable=unused-import
 from torch.nn import functional
 from torch.utils.checkpoint import checkpoint
-import torch_npu  # pylint: disable=unused-import
 
 from hyper_parallel.core.multicore import MegaMoeExperts
-from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime
-
+from tests.torch.multicore._evidence_helpers import EXTENDED_LEVEL1
+from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
 
 _HIDDEN = 512
 _INTERMEDIATE = 128
@@ -144,22 +144,25 @@ def _check_gradients(mega: MegaMoeExperts, invocation: tuple, expected: tuple,
 
 
 def _cases(world: int) -> list[tuple[list[int], bool]]:
-    """Exercise boundary tiles, cache misses, emptiness and maximal skew."""
-    cases = [([value] * world, False) for value in (1, 127, 128, 129, 255, 256, 257, 385, 513, 641, 1, 4095)]
-    ragged = [224, 240, 1, 127, 128, 129, 0, 257]
-    cases.extend([(ragged[:world], False), ([0] + [17] * (world - 1), True),
-                  ([0] * world, False), ([4096] + [1] * (world - 1), False),
-                  ([4096, 1, 0, 129, 0, 240, 4095, 128][:world], False)])
-    return cases
+    """Retain boundary, empty, skewed and revisited inputs; restore extra uniform lengths on demand."""
+    sizes = (1, 127, 128, 129, 255, 256, 257, 385, 513, 641, 1, 4095) if EXTENDED_LEVEL1 else (
+        1, 127, 128, 129, 255, 256, 257, 1,
+    )
+    cases = [([value] * world, False) for value in sizes]
+    cases.extend([([224, 240, 1, 127, 128, 129, 0, 257][:world], False),
+                  ([0] + [17] * (world - 1), True), ([0] * world, False)])
+    if EXTENDED_LEVEL1:
+        cases.append(([4096] + [1] * (world - 1), False))
+    return cases + [([4096, 1, 0, 129, 0, 240, 4095, 128][:world], False)]
 
 
 def _deferred(mega: MegaMoeExperts, weights: tuple, rank: int, device: torch.device) -> None:
     """Five pending forwards retain evicted plans through both backward orders."""
     world = dist.get_world_size()
+    lengths = [[size + rank_index for rank_index in range(world)] for size in (1, 129, 257, 385, 513)]
+    batches = [_inputs(item, mega.num_experts, mega.top_k) for item in lengths]
+    references = [_rounded_oracle(weights, batch) for batch in batches]
     for order in (tuple(reversed(range(5))), tuple(range(5))):
-        lengths = [[size + rank_index for rank_index in range(world)] for size in (1, 129, 257, 385, 513)]
-        batches = [_inputs(item, mega.num_experts, mega.top_k) for item in lengths]
-        references = [_rounded_oracle(weights, batch) for batch in batches]
         invocations = [_forward(mega, batch, rank, device) for batch in batches]
         try:
             mega.close()
@@ -233,38 +236,29 @@ def _padded_inputs(inputs: tuple) -> tuple:
     return tuple(batches)
 
 
-def _fixed_comparison(mega: MegaMoeExperts, fixed: MegaMoeExperts, weights: tuple,
-                      rank: int, device: torch.device) -> list:
-    """Compare real-token execution to the existing padded path and report raw FP32 error."""
-    reports = []
-    world = dist.get_world_size()
-    for lengths in ([127] * world, [224, 240, 1, 127, 128, 129, 0, 257][:world],
-                    [4096] + [1] * (world - 1)):
-        inputs = _inputs(lengths, mega.num_experts, mega.top_k)
-        mega.zero_grad(set_to_none=True)
-        fixed.zero_grad(set_to_none=True)
-        actual = _snapshot(mega, _forward(mega, inputs, rank, device))
-        padded = _snapshot(fixed, _forward(fixed, _padded_inputs(inputs), rank, device))
-        baseline = tuple(value[:lengths[rank]] if index < 3 else value
-                         for index, value in enumerate(padded))
-        for index, (value, expected) in enumerate(zip(actual, baseline)):
-            _assert_close(f"fixed path tensor {index}", value, expected)
-        oracle = _fp32_oracle(weights, inputs)
-        start, stop = sum(lengths[:rank]), sum(lengths[:rank + 1])
-        oracle = tuple(value[start:stop] if index < 3 else value[rank * 6:(rank + 1) * 6]
-                       for index, value in enumerate(oracle))
-        report = {"lengths": lengths, "fp32": []}
-        for value, old, expected in zip(actual, baseline, oracle):
-            delta = (value.float() - expected).abs()
-            old_delta = (old.float() - expected).abs()
-            report["fp32"].append({
-                "dynamic_bad_elements": int((delta > 2e-3 + 2e-2 * expected.abs()).sum()),
-                "fixed_bad_elements": int((old_delta > 2e-3 + 2e-2 * expected.abs()).sum()),
-                "dynamic_relative_l2": float(delta.norm() / expected.norm().clamp_min(1e-30)),
-                "fixed_relative_l2": float(old_delta.norm() / expected.norm().clamp_min(1e-30)),
-            })
-        reports.append(report)
-    return reports
+def _fixed_comparison(fixed: MegaMoeExperts, weights: tuple, inputs: tuple, actual: tuple,
+                      lengths: list[int], rank: int, device: torch.device) -> dict:
+    """Reuse the validated dynamic result for padding parity and raw FP32 diagnostics."""
+    fixed.zero_grad(set_to_none=True)
+    padded = _snapshot(fixed, _forward(fixed, _padded_inputs(inputs), rank, device))
+    baseline = tuple(value[:lengths[rank]] if index < 3 else value for index, value in enumerate(padded))
+    for index, (value, expected) in enumerate(zip(actual, baseline)):
+        _assert_close(f"fixed path tensor {index}", value, expected)
+    oracle = _fp32_oracle(weights, inputs)
+    start, stop = sum(lengths[:rank]), sum(lengths[:rank + 1])
+    oracle = tuple(value[start:stop] if index < 3 else value[rank * 6:(rank + 1) * 6]
+                   for index, value in enumerate(oracle))
+    report = {"lengths": lengths, "fp32": []}
+    for value, old, expected in zip(actual, baseline, oracle):
+        delta = (value.float() - expected).abs()
+        old_delta = (old.float() - expected).abs()
+        report["fp32"].append({
+            "dynamic_bad_elements": int((delta > 2e-3 + 2e-2 * expected.abs()).sum()),
+            "fixed_bad_elements": int((old_delta > 2e-3 + 2e-2 * expected.abs()).sum()),
+            "dynamic_relative_l2": float(delta.norm() / expected.norm().clamp_min(1e-30)),
+            "fixed_relative_l2": float(old_delta.norm() / expected.norm().clamp_min(1e-30)),
+        })
+    return report
 
 
 def _lifecycle(layers: list[MegaMoeExperts], rank: int, device: torch.device) -> None:
@@ -432,7 +426,10 @@ def test_dynamic_tokens() -> None:
     bounded_inputs = _inputs([17] * world, experts, top_k)
     _check_gradients(bounded, _forward(bounded, bounded_inputs, rank, device),
                      _rounded_oracle(weights, bounded_inputs), [17] * world, rank)
-    results = []
+    results, fixed_reports = [], []
+    reference_lengths = [[224, 240, 1, 127, 128, 129, 0, 257][:world]]
+    if EXTENDED_LEVEL1:
+        reference_lengths += [[127] * world, [4096] + [1] * (world - 1)]
     for lengths, hot in _cases(world):
         inputs = _inputs(lengths, experts, top_k, hot)
         expected = _rounded_oracle(weights, inputs)
@@ -447,10 +444,14 @@ def test_dynamic_tokens() -> None:
                 workspace.routed_buffer.fill_(float("nan"))
         invocation = _forward(mega, inputs, rank, device)
         errors = _check_gradients(mega, invocation, expected, lengths, rank)
+        if lengths in reference_lengths:
+            x, probs, output, _ = invocation
+            actual = tuple(value.detach().cpu().clone() for value in
+                           (output, x.grad, probs.grad, mega.gate_up_weight.grad, mega.down_weight.grad))
+            fixed_reports.append(_fixed_comparison(fixed, weights, inputs, actual, lengths, rank, device))
         results.append({"lengths": lengths, "hot": hot, "max_abs_error": errors})
         print(json.dumps({"rank": rank, **results[-1]}), flush=True)
     _frozen_gradients(mega, weights, rank, device)
-    fixed_reports = _fixed_comparison(mega, fixed, weights, rank, device)
     _lifecycle([mega, peer], rank, device)
     mega.load_state_dict(fixed.state_dict())
     # Retire the other member so closing the last owner checks pending graphs.
@@ -468,17 +469,17 @@ def test_dynamic_tokens() -> None:
     peer.close()
     fixed.close()
     bounded.close()
-    result_dir = os.getenv("HP_DYNAMIC_RESULT_DIR")
-    if result_dir:
-        path = Path(result_dir)
+    result = {"status": "passed", "results": results, "deferred_backward": "passed",
+              "coordinated_overflow": "passed", "fixed_reference": fixed_reports,
+              "checkpoint_shared_stream_sgd": "passed", "frozen_policies": "passed",
+              "torch": torch.__version__, "torch_npu": torch_npu.__version__,
+              "dispatch_mode": os.environ.get("HP_DYNAMIC_DISPATCH", "push")}
+    if os.getenv("HP_MEGA_MOE_LEVEL1_RESULT"):
+        write_evidence(result)
+    elif os.getenv("HP_DYNAMIC_RESULT_DIR"):
+        path = Path(os.environ["HP_DYNAMIC_RESULT_DIR"])
         path.mkdir(parents=True, exist_ok=True)
-        (path / f"ep{world}-rank{rank}.json").write_text(json.dumps(
-            {"status": "passed", "results": results, "deferred_backward": "passed",
-             "coordinated_overflow": "passed", "fixed_reference": fixed_reports,
-             "checkpoint_shared_stream_sgd": "passed", "frozen_policies": "passed",
-             "torch": torch.__version__, "torch_npu": torch_npu.__version__,
-             "dispatch_mode": os.environ.get("HP_DYNAMIC_DISPATCH", "push")},
-            indent=2) + "\n", encoding="utf-8")
+        (path / f"ep{world}-rank{rank}.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     dist.destroy_process_group()
 
 

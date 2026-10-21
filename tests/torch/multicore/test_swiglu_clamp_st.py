@@ -20,8 +20,8 @@ import os
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
 from tests.common.port_utils import allocate_port
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
@@ -59,15 +59,6 @@ def test_swiglu_clamp_numerics() -> None:
         f"tcp://127.0.0.1:{allocate_port()}"
     )
     with without_inherited_rank_environment():
-        parallel_run(
-            [TorchCase(_WORKER, "test_swiglu_clamp_numerics", num_proc=1)],
-            global_num_proc=1,
-        )
-        parallel_run(
-            [TorchCase(_WORKER, "test_swiglu_clamp_input_gradient", num_proc=1)],
-            global_num_proc=1,
-        )
-        parallel_run(
-            [TorchCase(_WORKER, "test_swiglu_clamp_ub_scratch", num_proc=1)],
-            global_num_proc=1,
-        )
+        run_multicore_case(_WORKER, "test_swiglu_clamp_numerics", num_proc=1)
+        run_multicore_case(_WORKER, "test_swiglu_clamp_input_gradient", num_proc=1)
+        run_multicore_case(_WORKER, "test_swiglu_clamp_ub_scratch", num_proc=1)

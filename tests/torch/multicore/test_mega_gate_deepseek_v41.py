@@ -21,7 +21,7 @@ import sys
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     prepare_multicore_test_environment,
     without_inherited_rank_environment,
@@ -66,4 +66,4 @@ def test_mega_gate_deepseek_v41(case: str, num_proc: int, monkeypatch: pytest.Mo
     if num_proc > 1:
         monkeypatch.setenv("HCCL_NPU_SOCKET_PORT_RANGE", _HCCL_PORT_RANGE)
     with without_inherited_rank_environment():
-        parallel_run([TorchCase(_WORKER, case, num_proc=num_proc)], global_num_proc=num_proc)
+        run_multicore_case(_WORKER, case, num_proc=num_proc)

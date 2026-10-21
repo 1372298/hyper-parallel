@@ -17,7 +17,7 @@
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
@@ -34,4 +34,4 @@ def test_mega_mhc_same_shape_multistream() -> None:
         raise RuntimeError("mHC multi-stream ST requires a payload built with --multicore on")
     worker = str(Path(__file__).resolve().with_name("_test_mega_mhc.py"))
     with without_inherited_rank_environment():
-        parallel_run([TorchCase(worker, "test_same_shape_multistream_forward_backward", num_proc=1)], global_num_proc=1)
+        run_multicore_case(worker, "test_same_shape_multistream_forward_backward", num_proc=1)

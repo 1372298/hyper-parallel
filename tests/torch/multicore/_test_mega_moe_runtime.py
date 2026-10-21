@@ -81,8 +81,12 @@ def test_mega_moe_group_list_isolation() -> None:
     start_shmem_lifetime()
     dispatch_mode = os.getenv("HP_MEGA_MOE_DISPATCH_MODE", "push")
     records = []
-    patterns = ("balanced", "zero_token_experts", "skew", "single_destination") * 2
-    for local_experts in (10, 11, 12, 13, 16, 17, 31, 32, 33, 64, 128):
+    extended = os.getenv("HP_MEGA_MOE_GROUP_LIST_EXTENDED", "0") == "1"
+    # Cover odd tails, both cache-line boundaries and a large graph-sized list.
+    patterns = (("balanced", "zero_token_experts", "skew", "single_destination") * 2 if extended else
+                ("balanced", "zero_token_experts", "skew", "single_destination", "balanced"))
+    expert_counts = ((10, 11, 12, 13, 16, 17, 31, 32, 33, 64, 128) if extended else (13, 16, 17, 32, 33, 128))
+    for local_experts in expert_counts:
         shape = baseline.MoeShape(local_num_tokens=128 * local_experts, num_experts=2 * local_experts)
         hidden, upstream = baseline.make_data(shape)
         mega, common = baseline.new_layers(shape, dispatch_mode=dispatch_mode)
@@ -96,7 +100,8 @@ def test_mega_moe_group_list_isolation() -> None:
                             "all_outputs_gradients_updates_match": True})
         finally:
             mega.close()
-    write_evidence({"dispatch_mode": dispatch_mode, "cases": records, "memory": memory_sample()})
+    write_evidence({"dispatch_mode": dispatch_mode, "extended": extended,
+                    "cases": records, "memory": memory_sample()})
 
 
 def _subgroup_route(mode: str, step: int) -> torch.Tensor:

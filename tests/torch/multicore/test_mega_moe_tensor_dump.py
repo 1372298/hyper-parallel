@@ -19,8 +19,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import TorchCase, parallel_run
 from tests.common.port_utils import allocate_port
+from tests.torch.multicore._case_launcher import run_multicore_case
 from tests.torch.multicore._test_env import (
     multicore_adapter_is_available,
     prepare_multicore_test_environment,
@@ -47,10 +47,7 @@ def _run_dump_case(monkeypatch, output_dir: Path, case_name: str) -> None:
     monkeypatch.setenv("HP_MEGA_MOE_DUMP_RESULT_DIR", str(output_dir))
     monkeypatch.setenv("HYPER_PARALLEL_SHMEM_BOOTSTRAP_ENDPOINT", f"tcp://127.0.0.1:{allocate_port()}")
     with without_inherited_rank_environment():
-        parallel_run(
-            [TorchCase(_WORKER, case_name, num_proc=_WORLD_SIZE)],
-            global_num_proc=_WORLD_SIZE,
-        )
+        run_multicore_case(_WORKER, case_name, num_proc=_WORLD_SIZE)
 
 
 @arg_mark(
