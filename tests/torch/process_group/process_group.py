@@ -28,8 +28,8 @@ def test_process_group():
     process group. After that, create a sub process group and get rank list and backend in sub process group.
     Finally, destroy the sub process group and process group.
     """
-    # init process group
-    init_process_group()
+    # Select HCCL explicitly so the backend-name assertions have a deterministic contract.
+    init_process_group(backend="hccl")
     world_size = dist.get_world_size()
     # pylint: disable=C0415
     rank_list = get_process_group_ranks()
