@@ -54,7 +54,7 @@ extern "C" {
 
 aclnnStatus aclnnHyperMegaGateRouteGetWorkspaceSize(const aclTensor *logits, const aclTensor *text_bias,
                                                     const aclTensor *vision_bias, const aclTensor *image_mask,
-                                                    const aclTensor *runtime_config, const aclTensor *profile_buffer,
+                                                    const aclTensor *runtime_config, const aclTensor *diagnostic_buffer,
                                                     const aclTensor *routing_weights, const aclTensor *expert_indices,
                                                     const aclTensor *route_scores, const aclTensor *selected_scores,
                                                     const aclTensor *normalization_denominator, int64_t top_k,
@@ -62,7 +62,7 @@ aclnnStatus aclnnHyperMegaGateRouteGetWorkspaceSize(const aclTensor *logits, con
                                                     uint64_t *workspaceSize, aclOpExecutor **executor) {
   OP_CHECK_COMM_INPUT(workspaceSize, executor);
   L2_DFX_PHASE_1(aclnnHyperMegaGateRoute,
-                 DFX_IN(logits, text_bias, vision_bias, image_mask, runtime_config, profile_buffer, top_k,
+                 DFX_IN(logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer, top_k,
                         routed_scaling_factor, use_vision_bias),
                  DFX_OUT(routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator));
   CHECK_RET(logits != nullptr && logits->GetViewShape().GetDimNum() == 2, ACLNN_ERR_PARAM_INVALID);
@@ -71,7 +71,7 @@ aclnnStatus aclnnHyperMegaGateRouteGetWorkspaceSize(const aclTensor *logits, con
   CHECK_RET(tokens > 0 && expert_count > 0 && top_k > 0 && top_k <= expert_count &&
               std::isfinite(routed_scaling_factor) && IsFp32(logits) && IsBias(text_bias, expert_count) &&
               IsBias(vision_bias, expert_count) && IsImageMask(image_mask, use_vision_bias ? tokens : 1) &&
-              IsRuntimeResource(runtime_config) && IsRuntimeResource(profile_buffer) &&
+              IsRuntimeResource(runtime_config) && IsRuntimeResource(diagnostic_buffer) &&
               AreOutputsValid(routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator,
                               tokens, expert_count, top_k),
             ACLNN_ERR_PARAM_INVALID);
@@ -80,7 +80,7 @@ aclnnStatus aclnnHyperMegaGateRouteGetWorkspaceSize(const aclTensor *logits, con
   auto *executor_ptr = unique_executor.get();
   CHECK_RET(executor_ptr != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
   const auto outputs =
-    l0op::HyperMegaGateRoute(logits, text_bias, vision_bias, image_mask, runtime_config, profile_buffer,
+    l0op::HyperMegaGateRoute(logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer,
                              routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator,
                              top_k, static_cast<float>(routed_scaling_factor), use_vision_bias, executor_ptr);
   CHECK_RET(std::all_of(outputs.begin(), outputs.end(), [](const aclTensor *output) { return output != nullptr; }),

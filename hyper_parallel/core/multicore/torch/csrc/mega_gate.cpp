@@ -31,8 +31,8 @@ void GetMegaGateOpApiFunctionsOnce(std::once_flag &resolve_once, const char *api
   } while (false)
 
 void CheckRuntimeResources(const at::Tensor &reference, const at::Tensor &runtime_config,
-                           const at::Tensor &profile_buffer, const char *operation) {
-  const std::array<const at::Tensor *, 2> resources{&runtime_config, &profile_buffer};
+                           const at::Tensor &diagnostic_buffer, const char *operation) {
+  const std::array<const at::Tensor *, 2> resources{&runtime_config, &diagnostic_buffer};
   for (const auto *resource : resources) {
     TORCH_CHECK(resource->dim() == 1 && resource->scalar_type() == at::kByte && resource->is_contiguous() &&
                   resource->device() == reference.device(),
@@ -53,8 +53,9 @@ void CheckRouteTensorProperties(const at::Tensor &logits, const at::Tensor &text
 }
 
 void CheckRouteInputs(const at::Tensor &logits, const at::Tensor &text_bias, const at::Tensor &vision_bias,
-                      const at::Tensor &image_mask, const at::Tensor &runtime_config, const at::Tensor &profile_buffer,
-                      int64_t top_k, double routed_scaling_factor, bool use_vision_bias) {
+                      const at::Tensor &image_mask, const at::Tensor &runtime_config,
+                      const at::Tensor &diagnostic_buffer, int64_t top_k, double routed_scaling_factor,
+                      bool use_vision_bias) {
   TORCH_CHECK(logits.dim() == 2 && text_bias.dim() == 1 && vision_bias.dim() == 1,
               "HyperMegaGateRoute inputs must have logits [tokens, experts] and biases [experts]");
   const auto tokens = logits.size(0);
@@ -67,7 +68,7 @@ void CheckRouteInputs(const at::Tensor &logits, const at::Tensor &text_bias, con
               "HyperMegaGateRoute image_mask must be BOOL [tokens] for vision routing or BOOL [1] otherwise");
   TORCH_CHECK(top_k > 0 && top_k <= expert_count, "HyperMegaGateRoute top_k must be in [1, expert_count]");
   CheckRouteTensorProperties(logits, text_bias, vision_bias, image_mask);
-  CheckRuntimeResources(logits, runtime_config, profile_buffer, "HyperMegaGateRoute");
+  CheckRuntimeResources(logits, runtime_config, diagnostic_buffer, "HyperMegaGateRoute");
   TORCH_CHECK(std::isfinite(routed_scaling_factor), "routed_scaling_factor must be finite");
   TORCH_CHECK(!at::GradMode::is_enabled() ||
                 (!logits.requires_grad() && !text_bias.requires_grad() && !vision_bias.requires_grad()),
@@ -78,9 +79,9 @@ using RouteOutputs = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, 
 
 RouteOutputs MegaGateRouteNpu(const at::Tensor &logits, const at::Tensor &text_bias, const at::Tensor &vision_bias,
                               const at::Tensor &image_mask, const at::Tensor &runtime_config,
-                              const at::Tensor &profile_buffer, int64_t top_k, double routed_scaling_factor,
+                              const at::Tensor &diagnostic_buffer, int64_t top_k, double routed_scaling_factor,
                               bool use_vision_bias) {
-  CheckRouteInputs(logits, text_bias, vision_bias, image_mask, runtime_config, profile_buffer, top_k,
+  CheckRouteInputs(logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer, top_k,
                    routed_scaling_factor, use_vision_bias);
   const auto tokens = logits.size(0);
   const auto expert_count = logits.size(1);
@@ -89,17 +90,17 @@ RouteOutputs MegaGateRouteNpu(const at::Tensor &logits, const at::Tensor &text_b
   auto route_scores = at::empty({tokens, expert_count}, logits.options());
   auto selected_scores = at::empty({tokens, top_k}, logits.options());
   auto normalization_denominator = at::empty({tokens, 1}, logits.options());
-  EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config, profile_buffer,
-                   routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator, top_k,
-                   routed_scaling_factor, use_vision_bias);
+  EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config,
+                   diagnostic_buffer, routing_weights, expert_indices, route_scores, selected_scores,
+                   normalization_denominator, top_k, routed_scaling_factor, use_vision_bias);
   return std::make_tuple(routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator);
 }
 
 RouteOutputs MegaGateRouteMeta(const at::Tensor &logits, const at::Tensor &text_bias, const at::Tensor &vision_bias,
                                const at::Tensor &image_mask, const at::Tensor &runtime_config,
-                               const at::Tensor &profile_buffer, int64_t top_k, double routed_scaling_factor,
+                               const at::Tensor &diagnostic_buffer, int64_t top_k, double routed_scaling_factor,
                                bool use_vision_bias) {
-  CheckRouteInputs(logits, text_bias, vision_bias, image_mask, runtime_config, profile_buffer, top_k,
+  CheckRouteInputs(logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer, top_k,
                    routed_scaling_factor, use_vision_bias);
   const auto tokens = logits.size(0);
   const auto expert_count = logits.size(1);
@@ -107,6 +108,40 @@ RouteOutputs MegaGateRouteMeta(const at::Tensor &logits, const at::Tensor &text_
                          at::empty({tokens, top_k}, logits.options().dtype(at::kLong)),
                          at::empty({tokens, expert_count}, logits.options()),
                          at::empty({tokens, top_k}, logits.options()), at::empty({tokens, 1}, logits.options()));
+}
+
+RouteOutputs MegaGateRouteOutNpu(const at::Tensor &logits, const at::Tensor &text_bias, const at::Tensor &vision_bias,
+                                 const at::Tensor &image_mask, const at::Tensor &runtime_config,
+                                 const at::Tensor &diagnostic_buffer, at::Tensor &routing_weights,
+                                 at::Tensor &expert_indices, at::Tensor &route_scores, at::Tensor &selected_scores,
+                                 at::Tensor &normalization_denominator, int64_t top_k, double routed_scaling_factor,
+                                 bool use_vision_bias) {
+  CheckRouteInputs(logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer, top_k,
+                   routed_scaling_factor, use_vision_bias);
+  TORCH_CHECK(routing_weights.sizes() == at::IntArrayRef({logits.size(0), top_k}) &&
+                expert_indices.sizes() == routing_weights.sizes() && route_scores.sizes() == logits.sizes() &&
+                selected_scores.sizes() == routing_weights.sizes() &&
+                normalization_denominator.sizes() == at::IntArrayRef({logits.size(0), 1}),
+              "MegaGate diagnostic outputs have incompatible shapes");
+  for (const auto *output :
+       {&routing_weights, &expert_indices, &route_scores, &selected_scores, &normalization_denominator}) {
+    TORCH_CHECK(output->device() == logits.device() && output->is_contiguous() &&
+                  output->scalar_type() == (output == &expert_indices ? at::kLong : at::kFloat),
+                "MegaGate diagnostic output dtype, device or layout mismatch");
+    for (const auto *input : {&logits, &text_bias, &vision_bias, &image_mask}) {
+      TORCH_CHECK(!output->is_alias_of(*input), "MegaGate diagnostic outputs must not alias inputs");
+    }
+    for (const auto *other :
+         {&routing_weights, &expert_indices, &route_scores, &selected_scores, &normalization_denominator}) {
+      TORCH_CHECK(output == other || !output->is_alias_of(*other), "MegaGate diagnostic outputs must be disjoint");
+    }
+  }
+  if (!logits.is_meta()) {
+    EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config,
+                     diagnostic_buffer, routing_weights, expert_indices, route_scores, selected_scores,
+                     normalization_denominator, top_k, routed_scaling_factor, use_vision_bias);
+  }
+  return std::make_tuple(routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator);
 }
 
 void CheckRouteGradShapes(const at::Tensor &logits, const at::Tensor &route_scores, const at::Tensor &selected_scores,
@@ -137,7 +172,7 @@ void CheckRouteGradProperties(const at::Tensor &route_scores, const at::Tensor &
 void CheckRouteGradInputs(const at::Tensor &logits, const at::Tensor &route_scores, const at::Tensor &selected_scores,
                           const at::Tensor &normalization_denominator, const at::Tensor &expert_indices,
                           const at::Tensor &grad_routing_weights, const at::Tensor &runtime_config,
-                          const at::Tensor &profile_buffer, int64_t top_k, double routed_scaling_factor) {
+                          const at::Tensor &diagnostic_buffer, int64_t top_k, double routed_scaling_factor) {
   TORCH_CHECK(logits.dim() == 2 && logits.size(0) > 0,
               "RouteGrad logits must have positive [tokens, experts] dimensions");
   const auto expert_count = logits.size(1);
@@ -152,19 +187,19 @@ void CheckRouteGradInputs(const at::Tensor &logits, const at::Tensor &route_scor
                 logits.device() == normalization_denominator.device() && logits.device() == expert_indices.device() &&
                 logits.device() == grad_routing_weights.device(),
               "RouteGrad inputs must be on the same device");
-  CheckRuntimeResources(logits, runtime_config, profile_buffer, "HyperMegaGateRouteGrad");
+  CheckRuntimeResources(logits, runtime_config, diagnostic_buffer, "HyperMegaGateRouteGrad");
 }
 
 at::Tensor MegaGateRouteGradNpu(const at::Tensor &logits, const at::Tensor &route_scores,
                                 const at::Tensor &selected_scores, const at::Tensor &normalization_denominator,
                                 const at::Tensor &expert_indices, const at::Tensor &grad_routing_weights,
-                                const at::Tensor &runtime_config, const at::Tensor &profile_buffer, int64_t top_k,
+                                const at::Tensor &runtime_config, const at::Tensor &diagnostic_buffer, int64_t top_k,
                                 double routed_scaling_factor) {
   CheckRouteGradInputs(logits, route_scores, selected_scores, normalization_denominator, expert_indices,
-                       grad_routing_weights, runtime_config, profile_buffer, top_k, routed_scaling_factor);
+                       grad_routing_weights, runtime_config, diagnostic_buffer, top_k, routed_scaling_factor);
   auto grad_logits = at::empty_like(logits);
   EXEC_NPU_CMD_EXT(aclnnHyperMegaGateRouteGrad, logits, route_scores, selected_scores, normalization_denominator,
-                   expert_indices, grad_routing_weights, runtime_config, profile_buffer, grad_logits, top_k,
+                   expert_indices, grad_routing_weights, runtime_config, diagnostic_buffer, grad_logits, top_k,
                    routed_scaling_factor);
   return grad_logits;
 }
@@ -172,21 +207,23 @@ at::Tensor MegaGateRouteGradNpu(const at::Tensor &logits, const at::Tensor &rout
 at::Tensor MegaGateRouteGradMeta(const at::Tensor &logits, const at::Tensor &route_scores,
                                  const at::Tensor &selected_scores, const at::Tensor &normalization_denominator,
                                  const at::Tensor &expert_indices, const at::Tensor &grad_routing_weights,
-                                 const at::Tensor &runtime_config, const at::Tensor &profile_buffer, int64_t top_k,
+                                 const at::Tensor &runtime_config, const at::Tensor &diagnostic_buffer, int64_t top_k,
                                  double routed_scaling_factor) {
   CheckRouteGradInputs(logits, route_scores, selected_scores, normalization_denominator, expert_indices,
-                       grad_routing_weights, runtime_config, profile_buffer, top_k, routed_scaling_factor);
+                       grad_routing_weights, runtime_config, diagnostic_buffer, top_k, routed_scaling_factor);
   return at::empty_like(logits);
 }
 
 }  // namespace
 
 TORCH_LIBRARY_IMPL(hyper_parallel, PrivateUse1, m) {
+  m.impl("mega_gate_route_out", &MegaGateRouteOutNpu);
   m.impl("mega_gate_route", &MegaGateRouteNpu);
   m.impl("mega_gate_route_grad", &MegaGateRouteGradNpu);
 }
 
 TORCH_LIBRARY_IMPL(hyper_parallel, Meta, m) {
+  m.impl("mega_gate_route_out", &MegaGateRouteOutNpu);
   m.impl("mega_gate_route", &MegaGateRouteMeta);
   m.impl("mega_gate_route_grad", &MegaGateRouteGradMeta);
 }

@@ -12,18 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Torch-only Multicore APIs, separate from the HyperParallel root exports."""
+"""Torch-only Multicore business APIs and generic diagnostic integration."""
 
 from typing import TYPE_CHECKING, Any
 
-from hyper_parallel.core.multicore import profiler
+from hyper_parallel.core.multicore.diagnostics import (
+    MegaKernelDiagnostics, prepare_mega_kernel_diagnostics, validate_mega_kernel_diagnostic_contract,
+)
 
 if TYPE_CHECKING:
     from hyper_parallel.core.multicore.modules.mega_gate.module import MegaGate
     from hyper_parallel.core.multicore.modules.mega_mhc.module import HyperMegaMhc
     from hyper_parallel.core.multicore.modules.mega_moe.module import MegaMoeExperts
 
-__all__ = ["HyperMegaMhc", "MegaGate", "MegaMoeExperts", "profiler"]
+__all__ = [
+    "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+    "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
+]
 
 
 def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name

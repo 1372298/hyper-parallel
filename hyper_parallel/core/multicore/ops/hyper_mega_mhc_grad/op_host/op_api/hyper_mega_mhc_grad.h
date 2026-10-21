@@ -17,7 +17,7 @@ const std::array<const aclTensor *, 9> HyperMegaMhcGrad(
     const aclTensor *mixedInput, const aclTensor *rmsRstd, const aclTensor *normWeight,
     const aclTensor *directGradX, const aclTensor *previousResidual, const aclTensor *previousOutput,
     const aclTensor *previousPost, const aclTensor *previousResidualMix, const aclTensor *runtimeConfig,
-    const aclTensor *allEventCounters, const aclTensor *profileBuffer, const aclTensor *gradResidual,
+    const aclTensor *allEventCounters, const aclTensor *diagnosticBuffer, const aclTensor *gradResidual,
     const aclTensor *gradPhi, const aclTensor *gradAlpha, const aclTensor *gradBias,
     const aclTensor *gradPreviousOutput, const aclTensor *gradPreviousPre,
     const aclTensor *gradPreviousPost, const aclTensor *gradPreviousResidual,

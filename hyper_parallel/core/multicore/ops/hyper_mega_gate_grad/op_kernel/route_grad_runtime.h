@@ -27,7 +27,7 @@ __aicore__ inline bool IsRouteGradRuntimeValid(__gm__ uint8_t *runtime, const Ti
          MulticoreRuntime::getTaskIndexNumByTaskType(runtime, MulticoreRuntime::TaskAiCoreType::TASK_AICORE_VECTOR) ==
            static_cast<int32_t>(tiling.stageCount) &&
          required_runtime_bytes <= tiling.runtimeConfigBytes &&
-         (!MulticoreRuntime::isCycleProfileEnabled(runtime) || required_profile_bytes <= tiling.profileBufferBytes);
+         (!MulticoreRuntime::isCycleProfileEnabled(runtime) || required_profile_bytes <= tiling.diagnosticBufferBytes);
 }
 
 #endif  // HYPER_MEGA_GATE_ROUTE_GRAD_RUNTIME_H

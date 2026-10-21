@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Public MegaKernel profiling APIs."""
+"""Common MegaKernel integration API; concrete tools live in sibling packages."""
 
-from hyper_parallel.core.multicore.profiler.profiler import (
-    ProfilerAction,
-    mega_kernel_profile,
-    merge_chrome_traces,
-    schedule,
+from hyper_parallel.core.multicore.diagnostics.api import (
+    MegaKernelDiagnostics, prepare_mega_kernel_diagnostics,
 )
+from hyper_parallel.core.multicore.diagnostics.common.graph import validate_mega_kernel_diagnostic_contract
+from hyper_parallel.core.multicore.diagnostics.common.schedule import DiagnosticAction, schedule
 
-__all__ = ["ProfilerAction", "mega_kernel_profile", "merge_chrome_traces", "schedule"]
+__all__ = [
+    "DiagnosticAction", "MegaKernelDiagnostics", "prepare_mega_kernel_diagnostics",
+    "validate_mega_kernel_diagnostic_contract", "schedule",
+]

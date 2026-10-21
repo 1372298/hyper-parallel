@@ -52,11 +52,11 @@ OP_TYPE_REGISTER(HyperMegaGateRoute);
 
 const std::array<const aclTensor *, 5> HyperMegaGateRoute(
   const aclTensor *logits, const aclTensor *text_bias, const aclTensor *vision_bias, const aclTensor *image_mask,
-  const aclTensor *runtime_config, const aclTensor *profile_buffer, const aclTensor *routing_weights,
+  const aclTensor *runtime_config, const aclTensor *diagnostic_buffer, const aclTensor *routing_weights,
   const aclTensor *expert_indices, const aclTensor *route_scores, const aclTensor *selected_scores,
   const aclTensor *normalization_denominator, int64_t top_k, float routed_scaling_factor, bool use_vision_bias,
   aclOpExecutor *executor) {
-  L0_DFX(HyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config, profile_buffer,
+  L0_DFX(HyperMegaGateRoute, logits, text_bias, vision_bias, image_mask, runtime_config, diagnostic_buffer,
          routing_weights, expert_indices, route_scores, selected_scores, normalization_denominator, top_k,
          routed_scaling_factor, use_vision_bias);
   auto *weights_out = const_cast<aclTensor *>(routing_weights);
@@ -71,7 +71,7 @@ const std::array<const aclTensor *, 5> HyperMegaGateRoute(
   }
   const auto status = ADD_TO_LAUNCHER_LIST_AICORE(
     HyperMegaGateRoute,
-    OP_INPUT(kernel_logits, text_bias, vision_bias, kernel_image_mask, runtime_config, profile_buffer),
+    OP_INPUT(kernel_logits, text_bias, vision_bias, kernel_image_mask, runtime_config, diagnostic_buffer),
     OP_OUTPUT(weights_out, indices_out, route_scores_out, selected_scores_out, denominator_out),
     OP_ATTR(top_k, routed_scaling_factor, use_vision_bias));
   if (status != ACLNN_SUCCESS) {

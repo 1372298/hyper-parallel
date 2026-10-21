@@ -406,7 +406,7 @@ class TestRuntimeCppReader(unittest.TestCase):
                 values = TaskSplitValue(tp=1, ep=ep_size, seq_size=128, all_expert_num=experts, top_k=2,
                                        dispatch_mode=mode)
                 configure_ready_handshake(cfg, values)
-                cfg.cycle_profiling_enabled = 1
+                cfg.diagnostic_mode = 1
                 cfg.aic_profile_record_capacity, cfg.aiv_profile_record_capacity = 101, 203
                 data = serialize_runtime_config(cfg)
                 buffer = ctypes.create_string_buffer(data)

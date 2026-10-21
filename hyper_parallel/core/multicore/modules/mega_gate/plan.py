@@ -17,16 +17,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.multicore.profiler.profiling import (
-    _PreparedMegaKernelRuntime,
-    _prepare_mega_kernel_runtime_config,
-)
-from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_config_tensor
+from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics, prepare_mega_kernel_diagnostics
 from hyper_parallel.core.multicore.scheduler.config import (
     EVENT_INVALID_ID,
     INVALID_PROFILE_OWNER_ID,
@@ -38,11 +34,11 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.runtime import allocate_runtime_config
 
-from .profiling import (
+from .diagnostics import (
     MEGA_GATE_ROUTE_GRAD_K1_STAGE_NAMES,
     MEGA_GATE_ROUTE_GRAD_STAGE_NAMES,
     MEGA_GATE_ROUTE_STAGE_NAMES,
-    _configure_mega_gate_profile_metadata,
+    bind_pipeline_graph,
 )
 
 
@@ -82,9 +78,9 @@ MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES = (
 class MegaGatePlan:
     """Capacity-bounded RuntimeConfig shared by all input shapes on one NPU."""
 
-    route_runtime: _PreparedMegaKernelRuntime
-    route_grad_runtime: _PreparedMegaKernelRuntime
-    route_grad_k1_runtime: _PreparedMegaKernelRuntime
+    route_runtime: MegaKernelDiagnostics
+    route_grad_runtime: MegaKernelDiagnostics
+    route_grad_k1_runtime: MegaKernelDiagnostics
     vision_mask_placeholder: torch.Tensor
 
 
@@ -97,6 +93,8 @@ def _build_pipeline_runtime_config(
     """Create descriptors broadcast to every active token-row worker."""
     if len(task_types) != len(stage_names):
         raise RuntimeError("MegaGate task types and profile stages must have equal length")
+    if not isinstance(kernel_name, str) or not kernel_name:
+        raise ValueError("MegaGate kernel_name must be a non-empty string")
     runtime_config = allocate_runtime_config(len(task_types))
     runtime_config.task_num = len(task_types)
     runtime_config.num_workers = MEGA_GATE_AIV_WORKER_CAPACITY
@@ -113,14 +111,7 @@ def _build_pipeline_runtime_config(
         task.profile_owner_id = INVALID_PROFILE_OWNER_ID
         runtime_config.all_tasks[task_id] = task
         runtime_config.vector_task_indices[task_id] = task_id
-    _configure_mega_gate_profile_metadata(runtime_config, stage_names, kernel_name)
     return runtime_config
-
-
-def _tensor_from_bytes(data: bytes, device: torch.device) -> torch.Tensor:
-    """Copy an immutable Host runtime image to one NPU device."""
-    array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
-    return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
 
 
 def build_mega_gate_plan(device: torch.device) -> MegaGatePlan:
@@ -134,20 +125,20 @@ def build_mega_gate_plan(device: torch.device) -> MegaGatePlan:
     """
     if device.type != "npu":
         raise ValueError(f"MegaGate plan requires an NPU device, got {device}")
-    device_id = device.index
-    if device_id is None:
-        device_id = torch.npu.current_device()
     rank = dist.get_rank() if dist.is_initialized() else 0
 
-    def prepare(runtime_config: RuntimeConfigC) -> _PreparedMegaKernelRuntime:
-        """Serialize one normal/profiled descriptor pair on the target NPU."""
-        return _prepare_mega_kernel_runtime_config(
-            runtime_config,
-            tensor_factory=lambda data: _tensor_from_bytes(data, device),
-            profile_tensor_factory=_enable_runtime_config_tensor,
-            rank=rank,
-            device=device,
-            device_id=device_id,
+    def prepare(runtime_config: RuntimeConfigC, *, backward: bool = False) -> MegaKernelDiagnostics:
+        """Prepare only ordinary storage; broadcast graph ports remain lazy.
+
+        Args:
+            runtime_config: Complete Host configuration describing native task queues.
+            backward: Whether to prepare the RouteGrad pipeline instead of Route.
+        """
+        return prepare_mega_kernel_diagnostics(
+            None, runtime_config, kernel_name="HyperMegaGateRouteGrad" if backward else "HyperMegaGateRoute",
+            parameter_count=11, device=device, rank=rank, owner_label="TokenRowShard",
+            execution_mode="aiv_pipeline", vector_worker_stride=1,
+            graph_adapter=partial(bind_pipeline_graph, backward=backward),
         )
 
     return MegaGatePlan(
@@ -160,11 +151,11 @@ def build_mega_gate_plan(device: torch.device) -> MegaGatePlan:
             MEGA_GATE_ROUTE_GRAD_TASK_TYPES,
             MEGA_GATE_ROUTE_GRAD_STAGE_NAMES,
             kernel_name="HyperMegaGateRouteGrad",
-        )),
+        ), backward=True),
         route_grad_k1_runtime=prepare(_build_pipeline_runtime_config(
             MEGA_GATE_ROUTE_GRAD_K1_TASK_TYPES,
             MEGA_GATE_ROUTE_GRAD_K1_STAGE_NAMES,
             kernel_name="HyperMegaGateRouteGrad",
-        )),
+        ), backward=True),
         vision_mask_placeholder=torch.zeros((1,), device=device, dtype=torch.bool),
     )

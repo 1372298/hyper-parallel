@@ -19,19 +19,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
-import torch
+import torch.distributed as dist
 
-from hyper_parallel.core.multicore.profiler.profiling import (
-    _PreparedMegaKernelRuntime,
-    _ProfileSpec,
-    _apply_mega_kernel_profile_graph,
-    _prepare_mega_kernel_runtime_config,
-)
-from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_config_tensor
+from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics, prepare_mega_kernel_diagnostics
 from hyper_parallel.core.multicore.scheduler.builder import build_runtime_config
 from hyper_parallel.core.multicore.scheduler.config import _validate_runtime_task_queues
 
+from .diagnostics import bind_backward_graph
 from .graph import (
     DEFAULT_GRAD_TOKEN_TILE,
     build_mega_mhc_grad_graph,
@@ -49,14 +43,8 @@ class MegaMhcGradPlan:
     num_cube_cores: int
     num_vector_cores: int
     token_tile: int
-    runtime: _PreparedMegaKernelRuntime
+    runtime: MegaKernelDiagnostics
     event_capacity: int
-
-
-def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
-    """Copy serialized scheduling data into one NPU byte tensor."""
-    array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
-    return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
 
 
 def build_mega_mhc_grad_plan(
@@ -92,34 +80,11 @@ def build_mega_mhc_grad_plan(
     )
     order_vector_tasks_by_stage(runtime_config)
     _validate_runtime_task_queues(runtime_config, runtime_config.event_capacity)
-    _apply_mega_kernel_profile_graph(
-        runtime_config,
-        graph,
-        _ProfileSpec(kernel_name="HyperMegaMhcGrad", owner_label="NativeKernel"),
-    )
-    npu_device = torch.device(device)
-    device_id = npu_device.index
-    if device_id is None:
-        device_id = torch.npu.current_device()
-
-    def tensor_factory(data: bytes) -> torch.Tensor:
-        """Materialize one serialized runtime buffer on the target NPU.
-
-        Args:
-            data: Serialized runtime bytes.
-
-        Returns:
-            Byte tensor resident on the target NPU.
-        """
-        return _tensor_from_bytes(data, npu_device)
-
-    runtime = _prepare_mega_kernel_runtime_config(
-        runtime_config,
-        tensor_factory=tensor_factory,
-        profile_tensor_factory=_enable_runtime_config_tensor,
-        rank=0,
-        device=npu_device,
-        device_id=device_id,
+    runtime = prepare_mega_kernel_diagnostics(
+        graph, runtime_config, kernel_name="HyperMegaMhcGrad",
+        parameter_count=33, device=device, owner_label="NativeKernel",
+        rank=dist.get_rank() if dist.is_initialized() else 0,
+        vector_worker_stride=1, graph_adapter=bind_backward_graph,
     )
     return MegaMhcGradPlan(
         token_count,

@@ -21,7 +21,7 @@ namespace l0op {
  * @param vision_bias Borrowed contiguous [experts] FP32 vision selection bias.
  * @param image_mask Borrowed contiguous BOOL token mask: [tokens] in vision mode, otherwise [1].
  * @param runtime_config Borrowed UINT8 ten-stage broadcast schedule.
- * @param profile_buffer Borrowed UINT8 cycle buffer, unread on the fast path.
+ * @param diagnostic_buffer Borrowed UINT8 cycle buffer, unread on the fast path.
  * @param routing_weights Caller-owned [tokens, top_k] FP32 output.
  * @param expert_indices Caller-owned [tokens, top_k] INT64 output.
  * @param route_scores Caller-owned [tokens, experts] FP32 backward state.
@@ -35,7 +35,7 @@ namespace l0op {
  */
 const std::array<const aclTensor *, 5> HyperMegaGateRoute(
   const aclTensor *logits, const aclTensor *text_bias, const aclTensor *vision_bias, const aclTensor *image_mask,
-  const aclTensor *runtime_config, const aclTensor *profile_buffer, const aclTensor *routing_weights,
+  const aclTensor *runtime_config, const aclTensor *diagnostic_buffer, const aclTensor *routing_weights,
   const aclTensor *expert_indices, const aclTensor *route_scores, const aclTensor *selected_scores,
   const aclTensor *normalization_denominator, int64_t top_k, float routed_scaling_factor, bool use_vision_bias,
   aclOpExecutor *executor);

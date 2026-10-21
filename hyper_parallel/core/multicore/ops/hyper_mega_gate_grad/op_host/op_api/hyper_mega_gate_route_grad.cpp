@@ -46,14 +46,14 @@ RouteGradOutputs HyperMegaGateRouteGradKernel(const aclTensor *selected_scores,
                                               const aclTensor *normalization_denominator,
                                               const aclTensor *grad_routing_weights, const aclTensor *route_scores,
                                               const aclTensor *expert_indices, const aclTensor *runtime_config,
-                                              const aclTensor *profile_buffer, int64_t top_k,
+                                              const aclTensor *diagnostic_buffer, int64_t top_k,
                                               float routed_scaling_factor, aclOpExecutor *executor) {
   L0_DFX(HyperMegaGateRouteGradKernel, selected_scores, normalization_denominator, grad_routing_weights, route_scores,
-         expert_indices, runtime_config, profile_buffer, top_k, routed_scaling_factor);
+         expert_indices, runtime_config, diagnostic_buffer, top_k, routed_scaling_factor);
   RouteGradOutputs outputs{nullptr, nullptr};
   CHECK_RET(selected_scores != nullptr && normalization_denominator != nullptr && grad_routing_weights != nullptr &&
               route_scores != nullptr && expert_indices != nullptr && runtime_config != nullptr &&
-              profile_buffer != nullptr && executor != nullptr && top_k > 0,
+              diagnostic_buffer != nullptr && executor != nullptr && top_k > 0,
             outputs);
   const auto &selected_shape = selected_scores->GetViewShape();
   const auto &score_shape = route_scores->GetViewShape();
@@ -83,7 +83,7 @@ RouteGradOutputs HyperMegaGateRouteGradKernel(const aclTensor *selected_scores,
   const auto status =
     ADD_TO_LAUNCHER_LIST_AICORE(HyperMegaGateRouteGrad,
                                 OP_INPUT(selected_scores_matrix, denominator_matrix, grad_weights_matrix,
-                                         route_scores_matrix, expert_indices_matrix, runtime_config, profile_buffer),
+                                         route_scores_matrix, expert_indices_matrix, runtime_config, diagnostic_buffer),
                                 OP_OUTPUT(selected_score_grad, zero_score_grad), OP_ATTR(top_k, routed_scaling_factor));
   CHECK_RET(status == ACLNN_SUCCESS, outputs);
   outputs.selected_score_grad = selected_score_grad;
@@ -94,8 +94,9 @@ RouteGradOutputs HyperMegaGateRouteGradKernel(const aclTensor *selected_scores,
 const aclTensor *HyperMegaGateRouteGrad(const aclTensor *logits, const aclTensor *route_scores,
                                         const aclTensor *selected_scores, const aclTensor *normalization_denominator,
                                         const aclTensor *expert_indices, const aclTensor *grad_routing_weights,
-                                        const aclTensor *runtime_config, const aclTensor *profile_buffer, int64_t top_k,
-                                        float routed_scaling_factor, const aclTensor *output, aclOpExecutor *executor) {
+                                        const aclTensor *runtime_config, const aclTensor *diagnostic_buffer,
+                                        int64_t top_k, float routed_scaling_factor, const aclTensor *output,
+                                        aclOpExecutor *executor) {
   L0_DFX(HyperMegaGateRouteGrad, logits, route_scores, selected_scores, normalization_denominator, expert_indices,
          grad_routing_weights, top_k, routed_scaling_factor);
   CHECK_RET(logits != nullptr && route_scores != nullptr && selected_scores != nullptr &&
@@ -104,7 +105,7 @@ const aclTensor *HyperMegaGateRouteGrad(const aclTensor *logits, const aclTensor
             nullptr);
 
   const auto route_grad = HyperMegaGateRouteGradKernel(selected_scores, normalization_denominator, grad_routing_weights,
-                                                       route_scores, expert_indices, runtime_config, profile_buffer,
+                                                       route_scores, expert_indices, runtime_config, diagnostic_buffer,
                                                        top_k, routed_scaling_factor, executor);
   CHECK_RET(route_grad.selected_score_grad != nullptr && route_grad.zero_score_grad != nullptr, nullptr);
   const auto *linear_indices = HyperMegaGateLinearIndex(expert_indices, route_grad.zero_score_grad, executor);

@@ -37,8 +37,11 @@ class TestMulticoreBoundary(unittest.TestCase):
         Description: Inspect the component and HyperParallel root package symbols.
         Expectation: Business modules and profiler are exported only by Multicore.
         """
-        self.assertEqual(multicore.__all__, ["HyperMegaMhc", "MegaGate", "MegaMoeExperts", "profiler"])
-        self.assertTrue(callable(multicore.profiler.mega_kernel_profile))
+        self.assertEqual(multicore.__all__, [
+            "HyperMegaMhc", "MegaGate", "MegaMoeExperts", "MegaKernelDiagnostics",
+            "prepare_mega_kernel_diagnostics", "validate_mega_kernel_diagnostic_contract",
+        ])
+        self.assertTrue(callable(multicore.prepare_mega_kernel_diagnostics))
         for name in (
             "HyperMegaMhc",
             "MegaGate",
@@ -76,3 +79,27 @@ class TestMulticoreBoundary(unittest.TestCase):
                 for module in modules:
                     with self.subTest(path=path, module=module):
                         self.assertFalse(module.startswith("hyper_parallel.platform"))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_diagnostics_dependency_boundaries(self):
+        """Feature: MegaKernel diagnostics.
+        Description: Keep common code tool-neutral and both tools independent of business adapters.
+        Expectation: Diagnostics dependency boundaries.
+        """
+        root = Path(multicore.__file__).parent / "diagnostics"
+        for path in root.rglob("*.py"):
+            relative = path.relative_to(root)
+            forbidden = ["hyper_parallel.core.multicore.modules"]
+            if relative.parts[0] in ("common", "api.py", "__init__.py"):
+                forbidden.extend(("diagnostics.profiler", "diagnostics.dump"))
+            elif relative.parts[0] == "dump":
+                forbidden.append("diagnostics.profiler")
+            elif relative.parts[0] == "profiler":
+                forbidden.append("diagnostics.dump")
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                modules = ([node.module or ""] if isinstance(node, ast.ImportFrom)
+                           else [alias.name for alias in node.names] if isinstance(node, ast.Import) else [])
+                for module in modules:
+                    with self.subTest(path=path, module=module):
+                        self.assertFalse(any(item in module for item in forbidden))

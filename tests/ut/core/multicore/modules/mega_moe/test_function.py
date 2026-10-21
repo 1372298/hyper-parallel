@@ -23,6 +23,7 @@ from unittest.mock import Mock, PropertyMock, patch
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
 
+from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics
 from hyper_parallel.core.multicore.modules.mega_moe import function as function_module
 from hyper_parallel.core.multicore.modules.mega_moe.function import _MegaMoeFunction
 from tests.common.mark_utils import arg_mark
@@ -75,14 +76,19 @@ class TestMegaMoeFunction(unittest.TestCase):
         self.assertEqual(tuple(placeholder.shape), (1, 4))
         self.assertNotEqual(placeholder.data_ptr(), 0)
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_backward_unpacks_saved_tensors_once(self) -> None:
-        """Checkpoint unpack hooks must only be consumed once per backward call."""
+        """Feature: MegaKernel diagnostics.
+        Description: Checkpoint unpack hooks must only be consumed once per backward call.
+        Expectation: Backward unpacks saved tensors once.
+        """
         tensors = tuple(torch.ones(1) for _ in range(13))
         context = Mock()
         gradient = torch.ones(1)
         context.plan.spec.dispatch_mode = "push"
         execution = function_module._BackwardExecution(
-            dispatch=torch.ones(1), grad_x=torch.ones(1), profile_call=Mock(),
+            dispatch=torch.ones(1), grad_x=torch.ones(1), event_counters=Mock(),
             gmm_workspace=None, swiglu_workspace=None,
             intermediates=function_module._BackwardIntermediates(*(torch.ones(1) for _ in range(5))),
         )
@@ -149,9 +155,10 @@ class TestMegaMoeFunction(unittest.TestCase):
         for name in ("up_proj", "swiglu", "down_proj", "act_grad", "gate_grad",
                      "w1_grad", "w2_grad", "swiglu_grad"):
             setattr(plan, f"{name}_tiling", None)
-        runtime = SimpleNamespace(normal_tensor=None)
-        plan.fwd_runtime = runtime
-        plan.bwd_runtime = runtime
+        runtime = SimpleNamespace(normal_tensor=None, kernel_name="mega_moe", rank=0)
+        plan.fwd_diagnostics = MegaKernelDiagnostics(runtime)
+        plan.bwd_diagnostics = MegaKernelDiagnostics(runtime)
+        plan.fwd_runtime_config = plan.bwd_runtime_config = None
         workspace = Mock(
             expert_capacity=128,
             expert_buffer=torch.empty(128, 4),
@@ -221,14 +228,16 @@ class TestMegaMoeFunction(unittest.TestCase):
         outputs = []
         sources = []
         with (
+            patch.object(MegaKernelDiagnostics, "launch",
+                         side_effect=AssertionError("ordinary path must bypass launch")),
             patch.object(
                 function_module.multicore_ops,
-                "mega_moe_with_profile_buffer",
+                "mega_moe",
                 side_effect=forward_kernel,
             ),
             patch.object(
                 function_module.multicore_ops,
-                "mega_moe_grad_with_profile_buffer",
+                "mega_moe_grad",
                 side_effect=backward_kernel,
             ),
             patch.object(function_module.multicore_ops, "moe_token_permute_grad",

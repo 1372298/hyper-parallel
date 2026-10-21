@@ -30,6 +30,7 @@ class OpType(Enum):
     """Operator kinds supported by the multicore compute graph."""
 
     ALLTOALL    = "alltoall"
+    AIV_PIPELINE = "aiv_pipeline"
     GMM         = "gmm"
     SWIGLU      = "swiglu"
     SWIGLU_GRAD = "swiglu_grad"
@@ -92,7 +93,9 @@ class OperatorNode:
     tiling_position: int
     fill_config:     Any                       # FillConfig subclass instance
     kernel_spec:     Any = None                # reserved for @MultiCore decorator path
-    diagnostic_name: Optional[str] = None      # optional Host-side profiling display name
+    diagnostic_name: Optional[str] = None      # optional Host-side diagnostic display name
+    diagnostic_view_resolver: Optional[Callable[..., Any]] = None
+    diagnostic_host_ports: bool = False  # Native hard-coded ABI operands, not TaskDesc TensorDesc arrays.
 
     predecessors:    List['OperatorNode'] = field(default_factory=list)
     successors:      List['OperatorNode'] = field(default_factory=list)

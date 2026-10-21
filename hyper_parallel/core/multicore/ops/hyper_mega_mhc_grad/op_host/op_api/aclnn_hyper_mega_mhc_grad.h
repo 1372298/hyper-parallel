@@ -19,7 +19,7 @@ ACLNN_API aclnnStatus aclnnHyperMegaMhcGradGetWorkspaceSize(
     const aclTensor *mixedInput, const aclTensor *rmsRstd, const aclTensor *normWeight,
     const aclTensor *directGradX, const aclTensor *previousResidual, const aclTensor *previousOutput,
     const aclTensor *previousPost, const aclTensor *previousResidualMix, const aclTensor *runtimeConfig,
-    const aclTensor *allEventCounters, const aclTensor *profileBuffer, aclTensor *gradResidual,
+    const aclTensor *allEventCounters, const aclTensor *diagnosticBuffer, aclTensor *gradResidual,
     aclTensor *gradPhi, aclTensor *gradAlpha, aclTensor *gradBias, aclTensor *gradPreviousOutput,
     aclTensor *gradPreviousPre, aclTensor *gradPreviousPost, aclTensor *gradPreviousResidual,
     aclTensor *gradNormWeight, double hcEps, uint64_t *workspaceSize, aclOpExecutor **executor);

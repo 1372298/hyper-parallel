@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 import torch_npu  # pylint: disable=unused-import
 
-from hyper_parallel.core.multicore import profiler as multicore_profiler
+from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler, schedule as diagnostic_schedule
 from hyper_parallel.core.multicore import MegaMoeExperts
 from tests.torch.multicore import _test_mega_moe as common
 
@@ -70,7 +70,7 @@ def _assert_complete_forward_trace(trace: dict) -> None:
         core_record_counts == _EXPECTED_CORE_RECORD_COUNTS
     ), f"rank={common.RANK}: unexpected AIC/AIV records: {core_record_counts}."
     assert all(
-        event["args"]["start_cycle"] > 0 and event["args"]["end_cycle"] >= event["args"]["start_cycle"]
+        0 < event["args"]["start_cycle"] <= event["args"]["end_cycle"]
         for event in internal_events
     ), f"rank={common.RANK}: profiling exported an invalid cycle record."
     assert {event["args"]["direction"] for event in internal_events} == {"forward"}
@@ -82,11 +82,14 @@ def _assert_complete_forward_trace(trace: dict) -> None:
 
 
 def test_mega_moe_forward_profiling() -> None:
-    """Warm up, synchronize ranks, and export one representative forward trace."""
+    """Feature: MegaKernel diagnostics.
+    Description: Warm up, synchronize ranks, and export one representative forward trace.
+    Expectation: Mega moe forward profiling.
+    """
     topk_ids, topk_weights, tokens_per_expert = common.make_balanced_route(_PROFILE_SHAPE)
     hidden_states, _ = common.make_data(_PROFILE_SHAPE)
     layer = _build_profile_layer()
-    schedule = multicore_profiler.schedule(wait=0, warmup=0, active=1, repeat=1)
+    schedule = diagnostic_schedule(wait=0, warmup=0, active=1, repeat=1)
     try:
         with torch.no_grad():
             layer(

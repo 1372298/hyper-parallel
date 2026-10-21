@@ -16,6 +16,7 @@
 
 import ctypes
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -25,6 +26,7 @@ from unittest.mock import patch
 
 from hyper_parallel.core.multicore import _loader
 from hyper_parallel.core.multicore._loader import NativeComponentUnavailableError
+from tests.common.mark_utils import arg_mark
 
 class TestMulticoreNative(unittest.TestCase):
     """Verify component-owned OPP environment and payload lookup."""
@@ -93,26 +95,36 @@ class TestMulticoreNative(unittest.TestCase):
         self.assertEqual(opp_value, environment["ASCEND_CUSTOM_OPP_PATH"])
         self.assertEqual(library_value, environment["LD_LIBRARY_PATH"])
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_missing_opp_environment_requires_set_env(self):
-        """The loader requires explicit environment activation before a framework is loaded."""
+        """Feature: MegaKernel diagnostics.
+        Description: The loader requires explicit environment activation before a framework is loaded.
+        Expectation: Missing opp environment requires set env.
+        """
         with patch.dict(os.environ, {}, clear=True), patch.object(
             _loader, "sys", SimpleNamespace(modules={})
         ), patch.object(
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {self.native_root / 'set_env.bash'}",
+            f"HP-NATIVE-OPP-NOT-ACTIVATED.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()
 
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_missing_opp_environment_after_framework_import_is_too_late(self):
-        """The loader rejects activation after framework initialization."""
+        """Feature: MegaKernel diagnostics.
+        Description: The loader rejects activation after framework initialization.
+        Expectation: Missing opp environment after framework import is too late.
+        """
         with patch.dict(os.environ, {}, clear=True), patch.object(
             _loader, "sys", SimpleNamespace(modules={"torch": object()})
         ), patch.object(
             _loader, "_component_root", return_value=self.native_root
         ), self.assertRaisesRegex(
             NativeComponentUnavailableError,
-            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {self.native_root / 'set_env.bash'}",
+            f"HP-NATIVE-OPP-ACTIVATION-TOO-LATE.*source {re.escape(str(self.native_root / 'set_env.bash'))}",
         ):
             _loader.require_multicore_environment()

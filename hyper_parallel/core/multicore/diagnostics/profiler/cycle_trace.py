@@ -18,11 +18,10 @@ from __future__ import annotations
 
 __all__ = []
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 import struct
-from threading import Lock
 from typing import Any
 
 from hyper_parallel.core.multicore.scheduler.config import (
@@ -35,8 +34,8 @@ from hyper_parallel.core.multicore.scheduler.config import (
     TaskDescC,
     TaskType,
 )
-from hyper_parallel.core.multicore.scheduler.graph import ComputeGraph, OperatorNode
-from hyper_parallel.core.multicore.scheduler.runtime import serialize_runtime_config
+from hyper_parallel.core.multicore.diagnostics.common.graph import _scheduled_task_ids
+from hyper_parallel.core.multicore.diagnostics.common.runtime import DiagnosticMode, PreparedDiagnosticRuntime
 
 
 CUBE_SLOT_COUNT = NUM_WORKERS_CUBE
@@ -53,7 +52,6 @@ MAX_PROFILE_BUFFER_BYTES = CORE_SLOT_COUNT * MAX_CORE_STRIDE_BYTES
 INVALID_OWNER_ID = 0xFFFFFFFF
 TASK_TYPE_DESC_BASE = 0x20000
 GRAPH_STAGE_DESC_BASE = 0x30000
-_PROFILE_METADATA_ATTRIBUTE = "_mega_kernel_profile_metadata"
 _SYSTEM_COUNTER_FREQUENCY_MHZ = {
     "ascend910b": 50.0,
     "ascend910c": 50.0,
@@ -119,15 +117,7 @@ class _ProfileMetadata:
     stage_names: Mapping[int, str]
     task_stage_names: Mapping[int, str]
     execution_mode: _TaskExecutionMode
-
-
-@dataclass(frozen=True)
-class _ProfileSpec:
-    """Kernel-level profiling semantics applied to a completed compute graph."""
-
-    kernel_name: str
-    owner_label: str
-    owner_resolver: Callable[[OperatorNode, TaskDescC, Any], int | None] | None = None
+    vector_worker_stride: int = 2
 
 
 @dataclass(frozen=True)
@@ -278,7 +268,9 @@ def _calculate_aiv_pipeline_profile_layout(
     )
 
 
-def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _calculate_event_driven_profile_layout(
+    runtime_config: RuntimeConfigC, vector_worker_stride: int = 2,
+) -> _ProfileLayout:
     """Size AIC/AIV slots for event-driven task queues using the busiest worker."""
     num_workers = int(runtime_config.num_workers)
     if num_workers < 0 or num_workers % 2 != 0 or num_workers > VECTOR_SLOT_COUNT:
@@ -296,7 +288,7 @@ def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _P
         runtime_config,
         runtime_config.vector_task_indices,
         int(runtime_config.task_index_num[1]),
-        active_worker_count,
+        num_workers // vector_worker_stride,
     )
     return _ProfileLayout(
         aic_required_records=aic_required_records,
@@ -306,20 +298,23 @@ def _calculate_event_driven_profile_layout(runtime_config: RuntimeConfigC) -> _P
     )
 
 
-def _calculate_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _calculate_profile_layout(
+    runtime_config: RuntimeConfigC, metadata: _ProfileMetadata | None = None,
+) -> _ProfileLayout:
     """Select the profile layout algorithm for the configured task execution mode."""
     _validate_runtime_config(runtime_config)
-    metadata = _get_mega_kernel_profile_metadata(runtime_config)
+    if metadata is None:
+        metadata = _ProfileMetadata("MegaKernel", "Owner", {}, {}, _TaskExecutionMode.EVENT_DRIVEN)
     if metadata.execution_mode is _TaskExecutionMode.AIV_PIPELINE:
         return _calculate_aiv_pipeline_profile_layout(runtime_config)
     if metadata.execution_mode is _TaskExecutionMode.EVENT_DRIVEN:
-        return _calculate_event_driven_profile_layout(runtime_config)
+        return _calculate_event_driven_profile_layout(runtime_config, metadata.vector_worker_stride)
     raise ValueError(f"unsupported task execution mode: {metadata.execution_mode!r}")
 
 
-def _configure_profile_layout(runtime_config: RuntimeConfigC) -> _ProfileLayout:
+def _configure_profile_layout(runtime_config: RuntimeConfigC, metadata: _ProfileMetadata) -> _ProfileLayout:
     """Calculate and serialize the bounded AIC/AIV record capacities."""
-    layout = _calculate_profile_layout(runtime_config)
+    layout = _calculate_profile_layout(runtime_config, metadata)
     runtime_config.aic_profile_record_capacity = layout.aic_record_capacity
     runtime_config.aiv_profile_record_capacity = layout.aiv_record_capacity
     return layout
@@ -339,231 +334,58 @@ def _resolve_stage_names(stage_names: Mapping[int, str] | None) -> dict[int, str
     return resolved_stage_names
 
 
-def _set_mega_kernel_profile_metadata(
-    runtime_config: RuntimeConfigC,
-    *,
-    kernel_name: str,
-    owner_label: str,
-    stage_names: Mapping[int, str],
-    task_stage_names: Mapping[int, str] | None = None,
-    execution_mode: _TaskExecutionMode = _TaskExecutionMode.EVENT_DRIVEN,
-) -> None:
-    """Attach concrete-kernel display metadata without changing serialized RuntimeConfig."""
-    _validate_runtime_config(runtime_config)
-    if not isinstance(kernel_name, str) or not kernel_name.strip():
-        raise ValueError(f"kernel_name must be a non-empty string, got {kernel_name!r}")
-    if not isinstance(owner_label, str) or not owner_label.strip():
-        raise ValueError(f"owner_label must be a non-empty string, got {owner_label!r}")
-    if not isinstance(execution_mode, _TaskExecutionMode):
-        raise TypeError(f"execution_mode must be _TaskExecutionMode, got {type(execution_mode).__name__}")
-    metadata = _ProfileMetadata(
-        kernel_name=kernel_name.strip(),
-        owner_label=owner_label.strip(),
-        stage_names=_resolve_stage_names(stage_names),
-        task_stage_names=dict(task_stage_names or {}),
-        execution_mode=execution_mode,
-    )
-    setattr(runtime_config, _PROFILE_METADATA_ATTRIBUTE, metadata)
+def _configure_trace_metadata(runtime_config: RuntimeConfigC, metadata: Any) -> _ProfileMetadata:
+    """Encode trace-specific descriptor IDs in an independent profiling configuration."""
+    stages = dict(DEFAULT_STAGE_NAMES)
+    stages.update({GRAPH_STAGE_DESC_BASE + key: name for key, name in metadata.stage_names.items()})
+    task_names = dict(metadata.task_stage_names)
+    for task_id in set(range(int(runtime_config.task_num))) | _scheduled_task_ids(runtime_config):
+        task = runtime_config.all_tasks[task_id]
+        stage_id = metadata.task_stage_ids.get(task_id)
+        if stage_id is not None:
+            task.profile_desc_id = GRAPH_STAGE_DESC_BASE + stage_id
+            owner = metadata.task_owner_ids.get(task_id)
+            task.profile_owner_id = INVALID_PROFILE_OWNER_ID if owner is None else owner
+        elif task.task_type == TaskType.TASK_TERMINATE:
+            task.profile_desc_id = 0x10006
+            task.profile_owner_id = INVALID_PROFILE_OWNER_ID
+            task_names[task_id] = "TerminateTask"
+        else:
+            task.profile_desc_id = INVALID_PROFILE_DESC_ID
+            task.profile_owner_id = INVALID_PROFILE_OWNER_ID
+    return _ProfileMetadata(metadata.kernel_name, metadata.owner_label, stages, task_names,
+                            _TaskExecutionMode.EVENT_DRIVEN)
 
 
-def _operator_profile_name(operator: OperatorNode) -> str:
-    """Return an explicit diagnostic name or derive one from the graph node name."""
-    diagnostic_name = operator.diagnostic_name
-    if diagnostic_name is not None:
-        if not isinstance(diagnostic_name, str) or not diagnostic_name.strip():
-            raise ValueError(
-                f"OperatorNode.diagnostic_name must be a non-empty string when set: {diagnostic_name!r}"
-            )
-        return diagnostic_name.strip()
-    if not isinstance(operator.name, str) or not operator.name.strip():
-        raise ValueError(f"OperatorNode.name must be a non-empty string, got {operator.name!r}")
-    stage_name = "".join(part[:1].upper() + part[1:] for part in operator.name.strip().split("_") if part)
-    if not stage_name:
-        raise ValueError(f"OperatorNode.name must contain a profiling display character: {operator.name!r}")
-    return stage_name
+class _PreparedProfileRuntime:
+    """Own profiling-specific preparation and trace decoding for one runtime."""
 
-
-def _scheduled_task_ids(runtime_config: RuntimeConfigC) -> set[int]:
-    """Collect queue task IDs, including tasks outside RuntimeConfig.task_num."""
-    task_ids = set()
-    task_schedules = (
-        (runtime_config.cube_task_indices, int(runtime_config.task_index_num[0])),
-        (runtime_config.vector_task_indices, int(runtime_config.task_index_num[1])),
-        (runtime_config.mix_task_indices, int(runtime_config.task_index_num[2])),
-    )
-    for task_indices, scheduled_task_count in task_schedules:
-        if not 0 <= scheduled_task_count <= len(task_indices):
-            raise ValueError(f"scheduled task count is outside RuntimeConfig capacity: {scheduled_task_count}")
-        for schedule_index in range(scheduled_task_count):
-            task_id = int(task_indices[schedule_index])
-            if not 0 <= task_id < len(runtime_config.all_tasks):
-                raise ValueError(f"scheduled task ID is outside RuntimeConfig capacity: {task_id}")
-            task_ids.add(task_id)
-    return task_ids
-
-
-def _graph_profile_stages(
-    graph: ComputeGraph,
-) -> tuple[dict[int, str], dict[int, tuple[OperatorNode, int, str]], int]:
-    """Map graph task ranges to generated stage IDs and display names."""
-    stage_names = {}
-    task_operators = {}
-    first_task_id = 0
-    for stage_index, operator in enumerate(graph.topological_sort()):
-        task_num = operator.task_num
-        if isinstance(task_num, bool) or not isinstance(task_num, int) or task_num < 0:
-            raise ValueError(f"operator {operator.name!r} has an invalid task_num: {task_num!r}")
-        last_task_id = first_task_id + task_num
-        stage_name = _operator_profile_name(operator)
-        desc_id = GRAPH_STAGE_DESC_BASE + stage_index
-        stage_names[desc_id] = stage_name
-        for task_id in range(first_task_id, last_task_id):
-            task_operators[task_id] = (operator, desc_id, stage_name)
-        first_task_id = last_task_id
-    return stage_names, task_operators, first_task_id
-
-
-def _resolve_profile_owner_id(
-    spec: _ProfileSpec,
-    operator: OperatorNode,
-    task_desc: TaskDescC,
-    context: Any,
-) -> int:
-    """Resolve and validate an optional business owner for one task."""
-    if spec.owner_resolver is None:
-        return INVALID_PROFILE_OWNER_ID
-    owner_id = spec.owner_resolver(operator, task_desc, context)
-    if owner_id is None:
-        return INVALID_PROFILE_OWNER_ID
-    if isinstance(owner_id, bool) or not isinstance(owner_id, int):
-        raise TypeError(f"profile owner_id must be an integer or None, got {owner_id!r}")
-    if not 0 <= owner_id < INVALID_PROFILE_OWNER_ID:
-        raise ValueError(f"profile owner_id is outside uint32 range: {owner_id}")
-    return owner_id
-
-
-def _resolve_profile_task(
-    task_id: int,
-    task_desc: TaskDescC,
-    task_operators: Mapping[int, tuple[OperatorNode, int, str]],
-    spec: _ProfileSpec,
-    context: Any,
-) -> tuple[int, int, int, str | None]:
-    """Resolve serialized profile IDs and the Host display name for one task."""
-    operator_entry = task_operators.get(task_id)
-    if operator_entry is not None:
-        operator, profile_desc_id, stage_name = operator_entry
-        profile_owner_id = _resolve_profile_owner_id(spec, operator, task_desc, context)
-        return task_id, profile_desc_id, profile_owner_id, stage_name
-    if task_desc.task_type == TaskType.TASK_TERMINATE:
-        profile_desc_id = 0x10006
-        return task_id, profile_desc_id, INVALID_PROFILE_OWNER_ID, DEFAULT_STAGE_NAMES[profile_desc_id]
-    return task_id, INVALID_PROFILE_DESC_ID, INVALID_PROFILE_OWNER_ID, None
-
-
-def _apply_mega_kernel_profile_graph(
-    runtime_config: RuntimeConfigC,
-    graph: ComputeGraph,
-    spec: _ProfileSpec,
-    *,
-    context: Any = None,
-) -> None:
-    """Derive per-task profiling metadata from the graph that created RuntimeConfig."""
-    _validate_runtime_config(runtime_config)
-    if not isinstance(graph, ComputeGraph):
-        raise TypeError(f"graph must be ComputeGraph, got {type(graph).__name__}")
-    if not isinstance(spec, _ProfileSpec):
-        raise TypeError(f"spec must be _ProfileSpec, got {type(spec).__name__}")
-
-    task_count = int(runtime_config.task_num)
-    if not 0 <= task_count <= len(runtime_config.all_tasks):
-        raise ValueError(f"profile task count is outside RuntimeConfig capacity: {task_count}")
-    task_ids = set(range(task_count))
-    task_ids.update(_scheduled_task_ids(runtime_config))
-    stage_names, task_operators, graph_task_count = _graph_profile_stages(graph)
-    if graph_task_count > task_count:
-        raise ValueError(
-            f"graph describes {graph_task_count} tasks but RuntimeConfig.task_num is only {task_count}"
+    def __init__(self, runtime: PreparedDiagnosticRuntime) -> None:
+        """Build only profiling-owned metadata, layout and Device configuration."""
+        runtime_config = runtime.copy_host_config()
+        self._metadata = _configure_trace_metadata(runtime_config, runtime.metadata)
+        self._metadata = _ProfileMetadata(
+            self._metadata.kernel_name, self._metadata.owner_label, self._metadata.stage_names,
+            self._metadata.task_stage_names, _TaskExecutionMode(runtime.spec.execution_mode),
+            runtime.spec.vector_worker_stride,
         )
-
-    resolved_tasks = [
-        _resolve_profile_task(task_id, runtime_config.all_tasks[task_id], task_operators, spec, context)
-        for task_id in sorted(task_ids)
-    ]
-
-    _set_mega_kernel_profile_metadata(
-        runtime_config,
-        kernel_name=spec.kernel_name,
-        owner_label=spec.owner_label,
-        stage_names=stage_names,
-        task_stage_names={
-            task_id: stage_name for task_id, _, _, stage_name in resolved_tasks if stage_name is not None
-        },
-    )
-    for task_id, profile_desc_id, profile_owner_id, _ in resolved_tasks:
-        task_desc = runtime_config.all_tasks[task_id]
-        task_desc.profile_desc_id = profile_desc_id
-        task_desc.profile_owner_id = profile_owner_id
-
-
-def _get_mega_kernel_profile_metadata(
-    runtime_config: RuntimeConfigC,
-) -> _ProfileMetadata:
-    metadata = getattr(runtime_config, _PROFILE_METADATA_ATTRIBUTE, None)
-    if metadata is not None:
-        return metadata
-    return _ProfileMetadata(
-        kernel_name="MegaKernel",
-        owner_label="Owner",
-        stage_names=_resolve_stage_names(None),
-        task_stage_names={},
-        execution_mode=_TaskExecutionMode.EVENT_DRIVEN,
-    )
-
-
-class _PreparedMegaKernelRuntime:
-    """Own disabled/profiled RuntimeConfig variants for one MegaKernel direction."""
-
-    def __init__(
-        self,
-        runtime_config: RuntimeConfigC,
-        *,
-        tensor_factory: Callable[[bytes], Any],
-        profile_tensor_factory: Callable[[Any], Any],
-        rank: int,
-        device: Any,
-        device_id: int,
-    ) -> None:
-        """Prepare immutable metadata and the default disabled Device tensor."""
-        _validate_runtime_config(runtime_config)
-        if not callable(tensor_factory):
-            raise TypeError("tensor_factory must be callable")
-        if not callable(profile_tensor_factory):
-            raise TypeError("profile_tensor_factory must be callable")
-        self._profile_tensor_factory = profile_tensor_factory
-        self._rank = rank
-        self._device = device
-        self._device_id = device_id
-        self._metadata = _get_mega_kernel_profile_metadata(runtime_config)
-        self._layout = _configure_profile_layout(runtime_config)
-        runtime_config.cycle_profiling_enabled = 0
-        self._normal_tensor = tensor_factory(serialize_runtime_config(runtime_config))
-        self._profile_tensor = None
-        self._profile_tensor_lock = Lock()
+        self._layout = _configure_profile_layout(runtime_config, self._metadata)
+        self._rank = runtime.rank
+        self._device_id = runtime.device_id
+        self._host_config = runtime_config
+        self._normal_tensor = runtime.normal_tensor
+        self._device = getattr(runtime.normal_tensor, "device", None)
+        runtime_config.diagnostic_mode = DiagnosticMode.PROFILE
+        self._profile_tensor = runtime.tensor_from_config(runtime_config)
 
     @property
     def normal_tensor(self) -> Any:
-        """Return the disabled RuntimeConfig tensor used by the fast path."""
+        """Return the original normal image without modifying it."""
         return self._normal_tensor
 
     @property
     def profile_tensor(self) -> Any:
-        """Lazily materialize the enabled RuntimeConfig tensor."""
-        if self._profile_tensor is not None:
-            return self._profile_tensor
-        with self._profile_tensor_lock:
-            if self._profile_tensor is None:
-                self._profile_tensor = self._profile_tensor_factory(self._normal_tensor)
+        """Return the independent profiling configuration."""
         return self._profile_tensor
 
     @property
@@ -591,6 +413,21 @@ class _PreparedMegaKernelRuntime:
         """Return the concrete kernel display name."""
         return self._metadata.kernel_name
 
+    @property
+    def host_config(self) -> RuntimeConfigC:
+        """Return an immutable Host copy retaining the graph-sized runtime arrays."""
+        return self._host_config
+
+    @property
+    def task_stage_names(self) -> Mapping[int, str]:
+        """Return task ID to human-facing stage-name metadata."""
+        return self._metadata.task_stage_names
+
+    @property
+    def owner_label(self) -> str:
+        """Return the concrete kernel's task-owner label."""
+        return self._metadata.owner_label
+
     def parse(self, buffer: Any, *, detailed_task_names: bool) -> dict[str, Any]:
         """Decode one completed invocation buffer.
 
@@ -615,26 +452,6 @@ class _PreparedMegaKernelRuntime:
             aic_record_capacity=self._layout.aic_record_capacity,
             aiv_record_capacity=self._layout.aiv_record_capacity,
         )
-
-
-def _prepare_mega_kernel_runtime_config(
-    runtime_config: RuntimeConfigC,
-    *,
-    tensor_factory: Callable[[bytes], Any],
-    profile_tensor_factory: Callable[[Any], Any],
-    rank: int,
-    device: Any,
-    device_id: int,
-) -> _PreparedMegaKernelRuntime:
-    """Prepare fast/profiled RuntimeConfig variants without exposing ABI details."""
-    return _PreparedMegaKernelRuntime(
-        runtime_config,
-        tensor_factory=tensor_factory,
-        profile_tensor_factory=profile_tensor_factory,
-        rank=rank,
-        device=device,
-        device_id=device_id,
-    )
 
 
 def _as_bytes(buffer: Any) -> bytes:

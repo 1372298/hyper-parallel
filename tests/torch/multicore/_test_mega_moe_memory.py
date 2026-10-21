@@ -23,7 +23,8 @@ from unittest.mock import patch
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.core.multicore import MegaMoeExperts, profiler as multicore_profiler, shmem
+from hyper_parallel.core.multicore import MegaMoeExperts, shmem
+from hyper_parallel.core.multicore.diagnostics import profiler as multicore_profiler, schedule
 from hyper_parallel.core.multicore.torch import ops
 from tests.torch.multicore import _test_mega_moe as baseline
 from tests.torch.multicore._mega_moe_utils import start_shmem_lifetime, write_evidence
@@ -176,7 +177,7 @@ def test_mega_moe_local_capacity_lifetime() -> None:
         mega, common = baseline.new_layers(shape, initial_capacity_factor=factor)
         resources = mega._get_execution_resources(baseline.make_data(shape)[0])  # pylint: disable=protected-access
         assert resources.plan.reuse_backward_dispatch
-        original = ops.mega_moe_grad_with_profile_buffer
+        original = ops.mega_moe_grad_with_diagnostic_buffer
         pairs = [("balanced", "tail"), ("tail", "balanced")]
         if factor is None:
             pairs.extend([("destination0", "destination1"), ("destination1", "tail")])
@@ -190,11 +191,11 @@ def test_mega_moe_local_capacity_lifetime() -> None:
                     assert args[17].data_ptr() != args[0].data_ptr()
                     return kernel(*args)
 
-                with patch.object(ops, "mega_moe_grad_with_profile_buffer", side_effect=_backward):
+                with patch.object(ops, "mega_moe_grad_with_diagnostic_buffer", side_effect=_backward):
                     for patterns in pairs:
                         expected = _deferred_pair(common, shape, patterns)
                         with multicore_profiler.mega_kernel_profile(
-                            schedule=multicore_profiler.schedule(wait=0, warmup=0, active=1, repeat=1),
+                            schedule=schedule(wait=0, warmup=0, active=1, repeat=1),
                         ) as profiler:
                             actual = _deferred_pair(mega, shape, patterns)
                             profiler.step()

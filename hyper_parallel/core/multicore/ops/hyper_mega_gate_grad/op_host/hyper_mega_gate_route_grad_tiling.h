@@ -26,7 +26,7 @@ TILING_DATA_FIELD_DEF(uint32_t, expertAlign);
 TILING_DATA_FIELD_DEF(uint32_t, kAlign);
 TILING_DATA_FIELD_DEF(uint32_t, sharedTmpBytes);
 TILING_DATA_FIELD_DEF(uint64_t, runtimeConfigBytes);
-TILING_DATA_FIELD_DEF(uint64_t, profileBufferBytes);
+TILING_DATA_FIELD_DEF(uint64_t, diagnosticBufferBytes);
 TILING_DATA_FIELD_DEF(uint64_t, kSlot0Offset);
 TILING_DATA_FIELD_DEF(uint64_t, kSlot1Offset);
 TILING_DATA_FIELD_DEF(uint64_t, kSlot2Offset);

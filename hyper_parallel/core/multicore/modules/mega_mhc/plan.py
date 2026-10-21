@@ -19,19 +19,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
+import torch.distributed as dist
 
-from hyper_parallel.core.multicore.profiler.profiling import (
-    _PreparedMegaKernelRuntime,
-    _ProfileSpec,
-    _apply_mega_kernel_profile_graph,
-    _prepare_mega_kernel_runtime_config,
-)
-from hyper_parallel.core.multicore.profiler.profiler import _enable_runtime_config_tensor
+from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics, prepare_mega_kernel_diagnostics
 from hyper_parallel.core.multicore.scheduler.builder import build_runtime_config
 from hyper_parallel.core.multicore.scheduler.config import _validate_runtime_task_queues
 
+from .diagnostics import bind_forward_graph
 from .graph import DEFAULT_TOKEN_TILE, build_mega_mhc_graph, resolve_token_tile
 
 
@@ -43,19 +38,13 @@ class MegaMhcPlan:
     hidden_size: int
     num_cube_cores: int
     token_tile: int
-    runtime: _PreparedMegaKernelRuntime
+    runtime: MegaKernelDiagnostics
     event_capacity: int
 
     @property
     def runtime_config(self) -> torch.Tensor:
         """Return the profiling-disabled RuntimeConfig tensor."""
-        return self.runtime.normal_tensor
-
-
-def _tensor_from_bytes(data: bytes, device: Any) -> torch.Tensor:
-    """Copy serialized Host scheduling data into one NPU byte tensor."""
-    array = np.frombuffer(bytearray(data), dtype=np.uint8).copy()
-    return torch.from_numpy(array).to(device=device, dtype=torch.uint8)
+        return self.runtime.runtime_config
 
 
 def build_mega_mhc_plan(
@@ -88,31 +77,11 @@ def build_mega_mhc_plan(
         num_cube_cores=num_cube_cores,
     )
     _validate_runtime_task_queues(runtime_config, runtime_config.event_capacity)
-    _apply_mega_kernel_profile_graph(
-        runtime_config,
-        graph,
-        _ProfileSpec(kernel_name="HyperMegaMhc", owner_label="TokenPartition"),
-    )
-    npu_device = torch.device(device)
-    device_id = npu_device.index
-    if device_id is None:
-        device_id = torch.npu.current_device()
-
-    def tensor_factory(data: bytes) -> torch.Tensor:
-        """Create one byte-backed runtime tensor on the selected NPU.
-
-        Args:
-            data: Serialized runtime bytes.
-        """
-        return _tensor_from_bytes(data, npu_device)
-
-    runtime = _prepare_mega_kernel_runtime_config(
-        runtime_config,
-        tensor_factory=tensor_factory,
-        profile_tensor_factory=_enable_runtime_config_tensor,
-        rank=0,
-        device=npu_device,
-        device_id=device_id,
+    runtime = prepare_mega_kernel_diagnostics(
+        graph, runtime_config, kernel_name="HyperMegaMhc",
+        parameter_count=23, device=device, owner_label="TokenPartition",
+        rank=dist.get_rank() if dist.is_initialized() else 0,
+        vector_worker_stride=1, graph_adapter=bind_forward_graph,
     )
     return MegaMhcPlan(
         token_count=token_count,

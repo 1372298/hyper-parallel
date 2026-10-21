@@ -20,7 +20,7 @@ aclnnStatus aclnnHyperMegaMhcGradGetWorkspaceSize(
   const aclTensor *gradCurrentPre, const aclTensor *mixedInput, const aclTensor *rmsRstd, const aclTensor *normWeight,
   const aclTensor *directGradX, const aclTensor *previousResidual, const aclTensor *previousOutput,
   const aclTensor *previousPost, const aclTensor *previousResidualMix, const aclTensor *runtimeConfig,
-  const aclTensor *allEventCounters, const aclTensor *profileBuffer, aclTensor *gradResidual, aclTensor *gradPhi,
+  const aclTensor *allEventCounters, const aclTensor *diagnosticBuffer, aclTensor *gradResidual, aclTensor *gradPhi,
   aclTensor *gradAlpha, aclTensor *gradBias, aclTensor *gradPreviousOutput, aclTensor *gradPreviousPre,
   aclTensor *gradPreviousPost, aclTensor *gradPreviousResidual, aclTensor *gradNormWeight, double hcEps,
   uint64_t *workspaceSize, aclOpExecutor **executor) {
@@ -29,7 +29,7 @@ aclnnStatus aclnnHyperMegaMhcGradGetWorkspaceSize(
     aclnnHyperMegaMhcGrad,
     DFX_IN(gradHinPlaceholder, gradHPost, gradHRes, x, phi, alpha, bias, previousPre, hcBeforeNorm, invRms, sumOut,
            normOut, gradCurrentPre, mixedInput, rmsRstd, normWeight, directGradX, previousResidual, previousOutput,
-           previousPost, previousResidualMix, runtimeConfig, allEventCounters, profileBuffer, hcEps),
+           previousPost, previousResidualMix, runtimeConfig, allEventCounters, diagnosticBuffer, hcEps),
     DFX_OUT(gradResidual, gradPhi, gradAlpha, gradBias, gradPreviousOutput, gradPreviousPre, gradPreviousPost,
             gradPreviousResidual, gradNormWeight));
   auto uniqueExecutor = CREATE_EXECUTOR();
@@ -61,7 +61,7 @@ aclnnStatus aclnnHyperMegaMhcGradGetWorkspaceSize(
   MAKE_CONTIGUOUS(previousResidualMix);
   MAKE_CONTIGUOUS(runtimeConfig);
   MAKE_CONTIGUOUS(allEventCounters);
-  MAKE_CONTIGUOUS(profileBuffer);
+  MAKE_CONTIGUOUS(diagnosticBuffer);
 #undef MAKE_CONTIGUOUS
 
   const auto outputs = l0op::HyperMegaMhcGrad(
@@ -69,7 +69,7 @@ aclnnStatus aclnnHyperMegaMhcGradGetWorkspaceSize(
     biasContiguous, previousPreContiguous, hcBeforeNormContiguous, invRmsContiguous, sumOutContiguous,
     normOutContiguous, gradCurrentPreContiguous, mixedInputContiguous, rmsRstdContiguous, normWeightContiguous,
     directGradXContiguous, previousResidualContiguous, previousOutputContiguous, previousPostContiguous,
-    previousResidualMixContiguous, runtimeConfigContiguous, allEventCountersContiguous, profileBufferContiguous,
+    previousResidualMixContiguous, runtimeConfigContiguous, allEventCountersContiguous, diagnosticBufferContiguous,
     gradResidual, gradPhi, gradAlpha, gradBias, gradPreviousOutput, gradPreviousPre, gradPreviousPost,
     gradPreviousResidual, gradNormWeight, hcEps, uniqueExecutor.get());
   CHECK_RET(std::all_of(outputs.begin(), outputs.end(), [](const aclTensor *value) { return value != nullptr; }),

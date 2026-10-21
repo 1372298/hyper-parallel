@@ -28,10 +28,10 @@ namespace MulticoreRuntime {
 class KernelWorker : public KernelWorkerBase<KernelWorker> {
  public:
   // input_list layout for hyper_mega_moe (forward):
-  //   [23] = tiling params  [24] = all_event_counters  [25] = profile_buffer  [16] = gmm_workspace
-  static constexpr uint32_t TILING_IDX = 23;
-  static constexpr uint32_t EVENT_IDX = 24;
-  static constexpr uint32_t PROFILE_IDX = 25;
+  //   [23] = tiling params  [24] = all_event_counters  [25] = diagnostic_buffer  [16] = gmm_workspace
+  static constexpr uint32_t TILING_IDX   = 23;
+  static constexpr uint32_t EVENT_IDX    = 24;
+  static constexpr uint32_t DIAGNOSTIC_IDX = 25;
   static constexpr uint32_t WORKSPACE_IDX = 16;
   static constexpr uint32_t SWIGLU_DYNAMIC_FIELDS_OFFSET =
     static_cast<uint32_t>(offsetof(SwiGluTilingData, rowLen));

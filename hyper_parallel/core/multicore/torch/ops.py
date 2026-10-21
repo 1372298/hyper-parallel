@@ -31,6 +31,8 @@ Forward and backward ACLNN symbols are packaged in one component-owned
 ``hyper_parallel_multicore_nn`` vendor. Source the packaged ``set_env.bash``
 before starting the application or framework Python process so CANN can discover that vendor.
 """
+from __future__ import annotations
+
 __all__ = [
     "cann_mhc_pre_sinkhorn",
     "cann_mhc_pre_sinkhorn_with_cache",
@@ -52,6 +54,18 @@ from hyper_parallel.core.multicore._loader import (
     get_multicore_paths,
     preload_vendor_library,
 )
+from hyper_parallel.core.multicore.diagnostics import MegaKernelDiagnostics
+
+
+def _launch_diagnostic_out(
+    operator, inputs, outputs, runtime_config, event_counters, diagnostic_buffer,
+    diagnostics, direction, attributes,
+):
+    """Bind preallocated native out operands before the selected tool prepares."""
+    parameters = (*inputs, runtime_config, event_counters, diagnostic_buffer, *outputs)
+    with diagnostics.launch(parameters, direction=direction, fallback_event_counters=event_counters) as call:
+        return operator(*inputs, call.runtime_config, call.event_counters, call.diagnostic_buffer,
+                        *outputs, *attributes)
 
 
 @lru_cache(maxsize=1)
@@ -259,12 +273,13 @@ def hyper_mega_mhc(
     norm_weight: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    profile_buffer: torch.Tensor,
+    diagnostic_buffer: torch.Tensor,
     *,
     hc_eps: float = 1e-6,
     norm_eps: float = 1e-6,
     num_iters: int = 20,
     need_backward: bool,
+    diagnostics: MegaKernelDiagnostics | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Allocate outputs and launch the single-kernel shifted mHC implementation.
 
@@ -280,11 +295,12 @@ def hyper_mega_mhc(
         norm_weight: Shifted RMSNorm weight.
         runtime_config: Serialized multicore schedule.
         all_event_counters: Device event-counter storage.
-        profile_buffer: Device profiling storage.
+        diagnostic_buffer: Shared Device diagnostics storage or a disabled placeholder.
         hc_eps: Sinkhorn numerical-stability epsilon.
         norm_eps: RMS normalization epsilon.
         num_iters: Sinkhorn iteration count.
         need_backward: Whether MhcPre should populate backward caches.
+        diagnostics: Active generic launch boundary, omitted on the ordinary path.
 
     Returns:
         Five public forward outputs followed by the six tensors consumed by
@@ -312,29 +328,30 @@ def hyper_mega_mhc(
         device=residual.device,
     )
     cache_outputs = _allocate_hyper_mega_mhc_forward_cache(residual, num_iters)
+    if diagnostics is not None:
+        diagnostic_outputs = _launch_diagnostic_out(
+            torch.ops.hyper_parallel.mega_mhc,
+            (previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix,
+             phi, alpha, bias, norm_weight),
+            (new_residual, next_pre_mix, next_post_mix, next_residual_mix, block_input, *cache_outputs),
+            runtime_config, all_event_counters, diagnostic_buffer, diagnostics, "forward",
+            (hc_eps, norm_eps, num_iters, need_backward),
+        )
+        return (*diagnostic_outputs[:3],
+                diagnostic_outputs[3].reshape(batch_size, sequence_length, hc_mult, hc_mult),
+                *diagnostic_outputs[4:])
     torch.ops.hyper_parallel.mega_mhc(
-        previous_output,
-        residual,
-        previous_pre_mix,
-        previous_post_mix,
-        previous_residual_mix,
-        phi,
-        alpha,
-        bias,
-        norm_weight,
-        runtime_config,
-        all_event_counters,
-        profile_buffer,
-        new_residual,
-        next_pre_mix,
-        next_post_mix,
-        next_residual_mix,
-        block_input,
-        *cache_outputs,
-        hc_eps,
-        norm_eps,
-        num_iters,
-        need_backward,
+        previous_output, residual,
+        previous_pre_mix, previous_post_mix,
+        previous_residual_mix, phi,
+        alpha, bias,
+        norm_weight, runtime_config,
+        all_event_counters, diagnostic_buffer,
+        new_residual, next_pre_mix,
+        next_post_mix, next_residual_mix,
+        block_input, *cache_outputs,
+        hc_eps, norm_eps,
+        num_iters, need_backward,
     )
     return (
         new_residual,
@@ -395,9 +412,10 @@ def hyper_mega_mhc_grad(
     previous_residual_mix: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    profile_buffer: torch.Tensor,
+    diagnostic_buffer: torch.Tensor,
     *,
     hc_eps: float = 1e-6,
+    diagnostics: MegaKernelDiagnostics | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Allocate gradients and launch the single-kernel shifted mHC backward.
 
@@ -425,8 +443,9 @@ def hyper_mega_mhc_grad(
         previous_residual_mix: Previous residual-mix coefficients.
         runtime_config: Serialized multicore schedule.
         all_event_counters: Device event-counter storage.
-        profile_buffer: Device profiling storage.
+        diagnostic_buffer: Shared Device diagnostics storage or a disabled placeholder.
         hc_eps: Sinkhorn numerical-stability epsilon.
+        diagnostics: Active generic launch boundary, omitted on the ordinary path.
     """
     _load_native()
     grad_outputs = _allocate_hyper_mega_mhc_grad_outputs(
@@ -440,33 +459,28 @@ def hyper_mega_mhc_grad(
         previous_residual_mix,
         norm_weight,
     )
+    if diagnostics is not None:
+        return _launch_diagnostic_out(
+            torch.ops.hyper_parallel.mega_mhc_grad,
+            (grad_hin_placeholder, grad_h_post, grad_h_res, x, phi, alpha, bias, previous_pre,
+             hc_before_norm, inv_rms, sum_out, norm_out, grad_current_pre, mixed_input, rms_rstd,
+             norm_weight, direct_grad_x, previous_residual, previous_output, previous_post, previous_residual_mix),
+            grad_outputs, runtime_config, all_event_counters, diagnostic_buffer, diagnostics, "backward", (hc_eps,),
+        )
     return torch.ops.hyper_parallel.mega_mhc_grad(
-        grad_hin_placeholder,
-        grad_h_post,
-        grad_h_res,
-        x,
-        phi,
-        alpha,
-        bias,
-        previous_pre,
-        hc_before_norm,
-        inv_rms,
-        sum_out,
-        norm_out,
-        grad_current_pre,
-        mixed_input,
-        rms_rstd,
-        norm_weight,
-        direct_grad_x,
-        previous_residual,
-        previous_output,
-        previous_post,
-        previous_residual_mix,
-        runtime_config,
-        all_event_counters,
-        profile_buffer,
-        *grad_outputs,
-        hc_eps,
+        grad_hin_placeholder, grad_h_post,
+        grad_h_res, x,
+        phi, alpha,
+        bias, previous_pre,
+        hc_before_norm, inv_rms,
+        sum_out, norm_out,
+        grad_current_pre, mixed_input,
+        rms_rstd, norm_weight,
+        direct_grad_x, previous_residual,
+        previous_output, previous_post,
+        previous_residual_mix, runtime_config,
+        all_event_counters, diagnostic_buffer,
+        *grad_outputs, hc_eps,
     )
 
 
@@ -698,7 +712,7 @@ def mega_moe_grad(
     )
 
 
-def mega_moe_with_profile_buffer(
+def mega_moe_with_diagnostic_buffer(
     dispatch_target: torch.Tensor,
     dispatch_target_off: torch.Tensor,
     dispatch_src: torch.Tensor,
@@ -721,7 +735,7 @@ def mega_moe_with_profile_buffer(
     down_proj_tiling: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    profile_buffer: torch.Tensor,
+    diagnostic_buffer: torch.Tensor,
     rank_id: int,
     ep: int,
     expert_num: int,
@@ -729,7 +743,7 @@ def mega_moe_with_profile_buffer(
     seq_size: int,
 ) -> None:
     """
-    Launch the internal forward ABI with a profiler-owned ordinary NPU buffer.
+    Launch the internal forward ABI with a shared diagnostic-buffer argument.
 
     Args:
         dispatch_target: First operator tensor; the detailed ABI is documented below.
@@ -739,7 +753,7 @@ def mega_moe_with_profile_buffer(
     All output tensors must be pre-allocated with correct shapes.
 
     Args:
-        dispatch_target: First tensor in the fixed profiled-forward ABI; the complete parameter groups are documented
+        dispatch_target: First tensor in the fixed diagnostic-forward ABI; the complete parameter groups are documented
             below and retain their registered schema order.
 
     Parameters
@@ -761,8 +775,9 @@ def mega_moe_with_profile_buffer(
         Per-rank runtime config tensor (from gen_runtime_data.py).
     all_event_counters :
         Event synchronization counter tensor.
-    profile_buffer :
-        Ordinary NPU memory receiving per-worker cycle records.
+    diagnostic_buffer :
+        Ordinary NPU memory receiving either profiling records or L1 dump
+        snapshots, selected by runtime_config. Unused in ordinary/L0 mode.
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
     """
@@ -790,7 +805,7 @@ def mega_moe_with_profile_buffer(
         down_proj_tiling,
         runtime_config,
         all_event_counters,
-        profile_buffer,
+        diagnostic_buffer,
         rank_id,
         ep,
         expert_num,
@@ -799,7 +814,7 @@ def mega_moe_with_profile_buffer(
     )
 
 
-def mega_moe_grad_with_profile_buffer(
+def mega_moe_grad_with_diagnostic_buffer(
     dispatch_target: torch.Tensor,
     dispatch_target_off: torch.Tensor,
     dy: torch.Tensor,
@@ -829,22 +844,23 @@ def mega_moe_grad_with_profile_buffer(
     swiglu_grad_workspace: torch.Tensor,
     runtime_config: torch.Tensor,
     all_event_counters: torch.Tensor,
-    profile_buffer: torch.Tensor,
+    diagnostic_buffer: torch.Tensor,
     rank_id: int,
     ep: int,
     expert_num: int,
     hidden_size: int,
     seq_size: int,
 ) -> None:
-    """Launch the profiled MoE-FFN backward ABI.
+    """Launch the diagnostic MoE-FFN backward ABI.
 
     The argument contract matches :func:`mega_moe_grad` with one additional
-    ordinary-NPU-memory ``profile_buffer``. Device workers write cycle records
-    directly into that buffer. All output and workspace tensors remain
+    ordinary-NPU-memory ``diagnostic_buffer``. Device workers write profiling
+    records or L1 dump snapshots according to runtime_config; ordinary/L0 mode
+    does not access the buffer. All output and workspace tensors remain
     caller-owned and are written in place.
 
     Args:
-        dispatch_target: First tensor in the fixed profiled-backward ABI; remaining tensor and topology arguments
+        dispatch_target: First tensor in the fixed diagnostic-backward ABI; remaining tensor and topology arguments
             retain their registered schema order.
     """
     _load_native()
@@ -878,7 +894,7 @@ def mega_moe_grad_with_profile_buffer(
         swiglu_grad_workspace,
         runtime_config,
         all_event_counters,
-        profile_buffer,
+        diagnostic_buffer,
         rank_id,
         ep,
         expert_num,

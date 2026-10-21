@@ -16,7 +16,7 @@
 
 import unittest
 
-from hyper_parallel.core.multicore.profiler.profiling import (
+from hyper_parallel.core.multicore.diagnostics.profiler.cycle_trace import (
     CORE_HEADER,
     CUBE_SLOT_COUNT,
     INVALID_OWNER_ID,

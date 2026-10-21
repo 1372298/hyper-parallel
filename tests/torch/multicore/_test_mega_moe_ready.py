@@ -117,7 +117,7 @@ def _run_ready_case(replay: bool) -> dict:
         source, _ = baseline.make_data(shape)
         ids, weights, counts = baseline.make_balanced_route(shape)
         with patch.object(
-            function_module.multicore_ops, "mega_moe_with_profile_buffer",
+            function_module.multicore_ops, "mega_moe",
             side_effect=RuntimeError("injected launch error"),
         ):
             try:
