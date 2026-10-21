@@ -29,11 +29,11 @@ class EncoderParallelConfig:
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
-            raise ValueError("[HP-ENCODER-002] enabled must be a boolean")
+            raise ValueError("enabled must be a boolean")
         if (isinstance(self.encoder_cp_size, bool) or not isinstance(self.encoder_cp_size, int)
                 or self.encoder_cp_size < 1):
             raise ValueError(
-                "[HP-ENCODER-002] accelerator.encoder_parallel.encoder_cp_size "
+                "accelerator.encoder_parallel.encoder_cp_size "
                 f"must be a positive integer, got {self.encoder_cp_size!r}"
             )
 
@@ -47,8 +47,8 @@ class EncoderParallelConfig:
         if raw is None:
             return cls()
         if not isinstance(raw, Mapping):
-            raise ValueError("[HP-ENCODER-002] encoder_parallel must be a mapping")
+            raise ValueError("encoder_parallel must be a mapping")
         unknown = set(raw) - {field.name for field in fields(cls)}
         if unknown:
-            raise ValueError(f"[HP-ENCODER-002] unknown encoder_parallel keys: {sorted(unknown)}")
+            raise ValueError(f"unknown encoder_parallel keys: {sorted(unknown)}")
         return cls(**raw)

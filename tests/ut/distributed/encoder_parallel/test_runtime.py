@@ -228,17 +228,17 @@ class TestEncoderRuntime(unittest.TestCase):
         spec = get_deepseek_v41_encoder_parallel_spec()
         options = {"micro_batch_size": 1, "compile_enabled": False, "validate_placement": False}
         invalid_options = dict(options, micro_batch_size=2)
-        with self.assertRaisesRegex(ValueError, "HP-ENCODER-014"):
+        with self.assertRaisesRegex(ValueError, "does not support the requested micro batch"):
             EncoderParallelRuntime(config=EncoderParallelConfig(enabled=True),
                                    mesh_context=self.context, model=self.model, spec=spec,
                                    execution_options=invalid_options)
         invalid_context = SimpleNamespace(**{**vars(self.context), "loss_parallel": True})
-        with self.assertRaisesRegex(NotImplementedError, "HP-ENCODER-015"):
+        with self.assertRaisesRegex(NotImplementedError, "unsupported encoder loss layout"):
             EncoderParallelRuntime(config=EncoderParallelConfig(enabled=True),
                                    mesh_context=invalid_context, model=self.model, spec=spec,
                                    execution_options=options)
         wide_context = SimpleNamespace(**{**vars(self.context), "cp_size": 2, "tp_size": 4})
-        with self.assertRaisesRegex(ValueError, "HP-ENCODER-005.*query.*key.*value"):
+        with self.assertRaisesRegex(ValueError, "head divisibility check failed"):
             EncoderParallelRuntime(config=EncoderParallelConfig(enabled=True, encoder_cp_size=4),
                                    mesh_context=wide_context, model=self.model, spec=spec,
                                    execution_options=options)
@@ -252,7 +252,7 @@ class TestEncoderRuntime(unittest.TestCase):
         Expectation: Runtime initialization identifies the missing block FQN.
         """
         self.model._hp_replaced_module_fqns = ()  # pylint: disable=protected-access
-        with self.assertRaisesRegex(RuntimeError, "HP-ENCODER-006.*blocks.0.attn"):
+        with self.assertRaisesRegex(RuntimeError, "incomplete vision attention replacement.*blocks.0.attn"):
             EncoderParallelRuntime(
                 config=EncoderParallelConfig(enabled=True), mesh_context=self.context,
                 model=self.model, spec=get_deepseek_v41_encoder_parallel_spec(),
@@ -270,5 +270,5 @@ class TestEncoderRuntime(unittest.TestCase):
         """
         batch = {"input_ids": torch.zeros(1, 8, dtype=torch.long),
                  "pixel_values": torch.zeros(4, 3, 2, 2)}
-        with self.assertRaisesRegex(ValueError, "HP-ENCODER-013"):
+        with self.assertRaisesRegex(ValueError, "incomplete image metadata bundle"):
             self.runtime.preflight_batch(batch)

@@ -354,7 +354,7 @@ class TestModelAdapterRecomputeRegions(unittest.TestCase):
         )
         model, adapter = self._model(policy)
 
-        with self.assertRaisesRegex(ValueError, "HP-STATE-002"):
+        with self.assertRaisesRegex(ValueError, "is also excluded"):
             self._apply(model, adapter, self._selection(layer_count=1))
 
     def test_exclude_predicate_keeps_named_modules_out_of_recompute(self):

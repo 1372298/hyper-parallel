@@ -99,12 +99,12 @@ class TestEncoderPlanning(unittest.TestCase):
                          [(rank // 2, rank % 2) for rank in range(8)])
         self.assertEqual([decoder_coordinates(rank, 4) for rank in range(8)],
                          [(rank // 4, rank % 4) for rank in range(8)])
-        with self.assertRaisesRegex(ValueError, "HP-ENCODER-004"):
+        with self.assertRaisesRegex(ValueError, "invalid decoder sequence layout"):
             DecoderSequenceLayout.build(mesh_context=_mesh(), cp_local_length=130)
         layout = DecoderSequenceLayout.build(mesh_context=_mesh(), cp_local_length=128, tp_rank=3)
         self.assertTrue(torch.equal(layout.localize(torch.arange(128).unsqueeze(0)),
                                     torch.arange(96, 128).unsqueeze(0)))
-        with self.assertRaisesRegex(ValueError, "HP-ENCODER-004"):
+        with self.assertRaisesRegex(ValueError, "decoder hidden does not match planned CP/SP shard"):
             layout.validate_hidden(torch.zeros(1, 31, 8))
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -122,7 +122,7 @@ class TestEncoderPlanning(unittest.TestCase):
                          (3, 2, 3))
         self.assertTrue(build_segments((), 0, 2)[0].is_dummy)
         layouts = {0: DecoderSequenceLayout.build(mesh_context=_mesh(), cp_local_length=128)}
-        with self.assertRaisesRegex(ValueError, "HP-ENCODER-016"):
+        with self.assertRaisesRegex(ValueError, "image span is outside the decoder domain"):
             build_destinations((EncoderWorkItem(1, 0, 2, 1, 255, 3, 0, 2, {}),), layouts)
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
@@ -134,7 +134,7 @@ class TestEncoderPlanning(unittest.TestCase):
         Expectation: Only enabled and encoder_cp_size remain public inputs.
         """
         for size in (0, True):
-            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "HP-ENCODER-002"):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "encoder_cp_size must be a positive integer"):
                 EncoderParallelConfig(encoder_cp_size=size)
         for name, value in (("mode", "sequence_sharded"),
                             ("balance_by", "attention_flops"),

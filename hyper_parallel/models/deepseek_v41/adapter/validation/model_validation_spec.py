@@ -70,7 +70,7 @@ def _validate_engram_scratch_state(model: Any, context: Any) -> dict[str, Any] |
     return {"non_official_initialization": failures} if failures else None
 
 
-def _validate_canonical_module_tree(model: Any, _context: Any) -> dict[str, Any] | None:
+def _validate_canonical_module_tree(model: Any, context: Any) -> dict[str, Any] | None:  # pylint: disable=unused-argument
     """Require executable V4.1 attention and Engram modules in the base model."""
     backbone = getattr(model, "model", None)
     layers = getattr(backbone, "layers", ())
@@ -194,13 +194,11 @@ def get_validation_spec() -> ModelValidationSpec:
                 name="deepseek_v41.canonical_module_tree",
                 checker=_validate_canonical_module_tree,
                 phase="structure",
-                error_code="HP-REPLACE-002",
             ),
             StateInvariantSpec(
                 name="deepseek_v41.final_engram_qk_scratch_initialization",
                 checker=_validate_engram_scratch_state,
                 phase="materialization",
-                error_code="HP-MAT-003",
             ),
         ),
         shared_state=SharedStateValidationSpec(

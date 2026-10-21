@@ -958,7 +958,7 @@ def _validate_region_exclusions(roots: list, exclude_targets: list) -> None:
     for module_fqn, _ in exclude_targets:
         if module_fqn in root_fqns:
             raise ValueError(
-                f"[HP-STATE-002] recompute region root {module_fqn!r} is also excluded "
+                f"recompute region root {module_fqn!r} is also excluded "
                 "from the recompute"
             )
     root_ids = {id(module) for _, module in roots}

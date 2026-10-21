@@ -355,7 +355,6 @@ def get_validation_spec():
                 name="example.canonical_executable_tree",
                 checker=_canonical_tree,
                 phase="structure",
-                error_code="HP-REPLACE-002",
             ),
         ),
         data=DataValidationSpec(
@@ -435,7 +434,7 @@ def build_recompute_policy():
 
 DeepSeek-V4.1 把它写成 `models/deepseek_v41/adapter/policies/activation_checkpointing.py` 里的一档开关：`ATTENTION_RECOMPUTE_TIER` 取 `reuse`（默认）/ `reuse_reindex` / `all` / `none`，不在重算范围里的角色由同一张角色表派生为 `exclude_predicate`，会重算的 index source 由同一个元组派给 `configure_shared_state` 去 pin 选区。默认 `reuse`：只读跨层状态的层随层重算，Full/Reindex 这类生产者留在区域外保留激活。`configure_shared_state` 把 indexer 的离散选择 pin 成 exclude 区域，重算复用正向选出的集合，也避免"跳过一段可微代码"破坏 checkpoint 的张量数不变量。跨层状态本身不需要调度——它作为重算区域的输入被 checkpoint 持有，发布出去的条目随它活到反向结束，而 `publish_*` 只在正向执行（`is_recomputing()` 判定），重算不会写第二次。pin 只覆盖离散选择：选区之外的 compressor、indexer 投影按档位随层重算或留在区域外。
 
-`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除（`HP-STATE-002`）。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重算的层安装选区 pin）。
+`region_patterns` 取**最外层匹配**作为区域根：写成整层模式时一个区域只保存一份层输入，写成 `model.layers.*.mlp` 这类叶子模块模式时则每个模块各自成区域（此时 `exclude_patterns` 一般留空）。`exclude_patterns` 必须命中区域根的后代，否则直接报错；同一个模块也不能既是区域根又被排除。`on_applied` 是区域装好后的模型自有钩子，用于开启依赖最终区域形状的运行时行为（例如 DeepSeek-V4.1 用它给会被重算的层安装选区 pin）。
 
 Trainer recipe 通过通用配置选择该策略：
 
@@ -784,13 +783,13 @@ DeepSeek-V4.1 的模型主体和优化路径是一一对应、但彼此不互相
 
 | 现象 | 含义 | 处理方式 |
 |---|---|---|
-| `HP-REPLACE-001/002` | 可选替换未命中，或最终树仍有非可执行 Placeholder/forward-state 契约破坏 | 优先把模型主体迁入正式 architecture；确有生命周期约束时再修正 finalization、adapter pattern 或显式 mapping |
-| `HP-FSDP-004/005/006` | 一个 FSDP unit 混合 dense/expert 域、专家落入 root 或 alias 归属冲突 | 在 adapter 声明同质 child unit 和正确边界 |
-| `HP-MAT-001/002/003` | meta tensor、derived buffer 或模型初始化未完成 | 修正 materialization hook/模型初始化，不用 checkpoint 掩盖派生状态 |
-| `HP-CKPT-001/002` | checkpoint key 未覆盖或转换不可逆 | 增加 mapping/transform/reverse transform 或显式合法排除 |
-| `HP-DATA-001/002` | forward 字段所有权冲突、字段缺失、label shift/模态梯度不符 | 修正 Omni dataset transform、get-batch 或 runtime input adapter 声明 |
-| `HP-PREC-001` | required probe 未匹配最终参数 | 使用替换后的最终 FQN 更新 adapter 声明 |
-| `HP-STATE-001/002/003` | 跨层状态缺 producer/consumer、producer 重复发布或 trace 超限 | 让状态写入只在正向执行（`is_recomputing()`）、把离散选择 pin 成 exclude 区域，或缩小重算边界 |
+| 替换相关报错 | 可选替换未命中，或最终树仍有非可执行 Placeholder/forward-state 契约破坏 | 优先把模型主体迁入正式 architecture；确有生命周期约束时再修正 finalization、adapter pattern 或显式 mapping |
+| FSDP ownership 相关报错 | 一个 FSDP unit 混合 dense/expert 域、专家落入 root 或 alias 归属冲突 | 在 adapter 声明同质 child unit 和正确边界 |
+| materialization 相关报错 | meta tensor、derived buffer 或模型初始化未完成 | 修正 materialization hook/模型初始化，不用 checkpoint 掩盖派生状态 |
+| checkpoint 覆盖相关报错 | checkpoint key 未覆盖或转换不可逆 | 增加 mapping/transform/reverse transform 或显式合法排除 |
+| forward 数据契约相关报错 | forward 字段所有权冲突、字段缺失、label shift/模态梯度不符 | 修正 Omni dataset transform、get-batch 或 runtime input adapter 声明 |
+| 参数探针未命中 | required probe 未匹配最终参数 | 使用替换后的最终 FQN 更新 adapter 声明 |
+| 共享状态契约相关报错 | 跨层状态缺 producer/consumer、producer 重复发布或 trace 超限 | 让状态写入只在正向执行（`is_recomputing()`）、把离散选择 pin 成 exclude 区域，或缩小重算边界 |
 | Online dataloader 拒绝跨 DP world-size cursor，或跳过 cursor 后 input hash 仍不同 | DCP 能重分片模型/优化器，不代表 loader 能重建全局样本位置；从同一配置起点也不保证 DP-invariant packing | warm-start 可用 `restore_dataloader_state=false` 请求 replay，但必须检查 global input hash；正式跨拓扑精度改用固定 Offline replay，真正续训改用支持全局 cursor 重建的 loader，否则标为 `BLOCKED` |
 | `BLOCKED` | 证据、设备、资产或独立 oracle 不可用 | 补齐前置条件；不要放宽阈值或静默缩小实验 |
 

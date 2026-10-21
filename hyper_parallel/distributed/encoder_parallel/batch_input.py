@@ -30,7 +30,7 @@ class EncoderParallelInputAdapter(RuntimeInputAdapter):
                  inner: RuntimeInputAdapter | None) -> None:
         """Combine visual planning with the batch's existing input provider."""
         if inner is not None and "encoder_parallel_plan" in inner.runtime_input_fields():
-            raise ValueError("[HP-DATA-001] encoder_parallel_plan has two owners")
+            raise ValueError("encoder_parallel_plan has two owners")
         self.runtime = runtime
         self.inner = inner
 
@@ -49,6 +49,6 @@ class EncoderParallelInputAdapter(RuntimeInputAdapter):
             raise TypeError("RuntimeInputAdapter.build_runtime_inputs must return a mapping")
         inputs = dict(generated)
         if "encoder_parallel_plan" in batch or "encoder_parallel_plan" in inputs or set(batch).intersection(inputs):
-            raise ValueError("[HP-DATA-001] runtime inputs cannot replace Omni model inputs")
+            raise ValueError("runtime inputs cannot replace Omni model inputs")
         inputs["encoder_parallel_plan"] = self.runtime.finalize_plan(*prepared)
         return inputs

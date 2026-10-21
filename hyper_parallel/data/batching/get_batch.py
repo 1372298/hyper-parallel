@@ -141,7 +141,7 @@ class OmniParallelBatch:
         collisions = set(batch).intersection(runtime_inputs)
         if collisions:
             raise ValueError(
-                "[HP-DATA-001] runtime inputs cannot replace Omni model inputs: "
+                "runtime inputs cannot replace Omni model inputs: "
                 f"{sorted(collisions)}"
             )
         return runtime_inputs
@@ -319,7 +319,7 @@ class TextParallelBatch:
         collisions = set(runtime_inputs).intersection(model_runtime_inputs)
         if collisions:
             raise ValueError(
-                "[HP-DATA-001] model runtime inputs cannot replace common attention inputs: "
+                "model runtime inputs cannot replace common attention inputs: "
                 f"{sorted(collisions)}"
             )
         runtime_inputs.update(model_runtime_inputs)
@@ -460,7 +460,7 @@ class TextParallelBatch:
         collisions = set(model_inputs).intersection(runtime_inputs)
         if collisions:
             raise ValueError(
-                "[HP-DATA-001] runtime inputs cannot replace framework-owned model inputs: "
+                "runtime inputs cannot replace framework-owned model inputs: "
                 f"{sorted(collisions)}"
             )
         model_inputs.update(runtime_inputs)

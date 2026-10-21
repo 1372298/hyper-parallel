@@ -149,7 +149,7 @@ class VLMTrainer:
         )
         if encoder_runtime is not None:
             if not isinstance(get_batch, OmniParallelBatch):
-                raise ValueError("[HP-ENCODER-001] encoder parallel requires OmniParallelBatch")
+                raise ValueError("encoder parallel requires OmniParallelBatch")
             get_batch.runtime_input_adapter = EncoderParallelInputAdapter(
                 runtime=encoder_runtime,
                 inner=get_batch.runtime_input_adapter,

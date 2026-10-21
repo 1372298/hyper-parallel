@@ -224,18 +224,9 @@ class TestModelIntegrationContracts(unittest.TestCase):
             ModelIntegrationConfig(mode="strict")
 
     def test_structured_finding_requires_actionable_error(self) -> None:
-        """Reject malformed codes and non-actionable ERROR findings."""
-        with self.assertRaisesRegex(ValueError, "invalid model integration error code"):
-            ModelIntegrationFinding(
-                code="BAD",
-                phase="D1",
-                owner_fqn="root",
-                severity=FindingSeverity.WARNING,
-                message="bad code",
-            )
+        """Reject non-actionable ERROR findings."""
         with self.assertRaisesRegex(ValueError, "require why_unsafe"):
             ModelIntegrationFinding(
-                code="HP-TEST-001",
                 phase="D1",
                 owner_fqn="root",
                 severity=FindingSeverity.ERROR,
@@ -318,7 +309,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             root = Path(temporary_directory)
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "model:\n  adapter: example\n  id_or_path: https://example.invalid/model\n",
                 encoding="utf-8",
             )
@@ -338,7 +329,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             (native_dir / "model.py").write_text("VALUE = 1\n", encoding="utf-8")
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 f"model:\n  adapter: example\n  id_or_path: {model_dir}\n"
                 f"reference:\n  source_path: {root / 'native'}\n",
                 encoding="utf-8",
@@ -362,7 +353,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             root = Path(temporary_directory)
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "model:\n  adapter: example\n"
                 f"output_dir: {root / 'evidence'}\n",
                 encoding="utf-8",
@@ -436,7 +427,10 @@ class TestModelIntegrationContracts(unittest.TestCase):
             _FakeUnit(("DENSE", "EXPERT")),
         )
 
-        self.assertIn("HP-FSDP-004", {finding.code for finding in report.errors})
+        self.assertIn(
+            "FSDP unit has incompatible gradient domains",
+            {finding.message for finding in report.errors},
+        )
 
     def test_homogeneous_gradient_domain_passes(self) -> None:
         """Accept homogeneous dense ownership."""
@@ -794,7 +788,10 @@ class TestModelIntegrationContracts(unittest.TestCase):
         findings = validate_observed_forward_fields(spec, {"input_ids": torch.ones(1)})
         gradients = modality_gradient_parameters(spec, model)
 
-        self.assertEqual({finding.code for finding in findings}, {"HP-DATA-002"})
+        self.assertEqual(
+            {finding.message for finding in findings},
+            {"actual model forward kwargs omit required training fields"},
+        )
         self.assertEqual(gradients, {"vision.*": True})
 
     def test_invalid_invariant_phase_is_structured(self) -> None:
@@ -811,7 +808,10 @@ class TestModelIntegrationContracts(unittest.TestCase):
 
         findings = validate_state_invariants(nn.Linear(1, 1), spec, {})
 
-        self.assertEqual({finding.code for finding in findings}, {"HP-SPEC-001"})
+        self.assertEqual(
+            {finding.message for finding in findings},
+            {"model state invariant declares an unsupported lifecycle phase"},
+        )
 
     def test_summary_first_line_is_machine_readable(self) -> None:
         """Generate a deterministic PASS/FAIL/BLOCKED report header."""
@@ -1273,7 +1273,10 @@ class TestModelIntegrationContracts(unittest.TestCase):
             unexpected_keys=(),
         )
         _, findings = build_checkpoint_coverage(model)
-        self.assertEqual({finding.code for finding in findings}, {"HP-CKPT-001"})
+        self.assertEqual(
+            {finding.message for finding in findings},
+            {"checkpoint coverage is incomplete after finalization"},
+        )
 
         coverage, findings = build_checkpoint_coverage(
             model,
@@ -1330,7 +1333,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 1,
             ):
                 state.publish_compressed_kv(1, torch.ones(1))
-                with self.assertRaisesRegex(RuntimeError, "HP-STATE-003"):
+                with self.assertRaisesRegex(RuntimeError, "shared-state validation trace exceeded"):
                     state.require_compressed_kv(1, 2)
         finally:
             finish_shared_state_trace(token)
@@ -1450,7 +1453,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             output_dir = root / "evidence"
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "model:\n"
                 "  adapter: example\n"
                 "  builder:\n"
@@ -1473,7 +1476,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
 
             invalid_manifest = root / "invalid_manifest.yaml"
             invalid_manifest.write_text(
-                "schema_version: 1\nmodel:\n  adapter: example\n  builder: {}\n"
+                "schema_version: 2\nmodel:\n  adapter: example\n  builder: {}\n"
                 f"output_dir: {root / 'invalid_evidence'}\n",
                 encoding="utf-8",
             )
@@ -1500,7 +1503,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             root = Path(temporary_directory).resolve()
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\nmodel:\n  adapter: example\nlauncher: {}\n",
+                "schema_version: 2\nmodel:\n  adapter: example\nlauncher: {}\n",
                 encoding="utf-8",
             )
             manifest = load_manifest(manifest_path)
@@ -1642,7 +1645,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             manifest_path = root / "validation.yaml"
             (root / "trainer.yaml").write_text("training: {}\n", encoding="utf-8")
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "model:\n  adapter: example\n"
                 "launcher:\n"
                 "  module: examples.training_demo.train_text\n"
@@ -1672,7 +1675,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             manifest_path = root / "validation.yaml"
             (root / "trainer.yaml").write_text("training: {}\n", encoding="utf-8")
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "model:\n  adapter: example\n"
                 "launcher:\n"
                 "  module: examples.training_demo.train_text\n"
@@ -1810,7 +1813,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             handoff_path.write_text("status: PASS\n", encoding="utf-8")
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\nmodel:\n  adapter: example\n"
+                "schema_version: 2\nmodel:\n  adapter: example\n"
                 f"integration_handoff: {handoff_path}\n",
                 encoding="utf-8",
             )
@@ -1840,7 +1843,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
                 path.write_text(json.dumps(payload), encoding="utf-8")
             handoff_path = gate_dir / "integration_handoff.yaml"
             handoff_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "family: example\n"
                 "status: PASS\n"
                 "structure_findings: check/findings.json\n"
@@ -1850,7 +1853,7 @@ class TestModelIntegrationContracts(unittest.TestCase):
             )
             manifest_path = root / "manifest.yaml"
             manifest_path.write_text(
-                "schema_version: 1\n"
+                "schema_version: 2\n"
                 "model:\n  adapter: example\n"
                 f"integration_handoff: {handoff_path}\n",
                 encoding="utf-8",

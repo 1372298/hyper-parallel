@@ -80,7 +80,7 @@ def _validate_image_bundle(batch: Mapping[str, Any]) -> int:
     """Validate image metadata tensors and return the image count."""
     non_tensors = [name for name in _IMAGE_FIELDS if not torch.is_tensor(batch[name])]
     if non_tensors:
-        raise ValueError(f"[HP-ENCODER-013] image metadata must be tensors; non_tensors={non_tensors}")
+        raise ValueError(f"image metadata must be tensors; non_tensors={non_tensors}")
     pixels = batch["pixel_values"]
     offsets = batch["image_patch_offsets"].reshape(-1)
     vit_hw = batch["image_vit_grid_hw"]
@@ -94,7 +94,7 @@ def _validate_image_bundle(batch: Mapping[str, Any]) -> int:
     invalid = _invalid_image_items(vit_hw, llm_hw, indices, starts, offset_values) if offsets_valid else []
     if not shapes_valid or not offsets_valid or invalid:
         raise ValueError(
-            "[HP-ENCODER-013] invalid DeepSeek image metadata bundle; "
+            "invalid DeepSeek image metadata bundle; "
             f"valid_shapes={shapes_valid}; valid_offsets={offsets_valid}; invalid_items={invalid}"
         )
     return count
@@ -109,7 +109,7 @@ def build_deepseek_v41_work_items(batch: Mapping[str, Any]) -> tuple[EncoderWork
     input_ids = batch.get("input_ids")
     if not torch.is_tensor(input_ids) or input_ids.ndim != 2 or input_ids.shape[0] != 1:
         raise ValueError(
-            "[HP-ENCODER-014] DeepSeek-V4.1 encoder parallel v1 requires micro_batch_size=1; "
+            "DeepSeek-V4.1 encoder parallel v1 requires micro_batch_size=1; "
             f"input_shape={getattr(input_ids, 'shape', None)}"
         )
     present = [batch.get(name) is not None for name in _IMAGE_FIELDS]
@@ -117,9 +117,9 @@ def build_deepseek_v41_work_items(batch: Mapping[str, Any]) -> tuple[EncoderWork
         return ()
     if not all(present):
         missing = [name for name in _IMAGE_FIELDS if batch.get(name) is None]
-        raise ValueError(f"[HP-ENCODER-013] incomplete DeepSeek image metadata bundle: missing={missing}")
+        raise ValueError(f"incomplete DeepSeek image metadata bundle: missing={missing}")
     if batch.get("token_types") is None:
-        raise ValueError("[HP-ENCODER-013] DeepSeek image inputs require token_types")
+        raise ValueError("DeepSeek image inputs require token_types")
     count = _validate_image_bundle(batch)
     items = []
     for index in range(count):
@@ -146,7 +146,7 @@ class DeepseekV41VisionBridge:
         """Keep direct references to the existing ViT and aligner modules."""
         backbone = getattr(model, "model", model)
         if backbone.vision is None or backbone.aligner is None:
-            raise ValueError("[HP-ENCODER-001] DeepSeek vision and aligner must be enabled")
+            raise ValueError("DeepSeek vision and aligner must be enabled")
         self.vision = backbone.vision
         self.aligner = backbone.aligner
 
@@ -163,20 +163,20 @@ class DeepseekV41VisionBridge:
         """
         if options.get("micro_batch_size") != 1:
             raise ValueError(
-                "[HP-ENCODER-014] encoder adapter does not support the requested micro batch; "
+                "encoder adapter does not support the requested micro batch; "
                 f"micro_batch_size={options.get('micro_batch_size')}; supported=(1,); "
                 "config_path=training.micro_batch_size"
             )
         if options.get("loss_parallel"):
             raise NotImplementedError(
-                "[HP-ENCODER-015] unsupported encoder loss layout; config_path=accelerator.loss_parallel"
+                "unsupported encoder loss layout; config_path=accelerator.loss_parallel"
             )
         forbidden = [name for name, module in self.vision.named_modules()
                      if isinstance(module, CheckpointWrapper)]
         forbidden.extend(name for name, module in self.aligner.named_modules()
                          if isinstance(module, CheckpointWrapper))
         if forbidden:
-            raise RuntimeError(f"[HP-ENCODER-010] vision activation checkpoint is unsupported: {forbidden}")
+            raise RuntimeError(f"vision activation checkpoint is unsupported: {forbidden}")
 
     def parse_images(self, batch: Mapping[str, Any]) -> tuple[EncoderWorkItem, ...]:
         """Validate native image metadata and expose complete image jobs.
@@ -207,7 +207,7 @@ class DeepseekV41VisionBridge:
                 sine = torch.zeros_like(cosine)
             else:
                 if pixels is None:
-                    raise ValueError("[HP-ENCODER-013] real image segment requires pixel_values")
+                    raise ValueError("real image segment requires pixel_values")
                 item = segment.item
                 full = pixels[item.payload_start:item.payload_stop]
                 local = full[segment.local_start:segment.local_start + segment.local_valid_length]
@@ -240,7 +240,7 @@ class DeepseekV41VisionBridge:
         """
         patches, cosine, sine = self._pack_local_inputs(batch, segments)
         if patches.shape[0] != sum(segment.local_padded_length for segment in segments):
-            raise ValueError("[HP-ENCODER-013] packed patch count does not match segment table")
+            raise ValueError("packed patch count does not match segment table")
         hidden = self.vision.patch_embed(patches)
         for block in self.vision.blocks:
             hidden = block(hidden, cosine, sine)

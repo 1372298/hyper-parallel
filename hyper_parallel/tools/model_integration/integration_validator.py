@@ -185,6 +185,7 @@ def _module_fqn(model: Any, target: Any) -> str:
 def _validate_gradient_domains(
     ownership: Iterable[ParameterOwnership],
 ) -> list[ModelIntegrationFinding]:
+    """Emit findings for conflicting ownership or gradient domains."""
     grouped = defaultdict(lambda: defaultdict(list))
     for entry in ownership:
         if entry.owner_fqn == "<unmanaged>" or entry.gradient_domain == "LOCAL":
@@ -209,7 +210,6 @@ def _validate_gradient_domains(
             continue
         findings.append(
             ModelIntegrationFinding(
-                code="HP-FSDP-006",
                 phase="D3",
                 owner_fqn=entries[0].parameter_fqn,
                 severity=FindingSeverity.ERROR,
@@ -232,7 +232,6 @@ def _validate_gradient_domains(
             }
             findings.append(
                 ModelIntegrationFinding(
-                    code="HP-FSDP-004",
                     phase="D3",
                     owner_fqn=owner_fqn,
                     severity=FindingSeverity.ERROR,
@@ -252,7 +251,6 @@ def _validate_gradient_domains(
         if owner_fqn == "<root>" and "EXPERT" in domains:
             findings.append(
                 ModelIntegrationFinding(
-                    code="HP-FSDP-005",
                     phase="D3",
                     owner_fqn=owner_fqn,
                     severity=FindingSeverity.ERROR,
@@ -271,6 +269,7 @@ def _validate_gradient_domains(
 
 
 def _validate_materialization(model: Any) -> list[ModelIntegrationFinding]:
+    """Emit findings for meta tensors and incomplete buffer rebuilds."""
     meta_state = []
     for name, value in (
         *model.named_parameters(remove_duplicate=False),
@@ -282,7 +281,6 @@ def _validate_materialization(model: Any) -> list[ModelIntegrationFinding]:
     if meta_state:
         findings.append(
             ModelIntegrationFinding(
-                code="HP-MAT-001",
                 phase="D4",
                 owner_fqn="<root>",
                 severity=FindingSeverity.ERROR,
@@ -317,7 +315,6 @@ def _validate_materialization(model: Any) -> list[ModelIntegrationFinding]:
     if invalid_rebuildable_buffers:
         findings.append(
             ModelIntegrationFinding(
-                code="HP-MAT-002",
                 phase="D4",
                 owner_fqn="<root>",
                 severity=FindingSeverity.ERROR,
@@ -335,6 +332,7 @@ def _validate_parameter_probes(
     model: Any,
     validation_spec: Optional[ModelValidationSpec],
 ) -> list[ModelIntegrationFinding]:
+    """Emit findings for required parameter probes that miss."""
     if validation_spec is None:
         return []
     parameter_names = tuple(name for name, _ in model.named_parameters(remove_duplicate=False))
@@ -344,7 +342,6 @@ def _validate_parameter_probes(
         if probe.required and not matches:
             findings.append(
                 ModelIntegrationFinding(
-                    code="HP-PREC-001",
                     phase="V0",
                     owner_fqn=probe.match,
                     severity=FindingSeverity.ERROR,
@@ -378,7 +375,6 @@ def validate_state_invariants(
         if invariant.phase not in phase_by_name:
             findings.append(
                 ModelIntegrationFinding(
-                    code="HP-SPEC-001",
                     phase="D1",
                     owner_fqn=invariant.name,
                     severity=FindingSeverity.ERROR,
@@ -398,7 +394,6 @@ def validate_state_invariants(
         facts = result if isinstance(result, Mapping) else {"result": result}
         findings.append(
             ModelIntegrationFinding(
-                code=invariant.error_code,
                 phase=phase_by_name[invariant.phase],
                 owner_fqn=invariant.name,
                 severity=FindingSeverity.ERROR,

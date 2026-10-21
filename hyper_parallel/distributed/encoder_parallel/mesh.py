@@ -30,7 +30,7 @@ def derive_reshaped_submesh(root_mesh: Any, *, source_dims: tuple[str, ...],
     """
     source = root_mesh[source_dims]
     if math.prod(target_sizes) != math.prod(source.mesh_shape) or len(target_sizes) != len(target_names):
-        raise ValueError("[HP-ENCODER-002] encoder mesh shape does not match decoder parent")
+        raise ValueError("encoder mesh shape does not match decoder parent")
     flat = source.flatten("encoder_parent")
     return flat._unflatten("encoder_parent", target_sizes, target_names)  # pylint: disable=protected-access
 

@@ -92,7 +92,6 @@ def _layout_mismatch_finding(
         actual: Any,
 ) -> ModelIntegrationFinding:
     return ModelIntegrationFinding(
-        code="HP-OPT-001",
         phase="D6",
         owner_fqn=parameter_fqn,
         severity=FindingSeverity.ERROR,
@@ -161,7 +160,6 @@ def validate_optimizer_layout(model: Any, optimizer: Any) -> list[ModelIntegrati
         ):
             findings.append(
                 ModelIntegrationFinding(
-                    code="HP-OPT-002",
                     phase="D8",
                     owner_fqn=parameter_fqn,
                     severity=FindingSeverity.ERROR,

@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -161,6 +160,7 @@ def _require_precision_handoff(
 
 
 def _build_declared_model(manifest: ValidationManifest, section_name: str) -> Any:
+    """Build the model declared by one manifest section."""
     section = getattr(manifest, section_name)
     builder = section.get("builder")
     if not isinstance(builder, Mapping):
@@ -190,6 +190,7 @@ def _inspect_side(
     manifest: ValidationManifest,
     section_name: str,
 ) -> ModelInventory:
+    """Collect the module inventory for one manifest section."""
     section = getattr(manifest, section_name)
     if isinstance(section.get("builder"), Mapping):
         return build_model_inventory(
@@ -292,7 +293,7 @@ def command_scaffold(args: argparse.Namespace) -> int:
         + '    """Return model-owned validation declarations."""\n'
         + "    return ModelValidationSpec()\n",
         destination / "validation.yaml": (
-            "schema_version: 1\n"
+            "schema_version: 2\n"
             f"model:\n  adapter: {family}\n"
             "launcher:\n"
             "  module: your.training.module\n"
@@ -334,18 +335,14 @@ def command_check(args: argparse.Namespace) -> int:
     except ManifestError:
         raise
     except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
-        match = re.search(r"\[(HP-[A-Z]+-[0-9]{3})\]", str(error))
-        code = match.group(1) if match is not None else "HP-BUILD-001"
-        phase = "D1" if code.startswith("HP-REPLACE") else "D2"
         finding = ModelIntegrationFinding(
-            code=code,
-            phase=phase,
+            phase="D2",
             owner_fqn="<model_builder>",
             severity=FindingSeverity.ERROR,
             message="final model construction failed before model integration could inspect the tree",
             facts={"error_type": type(error).__name__, "error": str(error)},
             why_unsafe="a partially built or partially planned model cannot enter training",
-            remediation="follow the coded replacement/planner error and rebuild the final model",
+            remediation="follow the replacement or planner error and rebuild the final model",
             related_config=("model.builder", "plan_overrides"),
         )
         report = ModelIntegrationReport(findings=[finding])
@@ -399,6 +396,7 @@ def command_check(args: argparse.Namespace) -> int:
 
 
 def _validation_spec(manifest: ValidationManifest) -> ModelValidationSpec:
+    """Resolve the model-owned validation spec from the adapter."""
     adapter = get_model_adapter(manifest.family)
     if adapter is None:
         raise ManifestError(f"no model adapter registered for {manifest.family!r}")
@@ -788,6 +786,7 @@ def _run_validation_case(
     case: Any,
     case_index: int,
 ) -> dict[str, Any]:
+    """Run one resolved validation case and return its report payload."""
     case_dir = store.path(f"cases/{case.name}")
     case_dir.mkdir(parents=True, exist_ok=True)
     resume_dir = case_dir / "resume_checkpoint"
@@ -997,7 +996,7 @@ def _report_entries(
     structure_entries = ["not executed"]
     if findings is not None:
         structure_entries = [
-            f"{finding['code']} {finding['severity']}: {finding['message']} "
+            f"{finding['severity']}: {finding['message']} "
             f"(fix: {finding.get('remediation') or 'n/a'})"
             for finding in findings.get("findings", ())
         ] or ["PASS: no ERROR findings"]
@@ -1858,6 +1857,7 @@ def command_report(args: argparse.Namespace) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="python -m hyper_parallel.tools.model_integration",
         description=__doc__,
