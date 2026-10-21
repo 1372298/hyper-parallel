@@ -79,6 +79,7 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
         return source
 
     def _check_case(self, factory, dtype: torch.dtype, route_dtype: torch.dtype, top_k: int, round_routes: bool):
+        """Compare one format and routing configuration with its legacy contract."""
         torch.manual_seed(20261020)
         module = GroupedExperts.from_module(self._source(dtype), fqn="experts", grouped_linear=factory())
         hidden = torch.randn(5, 4, dtype=dtype, requires_grad=True)
