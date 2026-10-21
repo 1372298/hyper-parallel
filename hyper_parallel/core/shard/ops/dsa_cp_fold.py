@@ -14,10 +14,19 @@
 # ============================================================================
 """Head-tail sequence folding for DSA context parallelism (causal load balance).
 
-With colossal CP every rank holds one contiguous slice of the sequence, so under a
-causal mask rank ``r`` needs the key prefix ``[0, (r + 1) * S / N)``: every DSA kernel
-whose cost grows with the key length (lightning indexer, sparse flash attention and
-its gradient, the indexer KL loss) gets linearly more expensive towards the last rank.
+Under fixed contiguous colossal CP, rank ``r`` needs the physical key prefix
+``[0, (r + 1) * S / N)``. Fixed folding balances physical prefix sums; packed
+document-local work and sparse-kernel time are not necessarily linear in that length.
+An optional immutable per-microbatch pair plan replaces the fixed chunk assignment.
+TND can additionally trim each KV prefix to its first active document, using host
+metadata attached once at model entry; the saved backward restores the folded layout.
+
+For sparse TND calls, global sequence-length tensors may carry two immutable host
+attributes: _hp_fold_pairs is a tuple of per-rank natural chunk-ID pairs, and
+_hp_compact_ends is a tuple of global cumulative document ends. The caller
+selects the matching Q chunks before model execution. Q/K metadata must describe
+the same layout and document boundaries; wrappers never read lengths from the
+device to build these plans. Omitting both attributes preserves fixed folding.
 
 Folding cuts the sequence into ``2N`` chunks of ``Sf = S / (2N)`` and gives rank ``r``
 chunk ``2r`` (block 0) followed by chunk ``2N - 2r - 1`` (block 1). The caller
@@ -38,7 +47,12 @@ Ported from the static-graph implementation (MindFormers ``dsa_lb_stage1``,
 ``training_graph/transformer/dsa/utils.py``); the chunk convention is the same one the
 generic head-tail flash-attention load balance in ``context_parallel.py`` uses.
 """
-from typing import Callable, Optional, Sequence, Tuple
+from bisect import bisect_left, bisect_right
+from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache, wraps
+from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -48,6 +62,9 @@ platform = get_platform()
 
 __all__ = [
     'dsa_cp_fold_requester',
+    'compact_pair_grad',
+    'fold_pairing',
+    'validate_fold_pairs',
     'check_fold_shapes',
     "set_dsa_cp_fold",
     "dsa_cp_fold_enabled",
@@ -100,19 +117,88 @@ def dsa_cp_fold_enabled() -> bool:
 # Chunk bookkeeping (pure Python, shared by forward and gradient paths)
 # ---------------------------------------------------------------------------
 
-def build_fold_order(seq_shards: int) -> list:
-    """Chunk permutation between folded and natural order (an involution).
+_PAIRING = ContextVar("dsa_fold_pairing", default=None)
+_COMPACT_ENDS = ContextVar("dsa_compact_document_ends", default=None)
 
-    Splitting the sequence into ``2N`` chunks, the folded full sequence holds true
+
+@lru_cache(maxsize=128)
+def validate_fold_pairs(pairs: tuple) -> tuple:
+    """Validate a complete immutable two-chunk partition."""
+    if (not pairs or any(len(row) != 2 for row in pairs)
+            or any(isinstance(x, bool) or not isinstance(x, int) for row in pairs for x in row)
+            or sorted(x for row in pairs for x in row) != list(range(2 * len(pairs)))):
+        raise ValueError("Fold pairs must partition the natural 2N chunks exactly once.")
+    return pairs
+
+
+@contextmanager
+def fold_pairing(pairs: Optional[tuple]) -> Iterator[None]:
+    """Scope a microbatch's immutable layout; never leak it into another forward."""
+    if pairs is not None:
+        pairs = validate_fold_pairs(pairs)
+    token = _PAIRING.set(pairs)
+    try:
+        yield
+    finally:
+        _PAIRING.reset(token)
+
+
+def _metadata_plan(values: Sequence[Any], attribute: str, description: str) -> Optional[tuple]:
+    """Require all Q/K metadata arguments to carry the same immutable plan."""
+    plans = [getattr(value, attribute, None) for value in values]
+    plans = [plan for plan in plans if plan is not None]
+    if not plans:
+        return None
+    if any(plan != plans[0] for plan in plans[1:]):
+        raise ValueError(f"Q/K sequence metadata carries different {description} plans.")
+    return plans[0]
+
+
+def _with_tensor_pairing(function: Callable) -> Callable:
+    """Decorate a kernel wrapper with its Q/K metadata scopes."""
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        """Scope the immutable metadata plan to one local kernel call."""
+        values = (*args, *kwargs.values())
+        pairs = _metadata_plan(values, "_hp_fold_pairs", "fold")
+        documents = _metadata_plan(values, "_hp_compact_ends", "compact document")
+        token = _COMPACT_ENDS.set(documents)
+        try:
+            with fold_pairing(pairs):
+                return function(*args, **kwargs)
+        finally:
+            _COMPACT_ENDS.reset(token)
+    return wrapped
+
+
+def build_fold_order(seq_shards: int) -> list:
+    """Folded source slots ordered by natural chunk ID.
+
+    The default mapping is an involution; dynamic layouts explicitly invert their
+    rank-major pair list. Splitting the sequence into ``2N`` chunks, the folded full sequence holds true
     chunk ``c if c is even else 2N - c`` at slot ``c``; applying the same list again
     maps back, so it serves both directions.
     """
+    # A dynamic permutation is generally not an involution: explicitly build its inverse.
     n = int(seq_shards)
+    pairs = _PAIRING.get()
+    if pairs is not None:
+        if len(pairs) != n:
+            raise ValueError("Fold plan does not match the sequence mesh.")
+        inverse = [0] * (2 * n)
+        for slot, chunk in enumerate(chunk for pair in pairs for chunk in pair):
+            inverse[chunk] = slot
+        return inverse
     return [c if c % 2 == 0 else 2 * n - c for c in range(2 * n)]
 
 
 def balanced_prefix_chunks(seq_shard_id: int, seq_shards: int, block_id: int) -> int:
     """Number of ``Sf`` chunks in one folded block's causal key prefix."""
+    pairs = _PAIRING.get()
+    if pairs is not None:
+        if len(pairs) != seq_shards or not 0 <= seq_shard_id < seq_shards or block_id not in (0, 1):
+            raise ValueError("Fold plan rank/block does not match the sequence mesh.")
+        return pairs[seq_shard_id][block_id] + 1
     if block_id == 0:
         return 2 * seq_shard_id + 1
     return 2 * (seq_shards - seq_shard_id)
@@ -142,7 +228,7 @@ def build_prefix_scatter_order(seq_shard_id: int, seq_shards: int, block_id: int
 # Tensor helpers
 # ---------------------------------------------------------------------------
 
-_INDEX_CACHE = {}
+_INDEX_CACHE = OrderedDict()
 
 
 def _index_tensor(values: Sequence[int], ref):
@@ -159,9 +245,97 @@ def _index_tensor(values: Sequence[int], ref):
     if idx is None or type(idx).__module__.split(".")[0] != backend:
         idx = platform.from_numpy(np.asarray(values, dtype=np.int32))
         _INDEX_CACHE[key] = idx
+        if len(_INDEX_CACHE) > 256:
+            _INDEX_CACHE.popitem(last=False)
     if backend == "torch":
         idx = idx.to(ref.device)
     return idx
+
+
+@lru_cache(maxsize=256)
+def _compact_plan(ends, full_len, rank, shards, pairs):
+    """Host-only active-document intervals and compact cumulative lengths."""
+    if (not ends or ends[-1] != full_len or any(a > b for a, b in zip((0,) + ends, ends))
+            or full_len % (2 * shards)):
+        raise ValueError("Compact TND KV requires monotonic document ends covering the folded full sequence.")
+    ends = tuple(dict.fromkeys(end for end in ends if end > 0))
+    width = full_len // (2 * shards)
+    chunks = pairs[rank] if pairs is not None else (2 * rank, 2 * shards - 1 - 2 * rank)
+    result = []
+    for chunk in chunks:
+        start, stop = chunk * width, (chunk + 1) * width
+        first, last = bisect_right(ends, start), bisect_left(ends, stop)
+        origin = ends[first - 1] if first else 0
+        selected = tuple(min(end, stop) for end in ends[first:last + 1])
+        result.append(((origin, stop), tuple(end - start for end in selected),
+                       tuple(end - origin for end in selected)))
+    return tuple(result)
+
+
+def _current_compact_plan(full_len, rank, shards):
+    """Build the active document intervals for the current metadata scope."""
+    ends = _COMPACT_ENDS.get()
+    return None if ends is None else _compact_plan(ends, full_len, rank, shards, _PAIRING.get())
+
+
+def _interval_select(x, interval, order):
+    """Gather only intersecting natural chunks, then trim the partial first chunk."""
+    start, stop = interval
+    width = x.shape[0] // len(order)
+    first, last = start // width, (stop + width - 1) // width
+    chunks = x.reshape((len(order), width) + tuple(x.shape[1:]))
+    selected = chunks.index_select(0, _index_tensor(order[first:last], x))
+    selected = selected.reshape(((last - first) * width,) + tuple(x.shape[1:]))
+    return selected.narrow(0, start - first * width, stop - start)
+
+
+def _zero_tokens(ref, length):
+    """Allocate a zero token span matching the reference tensor."""
+    return platform.zeros((length,) + tuple(ref.shape[1:]), dtype=ref.dtype, device=ref.device)
+
+
+def compact_pair_grad(grad0: Any, grad1: Any, intervals: tuple, order: tuple, full_len: int) -> Any:
+    """Merge overlapping document intervals and invert the folded gather once.
+
+    Uses chunk gathers and BF16 adds, avoiding a token index_add that promotes
+    full-length gradients to FP32 on Ascend. Inputs and saved plans are immutable.
+    """
+    gradients = (grad0, grad1)
+    active = [(interval, grad) for interval, grad in zip(intervals, gradients) if grad is not None]
+    if not active:
+        return None
+    ref = active[0][1]
+    width = full_len // len(order)
+    first = min(interval[0] for interval, _ in active) // width
+    last = (max(interval[1] for interval, _ in active) + width - 1) // width
+    edges = sorted({first * width, last * width, *(edge for interval, _ in active for edge in interval)})
+    parts = []
+    for start, stop in zip(edges[:-1], edges[1:]):
+        slices = [grad.narrow(0, start - interval[0], stop - start)
+                  for interval, grad in active if interval[0] <= start and stop <= interval[1]]
+        parts.append(slices[0] + slices[1] if len(slices) == 2 else
+                     slices[0] if slices else _zero_tokens(ref, stop - start))
+    parts.append(_zero_tokens(ref, width))
+    merged = platform.cat(parts, dim=0).reshape((last - first + 1, width) + tuple(ref.shape[1:]))
+    inverse = [last - first] * len(order)
+    for chunk in range(first, last):
+        inverse[order[chunk]] = chunk - first
+    return merged.index_select(0, _index_tensor(inverse, ref)).reshape((full_len,) + tuple(ref.shape[1:]))
+
+
+class _CompactPrefixPair(platform.Function):
+    """Differentiable active-document KV intervals with a saved per-forward layout."""
+
+    @staticmethod
+    def forward(ctx: Any, x: Any, intervals: tuple, order: tuple) -> tuple:  # pylint: disable=arguments-differ
+        """Gather active KV intervals and save their immutable mapping."""
+        ctx.compact_args = (intervals, order, x.shape[0])
+        return tuple(_interval_select(x, interval, order) for interval in intervals)
+
+    @staticmethod
+    def backward(ctx: Any, grad0: Any, grad1: Any) -> Any:  # pylint: disable=arguments-differ
+        """Restore both compact interval gradients to the saved folded layout."""
+        return compact_pair_grad(grad0, grad1, *ctx.compact_args), None, None
 
 
 def _chunked_shape(shape: tuple, seq_dim: int, chunks: int) -> tuple:
@@ -197,13 +371,14 @@ class _UnfoldPrefix(platform.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, seq_shard_id, seq_shards, block_id, seq_dim):  # pylint: disable=arguments-differ
+    def forward(ctx: Any, x: Any, seq_shard_id: Any, seq_shards: Any, block_id: Any, seq_dim: Any) -> Any:  # pylint: disable=arguments-differ
         """One folded block's causal key prefix."""
+        ctx.fold_pairs = _PAIRING.get()
         ctx.fold_args = (seq_shard_id, seq_shards, block_id, x.shape[seq_dim], seq_dim)
         return _unfold_prefix_select(x, seq_shard_id, seq_shards, block_id, seq_dim)
 
     @staticmethod
-    def backward(ctx, grad_output):  # pylint: disable=arguments-differ
+    def backward(ctx: Any, grad_output: Any) -> Any:  # pylint: disable=arguments-differ
         """Scatter the prefix-shaped gradient back onto the folded layout.
 
         The autograd default for ``index_select`` is a full-length ``index_add``, and
@@ -212,11 +387,12 @@ class _UnfoldPrefix(platform.Function):
         is exactly ``fold_prefix_grad`` (pad one zero chunk + one gather, stays bf16).
         """
         seq_shard_id, seq_shards, block_id, full_len, seq_dim = ctx.fold_args
-        grad = fold_prefix_grad(grad_output, seq_shard_id, seq_shards, block_id, full_len, seq_dim)
+        with fold_pairing(ctx.fold_pairs):
+            grad = fold_prefix_grad(grad_output, seq_shard_id, seq_shards, block_id, full_len, seq_dim)
         return grad, None, None, None, None
 
 
-def unfold_prefix(x, seq_shard_id: int, seq_shards: int, block_id: int, seq_dim: int = 1):
+def unfold_prefix(x: Any, seq_shard_id: int, seq_shards: int, block_id: int, seq_dim: int = 1) -> Any:
     """Natural-order causal key prefix of one folded block, from a folded full-length key.
 
     One ``index_select`` over whole chunks does both the un-fold and the prefix cut.
@@ -240,8 +416,9 @@ class _UnfoldPrefixPair(platform.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, seq_shard_id, seq_shards, seq_dim):  # pylint: disable=arguments-differ
+    def forward(ctx: Any, x: Any, seq_shard_id: Any, seq_shards: Any, seq_dim: Any) -> Any:  # pylint: disable=arguments-differ
         """Both folded blocks' causal key prefixes, gathered in one pass."""
+        ctx.fold_pairs = _PAIRING.get()
         full_len = x.shape[seq_dim]
         sf = full_len // (2 * seq_shards)
         m = (balanced_prefix_chunks(seq_shard_id, seq_shards, 0),
@@ -251,40 +428,41 @@ class _UnfoldPrefixPair(platform.Function):
                 _unfold_prefix_select(x, seq_shard_id, seq_shards, 1, seq_dim))
 
     @staticmethod
-    def backward(ctx, grad0, grad1):  # pylint: disable=arguments-differ
+    def backward(ctx: Any, grad0: Any, grad1: Any) -> Any:  # pylint: disable=arguments-differ
         """Merged reverse of both prefixes: the shorter one is a head of the longer one,
         so add it into that head and scatter back with a single gather."""
-        seq_shard_id, seq_shards, full_len, seq_dim, sf, m = ctx.fold_args
-        long_id = 0 if m[0] >= m[1] else 1
-        grads = (grad0, grad1)
-        g_long, g_short = grads[long_id], grads[1 - long_id]
-        if g_long is None and g_short is None:
-            return None, None, None, None
-        if g_long is None:
-            return fold_prefix_grad(g_short, seq_shard_id, seq_shards, 1 - long_id, full_len, seq_dim), \
-                None, None, None
-        parts = []
-        short_len = m[1 - long_id] * sf
-        long_len = m[long_id] * sf
-        if g_short is not None:
-            parts.append(g_long.narrow(seq_dim, 0, short_len) + g_short)
-            if long_len > short_len:
-                parts.append(g_long.narrow(seq_dim, short_len, long_len - short_len))
-        else:
-            parts.append(g_long)
-        zero_shape = list(g_long.shape)
-        zero_shape[seq_dim] = sf
-        parts.append(platform.zeros(tuple(zero_shape), dtype=g_long.dtype, device=g_long.device))
-        g = platform.cat(parts, dim=seq_dim)
-        g = g.reshape(_chunked_shape(g.shape, seq_dim, m[long_id] + 1))
-        g = g.index_select(seq_dim, _index_tensor(
-            build_prefix_scatter_order(seq_shard_id, seq_shards, long_id), g))
-        out_shape = list(g_long.shape)
-        out_shape[seq_dim] = full_len
-        return g.reshape(tuple(out_shape)), None, None, None
+        with fold_pairing(ctx.fold_pairs):
+            seq_shard_id, seq_shards, full_len, seq_dim, sf, m = ctx.fold_args
+            long_id = 0 if m[0] >= m[1] else 1
+            grads = (grad0, grad1)
+            g_long, g_short = grads[long_id], grads[1 - long_id]
+            if g_long is None and g_short is None:
+                return None, None, None, None
+            if g_long is None:
+                return fold_prefix_grad(g_short, seq_shard_id, seq_shards, 1 - long_id, full_len, seq_dim), \
+                    None, None, None
+            parts = []
+            short_len = m[1 - long_id] * sf
+            long_len = m[long_id] * sf
+            if g_short is not None:
+                parts.append(g_long.narrow(seq_dim, 0, short_len) + g_short)
+                if long_len > short_len:
+                    parts.append(g_long.narrow(seq_dim, short_len, long_len - short_len))
+            else:
+                parts.append(g_long)
+            zero_shape = list(g_long.shape)
+            zero_shape[seq_dim] = sf
+            parts.append(platform.zeros(tuple(zero_shape), dtype=g_long.dtype, device=g_long.device))
+            g = platform.cat(parts, dim=seq_dim)
+            g = g.reshape(_chunked_shape(g.shape, seq_dim, m[long_id] + 1))
+            g = g.index_select(seq_dim, _index_tensor(
+                build_prefix_scatter_order(seq_shard_id, seq_shards, long_id), g))
+            out_shape = list(g_long.shape)
+            out_shape[seq_dim] = full_len
+            return g.reshape(tuple(out_shape)), None, None, None
 
 
-def unfold_prefix_pair(x, seq_shard_id: int, seq_shards: int, seq_dim: int = 1):
+def unfold_prefix_pair(x: Any, seq_shard_id: int, seq_shards: int, seq_dim: int = 1) -> Any:
     """``(unfold_prefix(x, .., 0), unfold_prefix(x, .., 1))`` with one merged backward."""
     if x is None:
         return None, None
@@ -293,10 +471,14 @@ def unfold_prefix_pair(x, seq_shard_id: int, seq_shards: int, seq_dim: int = 1):
         raise ValueError(
             f"DSA CP fold needs the key sequence ({x.shape[seq_dim]}) to be a multiple of 2 * cp ({twon})."
         )
+    plan = _current_compact_plan(x.shape[seq_dim], seq_shard_id, seq_shards) if seq_dim == 0 else None
+    if plan is not None:
+        return _CompactPrefixPair.apply(x, tuple(item[0] for item in plan), tuple(build_fold_order(seq_shards)))
     return _UnfoldPrefixPair.apply(x, seq_shard_id, seq_shards, seq_dim)
 
 
-def fold_prefix_grad(grad, seq_shard_id: int, seq_shards: int, block_id: int, full_len: int, seq_dim: int = 1):
+def fold_prefix_grad(grad: Any, seq_shard_id: int, seq_shards: int, block_id: int,
+                     full_len: int, seq_dim: int = 1) -> Any:
     """Scatter a key-side gradient computed on one block's prefix back onto the folded layout.
 
     Needed where a fused kernel returns the key gradient itself (the indexer KL loss):
@@ -317,7 +499,7 @@ def fold_prefix_grad(grad, seq_shard_id: int, seq_shards: int, block_id: int, fu
     return g.reshape(tuple(out_shape))
 
 
-def split_half(x, dim: int) -> Tuple[Optional[object], Optional[object]]:
+def split_half(x: Any, dim: int) -> Tuple[Optional[object], Optional[object]]:
     """Split a query-side tensor into its two folded blocks (views)."""
     if x is None:
         return None, None
@@ -326,6 +508,7 @@ def split_half(x, dim: int) -> Tuple[Optional[object], Optional[object]]:
 
 
 def _cat_pair(a, b, dim: int):
+    """Concatenate the two folded block outputs along their sequence axis."""
     return platform.cat([a, b], dim=dim)
 
 
@@ -364,8 +547,8 @@ def _check_klen_covers_full_len(actual_seq_klen, full_len) -> None:
             f"Pack without tail padding, or turn dsa_enable_load_balance off.")
 
 
-def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
-                       seq_shard_id: int, seq_shards: int, block_id: int):
+def tnd_block_seq_lens(actual_seq_qlen: Any, actual_seq_klen: Any, full_len: int,
+                       seq_shard_id: int, seq_shards: int, block_id: int) -> Any:
     """Per-block ``(actual_seq_qlen, actual_seq_klen)`` for one folded TND block.
 
     This is the **only new semantics** the TND fold needs. Under BSND the causal prefix is
@@ -405,6 +588,10 @@ def tnd_block_seq_lens(actual_seq_qlen, actual_seq_klen, full_len: int,
     """
     if actual_seq_qlen is None or actual_seq_klen is None:
         return actual_seq_qlen, actual_seq_klen
+    plan = _current_compact_plan(full_len, seq_shard_id, seq_shards)
+    if plan is not None:
+        _, query_ends, key_ends = plan[block_id]
+        return _index_tensor(query_ends, actual_seq_qlen), _index_tensor(key_ends, actual_seq_klen)
     _check_klen_covers_full_len(actual_seq_klen, full_len)
     sf = int(full_len) // (2 * int(seq_shards))
     # The block's causal prefix spans this many Sf chunks, so its own chunk ends the prefix.
@@ -434,7 +621,7 @@ def _same_sequence_type(original, items):
     return type(original)(items)
 
 
-def check_fold_shapes(local_q, key, seq_shards: int, seq_dim: int = 1) -> None:
+def check_fold_shapes(local_q: Any, key: Any, seq_shards: int, seq_dim: int = 1) -> None:
     """Catch an N mismatch between who sliced the data and who folds it.
 
     ``seq_shards`` is how many ways the *sequence* is split, which is **not always CP**:
@@ -465,14 +652,14 @@ def check_fold_shapes(local_q, key, seq_shards: int, seq_dim: int = 1) -> None:
         )
 
 
-def fold_lightning_indexer(func: Callable, seq_shard_id: int, seq_shards: int, *args,
-                           fold_layout: str = "BSND", **kwargs):
+@_with_tensor_pairing
+def fold_lightning_indexer(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
+                           fold_layout: str = "BSND", **kwargs: Any) -> Any:
     """``lightning_indexer(query, key, weights, ...)``: Top-K indices/scores per block.
 
-    The indices of each block address that block's natural-order key prefix, which is
-    exactly the key the sparse attention and the KL loss see for the same block -- and
-    because the prefix is a natural-order truncation, an index is the same number in the
-    prefix as in the whole sequence, so nothing has to be remapped afterwards.
+    Each block's indices are consumed unchanged by sparse attention and KL with
+    exactly the same key interval and document metadata. In TND the kernels use
+    document-local indices; trimming inactive documents does not add a token offset.
 
     ``fold_layout='TND'``: the token axis is dim 0 and the causal window comes from
     ``actual_seq_lengths_query/key``, which are restated per block (see
@@ -503,8 +690,9 @@ def fold_lightning_indexer(func: Callable, seq_shard_id: int, seq_shards: int, *
     return _same_sequence_type(out0, (_cat_pair(a, b, seq_dim) for a, b in zip(out0, out1)))
 
 
-def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: int, *args,
-                                fold_layout: str = "BSND", **kwargs):
+@_with_tensor_pairing
+def fold_sparse_flash_attention(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
+                                fold_layout: str = "BSND", **kwargs: Any) -> Any:
     """``sparse_flash_attention(query, key, value, sparse_indices, scale, **kw)`` per block.
 
     BSND: ``attention_out`` is stitched on seq dim 1; ``softmax_max/sum`` are
@@ -568,8 +756,9 @@ SPARSE_KL_MIN_ARGS = {"BSND": 11, "TND": 13}
 DENSE_KL_MIN_ARGS = {"BSND": 12, "TND": 14}
 
 
-def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args,
-                                fold_layout: str = "BSND"):
+@_with_tensor_pairing
+def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
+                                fold_layout: str = "BSND") -> Any:
     """Sparse indexer KL loss per block, MindSpore positional form (17 args).
 
     Query-side inputs split on the sequence axis except the softmax stats, which carry the
@@ -612,11 +801,15 @@ def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: i
 
     d_qi0, d_ki0, d_w0, loss0 = _block(0)
     d_qi1, d_ki1, d_w1, loss1 = _block(1)
-    d_key_index = (fold_prefix_grad(d_ki0, seq_shard_id, seq_shards, 0, full_len, seq_dim)
-                   + fold_prefix_grad(d_ki1, seq_shard_id, seq_shards, 1, full_len, seq_dim))
+    compact_plan = _current_compact_plan(full_len, seq_shard_id, seq_shards) if tnd else None
+    if compact_plan is not None:
+        d_key_index = compact_pair_grad(d_ki0, d_ki1, tuple(item[0] for item in compact_plan),
+                                       tuple(build_fold_order(seq_shards)), full_len)
+    else:
+        d_key_index = (fold_prefix_grad(d_ki0, seq_shard_id, seq_shards, 0, full_len, seq_dim)
+                       + fold_prefix_grad(d_ki1, seq_shard_id, seq_shards, 1, full_len, seq_dim))
     return (_cat_pair(d_qi0, d_qi1, seq_dim), d_key_index,
             _cat_pair(d_w0, d_w1, seq_dim), loss0 + loss1)
-
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +819,7 @@ def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: i
 # in natural order and a block's causal prefix is simply its first ``m`` chunks.
 # ---------------------------------------------------------------------------
 
-def natural_prefix(x, seq_shard_id: int, seq_shards: int, block_id: int, seq_dim: int = 1):
+def natural_prefix(x: Any, seq_shard_id: int, seq_shards: int, block_id: int, seq_dim: int = 1) -> Any:
     """One folded block's causal key prefix out of a natural-order full-length key.
 
     Folded block ``b`` of rank ``r`` is natural chunk ``2r`` (b=0) or ``2N-2r-1`` (b=1),
@@ -644,7 +837,7 @@ def natural_prefix(x, seq_shard_id: int, seq_shards: int, block_id: int, seq_dim
     return x.narrow(seq_dim, 0, balanced_prefix_chunks(seq_shard_id, seq_shards, block_id) * sf)
 
 
-def natural_prefix_grad(grad, full_len: int, seq_dim: int = 1):
+def natural_prefix_grad(grad: Any, full_len: int, seq_dim: int = 1) -> Any:
     """Pad a prefix-shaped key gradient back to full length with zeros at the tail.
 
     The natural-order prefix is a leading slice, so unlike ``fold_prefix_grad`` nothing
@@ -666,8 +859,8 @@ _DENSE_LSE_ACTUAL_SEQ_QLEN_IDX = 3
 _DENSE_LSE_ACTUAL_SEQ_KLEN_IDX = 4
 
 
-def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, seq_shards: int, *args,
-                                             fold_layout: str = "BSND", **kwargs):
+def fold_dense_lightning_indexer_softmax_lse(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
+                                             fold_layout: str = "BSND", **kwargs: Any) -> Any:
     """Dense (stage-1) indexer softmax statistics per block.
 
     ``args``: query_index, key_index, weights, then scalars/options. The query side holds
@@ -720,8 +913,8 @@ _DENSE_KL_ACTUAL_SEQ_QLEN_IDX = 12
 _DENSE_KL_ACTUAL_SEQ_KLEN_IDX = 13
 
 
-def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args,
-                               fold_layout: str = "BSND"):
+def fold_dense_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: int, *args: Any,
+                               fold_layout: str = "BSND") -> Any:
     """Dense (stage-1) indexer KL loss per block, MindSpore positional form (18 args).
 
     Unlike the sparse loss this one has no ``sparse_indices`` and carries two extra
