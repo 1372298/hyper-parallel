@@ -78,6 +78,7 @@ class TestGroupedExpertsRoutingPrecision(unittest.TestCase):
         source.act_fn = nn.SiLU()
         return source
 
+
     def _check_case(self, factory, dtype: torch.dtype, route_dtype: torch.dtype, top_k: int, round_routes: bool):
         """Compare one format and routing configuration with its legacy contract."""
         torch.manual_seed(20261020)
