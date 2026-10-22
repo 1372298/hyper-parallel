@@ -109,6 +109,7 @@ class TestLoadBalanceLossMegatronParity(unittest.TestCase):
     Both are valid implementations but measure slightly different things.
     """
 
+
     def test_semantic_difference_documentation(self):
         """Document the semantic difference between implementations.
 
@@ -142,7 +143,13 @@ class TestLoadBalanceLossMegatronParity(unittest.TestCase):
         hp_prob_sum.scatter_add_(0, flat_experts, flat_scores)
         hp_prob_total = hp_prob_sum.sum().item()
 
-        self.assertEqual(megatron_prob_total, num_tokens, "Megatron prob sum should equal num_tokens")
+        # float32 accumulation over num_tokens * num_experts softmax probs
+        # leaves ~1e-5 absolute error (observed 7.6e-6); compare with a
+        # tolerance instead of exact equality.
+        self.assertAlmostEqual(
+            megatron_prob_total, float(num_tokens), delta=1e-5,
+            msg="Megatron prob sum should equal num_tokens (up to fp32 rounding)",
+        )
         self.assertLess(hp_prob_total, num_tokens, "HP prob sum should be < num_tokens (only top-k)")
 
     def test_formula_equivalence_with_same_input(self):
