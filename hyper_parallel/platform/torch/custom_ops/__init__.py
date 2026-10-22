@@ -20,6 +20,7 @@
 Custom operators are currently MindSpore-only.  Calling them from PyTorch
 raises ``NotImplementedError``.
 """
+from typing import Any
 
 
 class TorchCustomOps:
@@ -76,6 +77,20 @@ class TorchCustomOps:
         """NPU MHC pre-clamp-Sinkhorn operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_mhc_pre_clamp_sinkhorn is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_mhc_pre_cmhc(*args: Any, **kwargs: Any) -> Any:
+        """NPU MHC pre-CMHC operator; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_mhc_pre_cmhc is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_situ_glu(*args: Any, **kwargs: Any) -> Any:
+        """NPU SiTU-GLU operator; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_situ_glu is not supported on the PyTorch platform."
         )
 
     @staticmethod
