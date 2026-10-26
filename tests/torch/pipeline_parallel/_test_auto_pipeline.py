@@ -60,7 +60,7 @@ def _run_case(mesh, device: torch.device, schedule: str, split: list,
             distributed_setup=SimpleNamespace(pipeline_config=config, pipeline_batch_size=4),
         )
         assert all(not parameter.is_meta for parameter in pipeline.parameters())
-        assert all(stage.device == device for stage in pipeline.info.stages)
+        assert all(stage.device.type == device.type for stage in pipeline.info.stages)
         for part in pipeline.parts:
             keys = set(part.state_dict())
             part.load_state_dict({name: value for name, value in reference.state_dict().items() if name in keys})

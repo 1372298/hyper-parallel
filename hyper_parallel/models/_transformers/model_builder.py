@@ -785,8 +785,8 @@ def apply_model_infrastructure(
             # Keep the same lifecycle as the non-PP path: construct the stage
             # on meta, apply all stage-local planners/FSDP, then let the outer
             # model materialization create storage and load/initialize values.
-            # The runtime communication device is supplied separately below;
-            # it must not be inferred from these meta parameters.
+            # PipelineStage resolves its communication device independently
+            # from these meta parameters using the current accelerator.
             stage_model, source_shard_info = _plan_and_apply_sharding(
                 stage_model,
                 mesh,
@@ -815,7 +815,6 @@ def apply_model_infrastructure(
             model,
             parallelize_fn=_parallelize_stage,
             batch_size=getattr(distributed_setup, "pipeline_batch_size", None),
-            runtime_device=device,
         )
         model = _materialize_and_load_model(
             model,

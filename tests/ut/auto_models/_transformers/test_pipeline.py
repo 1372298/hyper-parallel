@@ -190,7 +190,7 @@ class TestAutoPipeline(unittest.TestCase):
             with self.subTest(batch_size=batch_size), self.assertRaisesRegex(ValueError, "DP-local batch"):
                 AutoPipeline(_FakePPMesh(0), config).build(model, batch_size=batch_size)
 
-    def test_meta_build_uses_runtime_device_before_materialization(self):
+    def test_meta_build_uses_current_accelerator_before_materialization(self):
         """PP communication never derives its device from meta stage parameters."""
         with torch.device("meta"):
             model = _tiny_qwen3()
@@ -199,16 +199,14 @@ class TestAutoPipeline(unittest.TestCase):
             with self.subTest(schedule=schedule):
                 config = PipelineConfig(enabled=True, schedule=schedule, split=split)
                 pipeline = AutoPipeline(_FakePPMesh(0), config)
-                with self.assertRaisesRegex(ValueError, "real runtime_device"):
-                    pipeline.build(model)
                 seen_meta = []
 
                 def parallelize(part):
                     seen_meta.append(all(parameter.is_meta for parameter in part.parameters()))
                     return part
 
-                pipeline.build(model, parallelize_fn=parallelize, batch_size=4,
-                               runtime_device=torch.device("cpu"))
+                with patch("torch.accelerator.current_accelerator", return_value=torch.device("cpu")):
+                    pipeline.build(model, parallelize_fn=parallelize, batch_size=4)
                 self.assertTrue(all(seen_meta))
                 self.assertTrue(all(parameter.is_meta for parameter in pipeline.parameters()))
                 for stage in pipeline.info.stages:
