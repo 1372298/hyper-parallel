@@ -29,3 +29,14 @@ def test_qwen3_pipeline_splits_match_reference() -> None:
         "test_qwen3_pipeline_splits_match_reference",
         num_proc=4,
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_qwen3_meta_pipeline_fsdp_matches_reference() -> None:
+    """Check meta construction through PP/FSDP materialization on four NPUs."""
+    torchrun_case(
+        str(Path(__file__).with_name("_test_auto_pipeline.py")),
+        "test_qwen3_meta_pipeline_fsdp_matches_reference",
+        num_proc=4,
+    )

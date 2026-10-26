@@ -561,12 +561,10 @@ def _materialize_and_load_model(
     load_base_model: bool,
     pretrained_path: Optional[str],
     weights_mapping: Any,
-    already_materialized: bool = False,
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
-    if not already_materialized:
-        model = _move_model_to_device(model, is_meta_device, device)
-    if not is_meta_device and not already_materialized:
+    model = _move_model_to_device(model, is_meta_device, device)
+    if not is_meta_device:
         return model
     external = get_model_external_state(model)
     external_result = None
@@ -784,16 +782,11 @@ def apply_model_infrastructure(
 
         def _parallelize_stage(stage_model: nn.Module) -> nn.Module:
             """Apply AutoModel parallelism to one already-split PP stage."""
-            # ``fully_shard`` tracks DTensor parameter storage internally.  A
-            # later ``PipelineModel.to_empty`` cannot reliably materialize
-            # those DTensors after they have been wrapped, so materialize each
-            # pruned stage before applying TP/CP/EP and FSDP2.  This preserves
-            # the deferred-loading contract while giving HSDP real local
-            # shards for the first schedule unshard.
-            if is_meta_device:
-                if device is None:
-                    raise RuntimeError("PP meta construction requires an explicit device")
-                stage_model.to_empty(device=device)
+            # Keep the same lifecycle as the non-PP path: construct the stage
+            # on meta, apply all stage-local planners/FSDP, then let the outer
+            # model materialization create storage and load/initialize values.
+            # The runtime communication device is supplied separately below;
+            # it must not be inferred from these meta parameters.
             stage_model, source_shard_info = _plan_and_apply_sharding(
                 stage_model,
                 mesh,
@@ -822,6 +815,7 @@ def apply_model_infrastructure(
             model,
             parallelize_fn=_parallelize_stage,
             batch_size=getattr(distributed_setup, "pipeline_batch_size", None),
+            runtime_device=device,
         )
         model = _materialize_and_load_model(
             model,
@@ -830,7 +824,6 @@ def apply_model_infrastructure(
             load_base_model=load_base_model,
             pretrained_path=pretrained_path,
             weights_mapping=weights_mapping,
-            already_materialized=is_meta_device,
         )
         apply_model_init_dtype(model, model_init_dtype)
         if compile_for_execution:

@@ -190,6 +190,34 @@ class TestAutoPipeline(unittest.TestCase):
             with self.subTest(batch_size=batch_size), self.assertRaisesRegex(ValueError, "DP-local batch"):
                 AutoPipeline(_FakePPMesh(0), config).build(model, batch_size=batch_size)
 
+    def test_meta_build_uses_runtime_device_before_materialization(self):
+        """PP communication never derives its device from meta stage parameters."""
+        with torch.device("meta"):
+            model = _tiny_qwen3()
+        for schedule, split in [("1f1b", [2, 2]),
+                                ("interleaved1f1b", [[1, 1], [1, 1]])]:
+            with self.subTest(schedule=schedule):
+                config = PipelineConfig(enabled=True, schedule=schedule, split=split)
+                pipeline = AutoPipeline(_FakePPMesh(0), config)
+                with self.assertRaisesRegex(ValueError, "real runtime_device"):
+                    pipeline.build(model)
+                seen_meta = []
+
+                def parallelize(part):
+                    seen_meta.append(all(parameter.is_meta for parameter in part.parameters()))
+                    return part
+
+                pipeline.build(model, parallelize_fn=parallelize, batch_size=4,
+                               runtime_device=torch.device("cpu"))
+                self.assertTrue(all(seen_meta))
+                self.assertTrue(all(parameter.is_meta for parameter in pipeline.parameters()))
+                for stage in pipeline.info.stages:
+                    self.assertEqual(stage.device, torch.device("cpu"))
+                pipeline.to_empty(device="cpu")
+                self.assertTrue(all(not parameter.is_meta for parameter in pipeline.parameters()))
+                for part, stage in zip(pipeline.parts, pipeline.info.stages):
+                    self.assertIs(stage.submodule, part)
+
     def test_vpp_local_chunks_parallelization_and_checkpoint_aliases(self):
         """Each local chunk is transformed independently and retains checkpoint aliases."""
         model = _tiny_qwen3(10)

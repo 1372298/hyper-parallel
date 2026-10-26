@@ -323,7 +323,8 @@ class AutoPipeline(nn.Module):
 
     def build(self, model: nn.Module, *, loss_fn: Callable | None = None,
               parallelize_fn: Callable[[nn.Module], nn.Module] | None = None,
-              batch_size: int | None = None) -> "AutoPipeline":
+              batch_size: int | None = None,
+              runtime_device: torch.device | None = None) -> "AutoPipeline":
         """Split and parallelize a model for one DP-local optimizer-step batch.
 
         Args:
@@ -332,6 +333,9 @@ class AutoPipeline(nn.Module):
             parallelize_fn: Stage-local TP/CP/EP/FSDP transformation.
             batch_size: DP-local batch size, derived by Trainer. Defaults to
                 one pipeline micro-batch for standalone callers.
+            runtime_device: Device used for PP communication buffers. This is
+                independent of parameter storage and must be supplied when the
+                model is constructed on ``meta``.
         """
         if not self.pipeline_config.enabled:
             raise ValueError("AutoPipeline.build requires pipeline.enabled=true")
@@ -339,6 +343,11 @@ class AutoPipeline(nn.Module):
         if (type(batch_size) is not int or batch_size <= 0
                 or batch_size % self.pipeline_config.pp_microbatch_size != 0):
             raise ValueError("DP-local batch size must be positive and divisible by pipeline.pp_microbatch_size")
+        if runtime_device is None:
+            runtime_device = next(model.parameters()).device
+        runtime_device = torch.device(runtime_device)
+        if runtime_device.type == "meta":
+            raise ValueError("AutoPipeline.build requires a real runtime_device for meta models")
         self.loss_fn = loss_fn or self.loss_fn
         assignments = _stage_assignments(model, self.pp_mesh.size(), self.pipeline_config)
         pp_rank = self.pp_mesh.get_local_rank()
@@ -356,7 +365,7 @@ class AutoPipeline(nn.Module):
                 stage_index=stage_index,
                 stage_num=len(assignments),
                 mesh=self.pp_mesh,
-                device=next(part.parameters()).device,
+                device=runtime_device,
                 dyn_shape=self.pipeline_config.dynamic_shape,
             ))
         self.parts = nn.ModuleList(parts)
