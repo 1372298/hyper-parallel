@@ -72,13 +72,10 @@ std::vector<ms::Tensor> npu_sparse_lightning_indexer_grad_kl_loss(
   ms::TensorToDevice(query, key, query_index, key_index, weights, sparse_indices, softmax_max, softmax_sum,
                      query_rope_t, key_rope_t);
   ms::TensorAllocate({d_query_index, d_key_index, d_weights, loss});
-  // CANN 9.2's V1 compatibility path inserts a sinks slot internally, which can
-  // misalign tensor address updates when MindSpore reuses the cached executor.
-  // Call V2 with an explicit null sinks argument to match the executor schema.
-  MS_DISPATCH_ACLNN(aclnnSparseLightningIndexerGradKLLossV2, query, key, query_index, key_index, weights,
-                    sparse_indices, softmax_max, softmax_sum, query_rope, key_rope, actual_seq_qlen_pair,
-                    actual_seq_klen_pair, nullptr, scale_value, layout_str, sparse_mode_val, pre_tokens_val,
-                    next_tokens_val, deterministic, d_query_index, d_key_index, d_weights, loss);
+  MS_DISPATCH_ACLNN(aclnnSparseLightningIndexerGradKLLoss, query, key, query_index, key_index, weights, sparse_indices,
+                    softmax_max, softmax_sum, query_rope, key_rope, actual_seq_qlen_pair, actual_seq_klen_pair,
+                    scale_value, layout_str, sparse_mode_val, pre_tokens_val, next_tokens_val, deterministic,
+                    d_query_index, d_key_index, d_weights, loss);
   return {d_query_index, d_key_index, d_weights, loss};
 }
 

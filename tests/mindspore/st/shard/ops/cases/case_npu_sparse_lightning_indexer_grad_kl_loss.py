@@ -166,21 +166,23 @@ def _derived(sm_max_fn, sm_sum_fn, sm_pl):
 _CMP = CompareSpec.allclose(rtol=1e-2, atol=1e-2)
 
 
-def _reg(name, fn, inputs, placements, derived, mesh, names):
+def _reg(name, fn, inputs, placements, derived, mesh, names, *, tag="npu_level0"):
     register(OpShardCase(name=name, fn=fn, inputs=inputs, placements=placements,
                          derived_inputs=derived, compare=_CMP, mesh_shape=mesh,
-                         mesh_dim_names=names, tags=("npu_level0",)))
+                         mesh_dim_names=names, tags=(tag,)))
 
 
+# Keep the two replicated cases in level1 pending a CANN 9.2 V1 executor reuse fix.
+# Switching the operator to V2 would break compatibility with CANN 9.1.
 _reg("sparse_grad_kl_loss_ops_bsnd_replicated", _grad_kl_loss_bsnd, _bsnd_inputs(),
-     _BSND_REPL, _derived(_sm_max_bsnd, _sm_sum_bsnd, (Replicate(),)), (2,), ("dp",))
+     _BSND_REPL, _derived(_sm_max_bsnd, _sm_sum_bsnd, (Replicate(),)), (2,), ("dp",), tag="npu_level1")
 _reg("sparse_grad_kl_loss_ops_bsnd_dp", _grad_kl_loss_bsnd, _bsnd_inputs(),
      _BSND_DP, _derived(_sm_max_bsnd, _sm_sum_bsnd, (Shard(0),)), (2,), ("dp",))
 _reg("sparse_grad_kl_loss_ops_bsnd_dp_cp", _grad_kl_loss_bsnd, _bsnd_inputs(),
      _BSND_DP_CP, _derived(_sm_max_bsnd, _sm_sum_bsnd, (Shard(0), Shard(2))),
      (2, 2), ("dp", "tp"))
 _reg("sparse_grad_kl_loss_ops_tnd_replicated", _grad_kl_loss_tnd, _tnd_inputs(),
-     _TND_REPL, _derived(_sm_max_tnd, _sm_sum_tnd, (Replicate(),)), (2,), ("dp",))
+     _TND_REPL, _derived(_sm_max_tnd, _sm_sum_tnd, (Replicate(),)), (2,), ("dp",), tag="npu_level1")
 _reg("sparse_grad_kl_loss_ops_tnd_dp", _grad_kl_loss_tnd, _tnd_inputs(),
      _TND_DP, _derived(_sm_max_tnd, _sm_sum_tnd, (Shard(1),)), (2,), ("dp",))
 _reg("sparse_grad_kl_loss_ops_tnd_dp_cp", _grad_kl_loss_tnd, _tnd_inputs(),
