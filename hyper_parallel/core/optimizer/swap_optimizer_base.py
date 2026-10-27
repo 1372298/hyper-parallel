@@ -43,6 +43,32 @@ _DEVICE_TYPE = "npu"
 _MISSING_CHECKPOINT_STATE = object()
 
 
+def _restore_dtensor_metadata(template: Any, local_tensor: Any) -> Any:
+    """Wrap a local tensor with the logical DTensor layout of ``template``."""
+    to_local = getattr(template, "to_local", None)
+    if not callable(to_local):
+        return local_tensor
+
+    layout = getattr(template, "layout", None)
+    if hasattr(layout, "tensor_stride"):
+        logical_stride = layout.tensor_stride
+    else:
+        logical_stride = tuple(template.stride())
+    if logical_stride is None:
+        logical_stride = [1] * len(template.shape)
+        for index in range(len(logical_stride) - 2, -1, -1):
+            logical_stride[index] = logical_stride[index + 1] * max(int(template.shape[index + 1]), 1)
+
+    return type(template).from_local(
+        local_tensor,
+        device_mesh=template.device_mesh,
+        placements=template.placements,
+        run_check=False,
+        shape=template.shape,
+        stride=tuple(logical_stride),
+    )
+
+
 @dataclass
 class SwapSlot:
     """One logical optimizer state tensor that may be swapped."""
@@ -680,33 +706,20 @@ class PipelineSwapRuntime:
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
         return saved_tensor.detach().to(device=param.device, dtype=saved_tensor.dtype).clone()
 
-    @staticmethod
-    def make_empty_device_tensor_like(param: Any, saved_tensor: Any) -> Any:
+    def make_empty_device_tensor_like(self, param: Any, saved_tensor: Any) -> Any:
         """Create an uninitialized live state tensor shell on the parameter device."""
         if not isinstance(saved_tensor, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
+        if self.is_distributed_tensor(param):
+            return self.make_empty_state_like(param)
         return torch.empty_like(saved_tensor, device=param.device, dtype=saved_tensor.dtype)
 
     def make_empty_state_like(self, param: Any) -> Any:
         """Allocate a state shell with the parameter's local and logical metadata."""
         local = torch.empty_like(self._storage_tensor(param), memory_format=torch.preserve_format)
-        if not self.is_distributed_tensor(param):
-            return local
-        layout = getattr(param, "layout", None)
-        if hasattr(layout, "tensor_stride"):
-            logical_stride = layout.tensor_stride
-        else:
-            logical_stride = tuple(param.stride())
-        if logical_stride is None:
-            logical_stride = [1] * len(param.shape)
-            for index in range(len(logical_stride) - 2, -1, -1):
-                logical_stride[index] = logical_stride[index + 1] * max(int(param.shape[index + 1]), 1)
         # Explicit from_local preserves layout even inside SkipDTensorDispatch,
         # where empty_like(param) would otherwise return a plain local tensor.
-        return type(param).from_local(
-            local, device_mesh=param.device_mesh, placements=param.placements,
-            run_check=False, shape=param.shape, stride=tuple(logical_stride),
-        )
+        return _restore_dtensor_metadata(param, local)
 
     def copy_to_device(self, slot: SwapSlot) -> None:
         """Copy one CPU mirror to device tensor."""
@@ -1581,7 +1594,8 @@ class StateSwapAdapter:
             for key in self._state_keys_for_param(param):
                 slot = self._slots.get((id(param), key))
                 if self.has_host_mirror(slot, key, saved_state):
-                    exported_state[key] = slot.cpu_tensor.detach().clone()
+                    local_copy = slot.cpu_tensor.detach().clone()
+                    exported_state[key] = _restore_dtensor_metadata(param, local_copy)
             for key, value in saved_state.items():
                 if key not in exported_state:
                     exported_state[key] = self._copy_checkpoint_value(value)
@@ -1593,16 +1607,17 @@ class StateSwapAdapter:
         """Clone checkpoint values without dispatching ``deepcopy`` on DTensor.
 
         HSDP state broadcasts may leave a distributed tensor in the wrapped
-        optimizer state.  Hyper DTensor intentionally rejects unregistered
-        ``__deepcopy__`` dispatch, so normalize distributed tensors to their
-        local shards before cloning.  Nested containers are copied recursively;
+        optimizer state. Hyper DTensor intentionally rejects unregistered
+        ``__deepcopy__`` dispatch, so clone its local shard and restore the
+        global layout explicitly. Nested containers are copied recursively;
         scalar metadata still uses regular ``copy.deepcopy`` semantics.
         """
         if isinstance(value, torch.Tensor):
             to_local = getattr(value, "to_local", None)
             local = to_local() if callable(to_local) else value
             if local is not value:
-                return local.detach().cpu().clone()
+                local_copy = local.detach().cpu().clone()
+                return _restore_dtensor_metadata(value, local_copy)
             return copy.deepcopy(value)
         if isinstance(value, dict):
             return {
@@ -1805,9 +1820,11 @@ class StateSwapAdapter:
         """Cast swappable state dtype like PyTorch while keeping values on CPU."""
         if not isinstance(saved_tensor, torch.Tensor):
             raise ValueError(f"Expected torch.Tensor in optimizer state, got {type(saved_tensor)!r}.")
+        to_local = getattr(saved_tensor, "to_local", None)
+        source = to_local() if callable(to_local) else saved_tensor
         if param.is_floating_point():
-            return saved_tensor.detach().to(dtype=param.dtype, device="cpu")
-        return saved_tensor.detach().to(device="cpu")
+            return source.detach().to(dtype=param.dtype, device="cpu")
+        return source.detach().to(device="cpu")
 
     def _register_present_slots(self, param: Any, state: Dict[str, Any]) -> None:
         """Register configured state tensors that already exist in an optimizer state mapping."""
