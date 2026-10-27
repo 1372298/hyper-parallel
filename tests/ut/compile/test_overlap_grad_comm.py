@@ -67,6 +67,19 @@ def _opaque(tensor):
     return tensor
 
 
+def _contiguous_input(graph, launch, *, owned_aten=False):
+    """Model the untagged method emitted by FSDP, or an already owned ATen input."""
+    source = launch.args[0]
+    with graph.inserting_before(launch):
+        if owned_aten:
+            preparation = _call(graph, torch.ops.aten.contiguous.default, (source,))
+            preparation.meta["fsdp_reduce_scatter_prepare"] = launch.name
+        else:
+            preparation = graph.call_method("contiguous", (source,))
+    launch.replace_input_with(source, preparation)
+    return preparation
+
+
 class TestGradientOverlap(unittest.TestCase):
     """Only owned FSDP reductions move, with complete dependency/effect bounds."""
 
@@ -110,6 +123,73 @@ class TestGradientOverlap(unittest.TestCase):
         self.assert_order(module, grad0, launch, grad1)
         self.assertNotIn("fsdp_prefetch", module.meta,
                          f"expected no parameter scheduling statistics, got {module.meta}")
+
+    def test_private_layout_preparation_moves_with_launch_after_effects(self):
+        """Contiguous materialization and RS advance together without crossing effects."""
+        for target in (None, torch.ops.aten.add_.Tensor, _opaque):
+            with self.subTest(target=target):
+                module, (grad0, grad1), ((launch, wait), _) = _graph()
+                preparation = _contiguous_input(module.graph, launch)
+                boundary = grad0
+                if target is not None:
+                    with module.graph.inserting_before(grad1):
+                        args = (grad0, 1) if target is torch.ops.aten.add_.Tensor else (grad0,)
+                        boundary = _call(module.graph, target, args)
+                overlap_grad_comm(module, PassConfig())
+                self.assert_order(module, boundary, preparation, launch, grad1, wait)
+                self.assertIs(preparation.target, torch.ops.aten.contiguous.default,
+                              f"expected schema-backed contiguous, got {preparation.target}")
+                before = module.code
+                overlap_grad_comm(module, PassConfig())
+                self.assertEqual(module.code, before, f"expected stable code {before}, got {module.code}")
+                module.graph.lint()
+
+    def test_unsupported_layout_preparation_stays_in_place(self):
+        """Shared, foreign, forward and non-default methods retain their barriers."""
+        for case in ("shared", "foreign", "forward", "kwargs", "extra_arg", "other_method", "unowned_aten"):
+            with self.subTest(case=case):
+                module, (_, grad1), ((launch, _), _) = _graph()
+                preparation = _contiguous_input(module.graph, launch, owned_aten=case == "unowned_aten")
+                if case == "shared":
+                    output = next(node for node in module.graph.nodes if node.op == "output")
+                    output.args = ((*output.args[0], preparation),)
+                elif case == "unowned_aten":
+                    preparation.meta.pop("fsdp_reduce_scatter_prepare")
+                elif case == "foreign":
+                    preparation.meta["fsdp_reduce_scatter_prepare"] = "another_reduction"
+                elif case == "forward":
+                    preparation.meta["autograd_backward"] = False
+                elif case == "kwargs":
+                    preparation.kwargs = {"memory_format": torch.channels_last}
+                elif case == "extra_arg":
+                    preparation.args = (*preparation.args, torch.contiguous_format)
+                else:
+                    preparation.target = "clone"
+                original = (preparation.op, preparation.target, dict(preparation.meta))
+                overlap_grad_comm(module, PassConfig())
+                self.assert_order(module, grad1, preparation, launch)
+                self.assertEqual((preparation.op, preparation.target, preparation.meta), original,
+                                 f"expected unchanged preparation {original}, got {preparation}")
+                module.graph.lint()
+
+    def test_layout_preparation_wait_precedes_input_alias_release(self):
+        """Contiguous may alias an already contiguous gradient, so its RS must finish before free."""
+        for shared in (False, True):
+            with self.subTest(shared=shared):
+                module, (grad0, grad1), ((launch, wait), _) = _graph()
+                preparation = _contiguous_input(module.graph, launch)
+                output = next(node for node in module.graph.nodes if node.op == "output")
+                if shared:
+                    output.args = ((*output.args[0], preparation),)
+                with module.graph.inserting_before(output):
+                    release = _call(module.graph, _free_tensor_storage, (grad0,))
+                    release.meta["comm_type"] = "fsdp_reshard_free_backward"
+                    trailing = _call(module.graph, torch.ops.aten.relu.default, (grad1,))
+                overlap_grad_comm(module, PassConfig())
+                self.assert_order(module, grad0, preparation, launch, wait, release, trailing, output)
+                if not shared:
+                    self.assert_order(module, launch, grad1)
+                module.graph.lint()
 
     def test_switches_and_unowned_or_forward_reductions_are_noop(self):
         """Independent toggle permits a prefetch-only baseline; TP remains owned by TP."""
