@@ -21,7 +21,8 @@ communication):
 ``run`` guards:
 1. Early-returns when distributed is not initialized or ``world_size == 1``.
 2. Raises ``ValueError`` when the caller omits the live ``model=`` kwarg.
-3. Rejects the PP+FSDP hybrid without a mesh (v1 is pure-PP only).
+3. Rejects PP+FSDP without a pp group; with a registered ``pp`` group it
+   resolves stage/degree from the group and validates the pp x DP topology.
 
 Stage split (2-stage mini LLM, manual plan):
 4. Stage 0: state/grads sliced to its params, fwd subgraph ends at the
@@ -103,6 +104,9 @@ from hyper_parallel.compile.tracer.graph_tracer import (  # pylint: disable=C041
 )
 
 _PP_DIST_PATH = "hyper_parallel.compile.passes.parallel.pp_pass.dist"
+_PP_RESOLVE_PG_PATH = (
+    "hyper_parallel.compile.passes.parallel.pp_pass._resolve_process_group"
+)
 _SCHED_DIST_PATH = "hyper_parallel.compile.passes.parallel.pp_schedule.dist"
 
 _STAGE_FQNS = ["embed", "lin0", "lin1", "head"]
@@ -460,6 +464,86 @@ class TestPpPassRunGuards(unittest.TestCase):
             result = PpPass().run(gm, cfg, model=MiniLLM())
         self.assertIs(result, gm, "pp_degree=1 run should return the same graph")
         self.assertEqual(len(gm.state_fqns), 8, "skipped run must not slice state_fqns")
+
+
+class TestPpPassFsdpHybrid(unittest.TestCase):
+    """PP+DP hybrid: resolve stage/degree from the registered pp group."""
+
+    STAGE1_STATE = ["lin1.weight", "lin1.bias", "head.weight", "head.bias"]
+
+    @staticmethod
+    def _hybrid_cfg(**overrides: Any) -> PassConfig:
+        """Hybrid config: 2 pp stages x 2 DP ranks over a 4-rank world."""
+        cfg = {
+            "fsdp_enabled": True,
+            "pp_enabled": True,
+            "pp_degree": 2,
+            "fsdp_degree": 2,
+            "pp_microbatch_size": 1,
+        }
+        cfg.update(overrides)
+        return PassConfig(**cfg)
+
+    @contextmanager
+    def _hybrid_dist(self, group_rank: int):
+        """Group queries see the 2-rank pp axis; the world sees 4 ranks."""
+        with _patch_dist(world_size=4, rank=2 * group_rank) as mock_dist:
+            mock_dist.get_world_size.side_effect = lambda group=None: (
+                2 if group is not None else 4
+            )
+            mock_dist.get_rank.side_effect = lambda group=None: (
+                group_rank if group is not None else 2 * group_rank
+            )
+            with patch(_PP_RESOLVE_PG_PATH, return_value=MagicMock()) as resolve:
+                yield mock_dist, resolve
+
+    def _run(self, gm, model, group_rank=0, cfg=None):
+        """Run ``PpPass`` as pp group rank ``group_rank``; return dist + group."""
+        cfg = cfg or self._hybrid_cfg()
+        with self._hybrid_dist(group_rank) as (mock_dist, resolve):
+            PpPass(parallel_plan=_manual_plan()).run(
+                gm, cfg, model=model, pp_group_name="pp"
+            )
+        return mock_dist, resolve.return_value
+
+    def test_stage_resolved_from_pp_group_rank(self):
+        """Stage index and slicing follow the pp group rank, not the world rank."""
+        for group_rank, expected in (
+            (0, ["embed.weight", "embed.bias", "lin0.weight", "lin0.bias"]),
+            (1, self.STAGE1_STATE),
+        ):
+            with self.subTest(group_rank=group_rank):
+                gm = _mini_llm_joint_graph()
+                _, pg = self._run(gm, MiniLLM(), group_rank)
+                self.assertEqual(gm.state_fqns, expected)
+                self.assertEqual(gm.pp_schedule.stage_idx, group_rank)
+                self.assertEqual(gm.pp_schedule.pp_degree, 2)
+                self.assertIs(gm.pp_schedule.pp_group, pg)
+
+    def test_derives_fsdp_degree_without_new_group(self):
+        """Unset ``fsdp_degree`` is derived; no world-sized group is built."""
+        gm = _mini_llm_joint_graph()
+        mock_dist, _ = self._run(
+            gm, MiniLLM(), group_rank=1, cfg=self._hybrid_cfg(fsdp_degree=None)
+        )
+        mock_dist.new_group.assert_not_called()
+        self.assertEqual(gm.pp_schedule.stage_idx, 1)
+
+    def test_rejects_invalid_topology(self):
+        """Rejects untiled degrees, a pp-degree mismatch, and HSDP."""
+        cases = (
+            ({"fsdp_degree": 3}, "tile the world"),
+            ({"pp_degree": 4, "fsdp_degree": 1}, "does not match"),
+            ({"dp_mode": "hsdp"}, "3-D"),
+        )
+        for overrides, match in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, match):
+                    self._run(
+                        _mini_llm_joint_graph(),
+                        MiniLLM(),
+                        cfg=self._hybrid_cfg(**overrides),
+                    )
 
 
 class TestPpPassStage0(unittest.TestCase):

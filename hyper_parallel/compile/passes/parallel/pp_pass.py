@@ -52,7 +52,15 @@ value-level FX nodes that follow the data flow: this stage's all_gather /
 reduce_scatter nodes land inside its slices untouched, while foreign
 stages' collectives are simply never copied. Splitting first (PP before
 FSDP) would instead hand ``FSDPPass`` two subgraphs and a loss-less output
-list, breaking its grad-index contract.
+list, breaking its grad-index contract. This ordering is also what makes
+the PP+DP hybrid work with no extra machinery: with the 2-D ``(pp, DP)``
+mesh (``GraphCompiler._init_pp_dp_mesh``), ``FSDPPass`` shards parameters
+over the intra-stage DP group and ``PpPass`` pipelines each DP replica with
+the same DP replica of the neighbouring stages over the cross-stage
+``"pp"`` group. FSDP's backward re-gather / remat nodes are tagged
+``autograd_backward`` by ``FSDPPass`` precisely so this pass classifies
+them into the backward slice (lazy re-gather), and forward-phase reshard
+nodes stay in the forward slice.
 """
 
 __all__ = ["PpPass", "_auto_stage_split"]
@@ -64,8 +72,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 import torch
 import torch.distributed as dist
 from torch import fx, nn
+from torch.distributed.distributed_c10d import _resolve_process_group
 
-from ...pass_config import PassConfig
+from ...pass_config import PassConfig, normalize_dp_mode
 from ..base import GraphPass
 from ...graph_parallel_plan import GraphParallelPlan
 from .pp_schedule import PipelineScheduleBase, get_schedule_class
@@ -359,7 +368,7 @@ class PpPass(GraphPass):
         if pp_degree < 2:
             _LOG.info("Skipped: pp_degree=%s < 2", pp_degree)
             return None
-        pp_degree, group, stage_idx = self._resolve_group_and_stage(pass_config)
+        pp_degree, group, stage_idx = self._resolve_group_and_stage(pass_config, kwargs)
         _LOG.info(
             "Running: stage %s/%s, world_size=%s",
             stage_idx,
@@ -555,49 +564,117 @@ class PpPass(GraphPass):
     # Group / plan resolution
     # ------------------------------------------------------------------
 
-    def _resolve_group_and_stage(self, pass_config: PassConfig) -> Tuple[int, Any, int]:
+    def _resolve_group_and_stage(
+        self, pass_config: PassConfig, kwargs: Dict[str, Any]
+    ) -> Tuple[int, Any, int]:
         """Resolve PP degree, process group, and this rank's stage index.
+
+        Two layouts are supported:
+
+        - **PP+DP hybrid** (``pp_group_name`` kwarg, registered by
+          ``GraphCompiler._init_pp_dp_mesh``): the group spans one rank per
+          stage at this rank's DP position, so the stage index is simply this
+          rank's position within the group and every DP replica of a stage
+          pipelines with the same DP replica of its neighbours. Requires
+          ``pp_degree * dp_degree == world_size`` (validated here).
+        - **Pure PP** (no ``pp_group_name``): the group is the whole world
+          and each rank owns one stage. ``fsdp_enabled`` is rejected here —
+          a 1-D fallback FSDP mesh spans the whole world and would shard
+          parameters across stage boundaries; the hybrid must go through the
+          2-D mesh path.
 
         A single PP process group carries both forward activations and
         backward gradients; the schedule keeps the two ends of every
         neighbour pair's FIFO complementary (see ``Schedule1F1B``).
-
-        v1 supports the pure-PP layout (``pp_degree == world_size``, one
-        stage per rank); ``pp_degree == 1`` disables the pass. Any other
-        layout is rejected loudly: DP replication over one stage would
-        funnel every replica's P2P into a single peer rank (the group is
-        the whole world), and the PP+FSDP hybrid requires a mesh
-        expressing both dimensions (``mesh_context`` path) — the trainer's
-        1-D fallback mesh shards FSDP across the whole world and cannot
-        host PP, so that combination would silently mis-shard.
         """
+        pp_group_name = kwargs.get("pp_group_name")
+        if pp_group_name is not None:
+            return self._resolve_from_pp_group(pass_config, pp_group_name)
+
         world_size = dist.get_world_size()
         rank = dist.get_rank()
         pp_degree = pass_config.pp_degree or world_size
 
         if pp_degree not in (1, world_size):
             raise ValueError(
-                f"v1 supports pure-PP only: pp_degree={pp_degree} must "
-                f"equal world_size={world_size} (or be 1 to disable PP). "
-                f"DP-replication and PP+FSDP hybrid layouts require a "
-                f"mesh_context with an explicit pp dim."
+                f"Without a pp process group only pure-PP is supported: "
+                f"pp_degree={pp_degree} must equal world_size={world_size} "
+                f"(or be 1 to disable PP). For the PP+DP hybrid pass "
+                f"pp_group_name (registered by GraphCompiler's 2-D pp mesh)."
             )
         if pass_config.fsdp_enabled:
             raise ValueError(
-                "PP+FSDP hybrid requires a mesh expressing both the PP and "
-                "FSDP dimensions (mesh_context path). The trainer's 1-D "
-                "fallback FSDP mesh spans the whole world and cannot host "
-                "PP — FSDP would shard parameters across stage boundaries. "
-                "Run pure-PP (fsdp_enabled=False, pp_degree == world_size) "
-                "or provide a mesh_context with a pp dim."
+                "PP+FSDP hybrid requires a 2-D (pp, DP) mesh expressing both "
+                "dimensions: let GraphCompiler build it (fsdp_enabled=True + "
+                "pp_enabled=True, which registers the cross-stage 'pp' group "
+                "and passes pp_group_name to this pass). The 1-D fallback "
+                "FSDP mesh spans the whole world and cannot host PP — FSDP "
+                "would shard parameters across stage boundaries. Run pure-PP "
+                "(fsdp_enabled=False, pp_degree == world_size) or the mesh "
+                "path."
             )
 
         group = dist.new_group(list(range(world_size)))
-        # v1 is pure-PP (pp_degree == world_size, checked above), so each
-        # rank owns exactly one stage. Keep the general formula so a future
+        # Pure-PP (pp_degree == world_size, checked above), so each rank owns
+        # exactly one stage. Keep the general formula so a future
         # DP-replication layout (pp_degree < world_size) maps rank->stage
         # contiguously rather than silently assuming 1:1.
         stage_idx = rank * pp_degree // world_size
+        return pp_degree, group, stage_idx
+
+    def _resolve_from_pp_group(
+        self, pass_config: PassConfig, group_name: str
+    ) -> Tuple[int, Any, int]:
+        """Resolve stage/pp-degree from the registered ``"pp"`` group.
+
+        Validates the hybrid topology: the configured ``pp_degree`` (when
+        set) must match the group size, and with the DP axis enabled
+        ``pp_degree * dp_degree`` must tile the world. HSDP needs a 3-D mesh
+        and is rejected outright.
+        """
+        group = _resolve_process_group(group_name)
+        pp_degree = dist.get_world_size(group)
+        stage_idx = dist.get_rank(group)
+
+        configured = pass_config.pp_degree
+        if configured is not None and configured != pp_degree:
+            raise ValueError(
+                f"pass_config.pp_degree={configured} does not match the "
+                f"registered pp group size ({pp_degree})"
+            )
+
+        if pass_config.fsdp_enabled:
+            dp_mode = normalize_dp_mode(pass_config.dp_mode)
+            if dp_mode == "hsdp":
+                raise ValueError(
+                    "PP + HSDP requires a 3-D (pp, dp_replicate, fsdp_shard) "
+                    "mesh, which is not supported yet; run PP with "
+                    "dp_mode='fsdp' or 'ddp'"
+                )
+            dp_degree = (
+                pass_config.fsdp_degree
+                if dp_mode == "fsdp"
+                else pass_config.dp_replicate_degree
+            )
+            world_size = dist.get_world_size()
+            if dp_degree is None:
+                if world_size % pp_degree != 0:
+                    raise ValueError(
+                        f"world_size ({world_size}) not divisible by the pp "
+                        f"group size ({pp_degree}); cannot derive the DP "
+                        f"degree"
+                    )
+                dp_degree = world_size // pp_degree
+            if pp_degree * dp_degree != world_size:
+                raise ValueError(
+                    f"PP+DP degrees must tile the world: pp_degree "
+                    f"({pp_degree}) x dp_degree ({dp_degree}) != world_size "
+                    f"({world_size})"
+                )
+
+        _LOG.info(
+            "Resolved stage %s/%s from pp group '%s'", stage_idx, pp_degree, group_name
+        )
         return pp_degree, group, stage_idx
 
     def _resolve_stage_plan(self, model: nn.Module, pp_degree: int) -> List[List[str]]:

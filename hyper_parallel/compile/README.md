@@ -40,8 +40,12 @@ pass_config = PassConfig(enable_overlap=True)
 ### Layer 3: Pass Pipeline
 
 ```text
-DeadCodeElimination → CanonicalizeGraph → FSDPPass → PpPass → AutoOverlapPass → FsdpOverlapPass
+DeadCodeElimination → CanonicalizeGraph → FSDPPass
+    → AutoOverlapPass → FsdpOverlapPass → [PP: PpPass]
 ```
+
+`PpPass` runs last so every graph-level pass still sees the joint graph;
+it then replaces it with the schedule stub.
 
 **FSDPPass** (data-parallel, `PassConfig.dp_mode`):
 
@@ -69,8 +73,14 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
   boundaries, exchanging boundary activations/gradients via P2P
 - Installs a self-contained GPipe / 1F1B schedule (`pp_schedule`) as a
   `call_module` stub, so the trainer needs no PP wiring
-- v1 is pure-PP (`pp_degree == world_size`, `fsdp_enabled=False`); PP+FSDP
-  hybrids require a `mesh_context` carrying a pp dim
+- Pure PP: `fsdp_enabled=False`, `pp_degree == world_size`; the PP+FSDP /
+  PP+DDP hybrid uses the 2-D `(pp, DP)` mesh built by the compiler, which
+  registers the intra-stage DP group (`"fsdp"` / `"dp_replicate"`) and the
+  cross-stage `"pp"` group — `FSDPPass` shards parameters over the
+  intra-stage group (its collectives for foreign stages are never copied
+  into the stage slices) and `PpPass` pipelines each DP replica with the
+  same DP replica of the neighbouring stages. PP+HSDP and PP composed with
+  an external `MeshContext` are not supported yet.
 
 **AutoOverlapPass**:
 
@@ -86,6 +96,11 @@ Disable reshard with `PassConfig(fsdp_reshard_after_forward=False)`.
   reduce-scatter launches and delays their wait/view DAGs.
 - Both switches default to `True`, independently of the legacy `enable_overlap`
   flag. The legacy flag keeps selecting `AutoOverlapPass`.
+- `PpPass` runs last, so this pass always sees the FSDP collectives before
+  the split; after the split they live inside the schedule's per-stage
+  submodules where a graph-level pass could no longer reach them. The
+  reordering is value-level and dataflow-preserving, so the stage slices
+  inherit it unchanged.
 - `max_in_flight_gb=0.25` retains the previous 256 MiB speculative AG limit.
   The name and binary-unit conversion follow PyTorch's overlap scheduler;
   this pass accounts for early AG replicas until first use in each phase,
@@ -251,8 +266,9 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
 | Axis | Status | Notes |
 |------|--------|-------|
 | FSDP / DDP / HSDP | Implemented | `FSDPPass`; `PassConfig.dp_mode` selects the mode |
-| PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b`); pure-PP v1 |
+| PP | Implemented | `PpPass` + `pp_schedule` (`gpipe` / `1f1b`); pure PP and the PP+FSDP / PP+DDP hybrid (2-D `(pp, DP)` mesh) |
 | TP (+ SP / LP) | Via `mesh_context` | TP collectives are baked into automodel boundary forwards; graph mode reuses the mesh |
+| PP + HSDP / PP + TP | Planned | HSDP needs a 3-D mesh; TP-in-stage needs per-stage TP collectives in the graph |
 | EP | Planned | — |
 
 ## Limitations
@@ -270,8 +286,14 @@ tracer. It adds no runtime dependency on the separate MagiCompiler checkout.
   FSDP-sharded; they stay replicated and their gradient is `all_reduce`d over
   the DP group (DDP semantics, so replicas stay in sync). `FSDPPass` logs the
   fallback naming them.
-- **PP v1 is pure-PP**: `pp_degree == world_size` and `fsdp_enabled=False`.
-  PP+FSDP hybrids require a `mesh_context` exposing a pp dim.
+- **PP pure / hybrid split**: pure PP runs with `fsdp_enabled=False` and
+  `pp_degree == world_size`. The PP+FSDP / PP+DDP hybrid is supported
+  through the 2-D `(pp, DP)` mesh: set `fsdp_enabled=True`, `pp_enabled=True`
+  and `pp_degree` plus `fsdp_degree` (or `dp_replicate_degree` for DDP) with
+  `pp_degree * dp_degree == world_size`; the compiler registers the
+  intra-stage DP group and the cross-stage `"pp"` group. PP+HSDP (3-D mesh)
+  and PP composed with an external `MeshContext` are not supported yet.
+  Without a pp group (direct `PpPass` use), `fsdp_enabled=True` is rejected.
 - **`AutoOverlapPass` is a placeholder no-op** — see the pass note above.
 - **Compilation is not idempotent**: the partitioning passes mutate the live
   model in place, so `GraphCompiler.compile` may only be called once — a

@@ -143,13 +143,21 @@ class TestGraphCompilerForwardBackward(unittest.TestCase):
                 if transposed:
                     model.weight = nn.Parameter(model.weight.T)
                 x, y = _fixed_batch()
-                expected = torch.autograd.grad(_mse_train_fn(model, x=x, y=y), tuple(model.parameters()))
-                compiler = GraphCompiler(model, _mse_train_fn, PassConfig(fsdp_enabled=False),
-                                         device=torch.device("cpu"))
+                expected = torch.autograd.grad(
+                    _mse_train_fn(model, x=x, y=y), tuple(model.parameters())
+                )
+                compiler = GraphCompiler(
+                    model,
+                    _mse_train_fn,
+                    PassConfig(fsdp_enabled=False),
+                    device=torch.device("cpu"),
+                )
                 compiler.forward_backward(x=x, y=y)
                 for parameter, gradient in zip(model.parameters(), expected):
                     self.assertEqual(parameter.grad.stride(), parameter.stride())
-                    torch.testing.assert_close(parameter.grad, gradient, rtol=1e-5, atol=1e-6)
+                    torch.testing.assert_close(
+                        parameter.grad, gradient, rtol=1e-5, atol=1e-6
+                    )
 
     def test_grad_count_mismatch_raises(self):
         """Test the compiler refuses to assign on a trainable-count mismatch.
@@ -479,20 +487,88 @@ class TestGraphCompilerDeviceMesh(unittest.TestCase):
                 comp._init_device_mesh(None)
         self.assertIn("tp_size", str(ctx.exception))
 
-    def test_init_device_mesh_fallback_rejects_pp(self):
-        """Test the fallback refuses a PP topology (needs a MeshContext)."""
+    def test_init_device_mesh_pp_fsdp_builds_2d(self):
+        """Test the PP+FSDP hybrid builds a 2-D ``(pp, fsdp_shard)`` mesh."""
         comp = GraphCompiler(
             model=_make_model(),
             train_fn=_mse_train_fn,
-            pass_config=PassConfig(fsdp_enabled=True, pp_enabled=True),
+            pass_config=PassConfig(
+                fsdp_enabled=True, pp_enabled=True, pp_degree=2, fsdp_degree=2
+            ),
             device=torch.device("cpu"),
         )
         mock_dist = MagicMock()
         mock_dist.get_world_size.return_value = 4
-        with patch("hyper_parallel.compile.compiler.dist", mock_dist):
-            with self.assertRaises(ValueError) as ctx:
-                comp._init_device_mesh(None)
-        self.assertIn("pp_enabled", str(ctx.exception))
+
+        def _sub(group: str) -> MagicMock:
+            sub = MagicMock()
+            sub.size.return_value = 2
+            sub.get_group.return_value = group
+            return sub
+
+        fake_mesh = MagicMock()
+        fake_mesh.__getitem__.side_effect = {
+            "pp": _sub("PP_PG"),
+            "fsdp_shard": _sub("SHARD_PG"),
+        }.__getitem__
+        mock_init_mesh = MagicMock(return_value=fake_mesh)
+        mock_register = MagicMock()
+        with (
+            patch("hyper_parallel.compile.compiler.dist", mock_dist),
+            patch(
+                "hyper_parallel.compile.compiler._register_process_group",
+                mock_register,
+            ),
+            patch("hyper_parallel.compile.compiler.init_device_mesh", mock_init_mesh),
+        ):
+            comp._init_device_mesh(None)
+
+        call = mock_init_mesh.call_args
+        self.assertEqual(call.args[1], (2, 2))
+        self.assertEqual(call.kwargs.get("mesh_dim_names"), ("pp", "fsdp_shard"))
+        self.assertEqual(call.kwargs.get("rank_list"), tuple(range(4)))
+        registered = {c.args[0]: c.args[1] for c in mock_register.call_args_list}
+        self.assertEqual(registered, {"pp": "PP_PG", "fsdp": "SHARD_PG"})
+        self.assertEqual(comp.pass_config.pp_degree, 2)
+        self.assertEqual(comp.pass_config.fsdp_degree, 2)
+        self.assertEqual(comp._pp_group_name, "pp")
+
+    def test_build_pass_kwargs_hands_pp_group_to_pp_pass(self):
+        """Test ``_build_pass_kwargs`` forwards the registered pp group name."""
+        comp = GraphCompiler(
+            model=_make_model(),
+            train_fn=_mse_train_fn,
+            pass_config=PassConfig(
+                fsdp_enabled=True, pp_enabled=True, pp_degree=2, fsdp_degree=2
+            ),
+            device=torch.device("cpu"),
+        )
+        self.assertIsNone(comp._build_pass_kwargs().get("pp_group_name"))
+        comp._pp_group_name = "pp"
+        self.assertEqual(comp._build_pass_kwargs()["pp_group_name"], "pp")
+
+    def test_init_device_mesh_pp_rejects_invalid_topology(self):
+        """Test PP rejects an external MeshContext, HSDP, and untiled degrees."""
+        cases = (
+            ({"fsdp_degree": 2}, MagicMock(), "fsdp", "MeshContext"),
+            ({"fsdp_degree": 2, "dp_mode": "hsdp"}, None, "hsdp", "3-D"),
+            ({"pp_degree": 3, "fsdp_degree": 2}, None, "fsdp", "tile the world"),
+        )
+        for overrides, context, dp_mode, match in cases:
+            with self.subTest(match=match):
+                cfg = {"fsdp_enabled": True, "pp_enabled": True, "pp_degree": 2}
+                cfg.update(overrides)
+                comp = GraphCompiler(
+                    model=_make_model(),
+                    train_fn=_mse_train_fn,
+                    pass_config=PassConfig(**cfg),
+                    device=torch.device("cpu"),
+                )
+                mock_dist = MagicMock()
+                mock_dist.get_world_size.return_value = 4
+                with patch("hyper_parallel.compile.compiler.dist", mock_dist):
+                    with self.assertRaisesRegex(ValueError, match):
+                        comp._init_pp_dp_mesh(dp_mode, context)
 
     def test_init_device_mesh_context_upgrades_fsdp_to_hsdp(self):
         """Test a replicate axis > 1 upgrades ``dp_mode='fsdp'`` to ``'hsdp'``.
