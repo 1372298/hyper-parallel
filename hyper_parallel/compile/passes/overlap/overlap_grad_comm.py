@@ -28,7 +28,7 @@ import logging
 from dataclasses import dataclass
 
 from torch import fx
-from torch.ops import _c10d_functional
+from torch.ops import _c10d_functional, aten
 
 from ...pass_config import PassConfig
 from .utils import is_barrier, is_collective, is_op, is_view
@@ -45,6 +45,30 @@ class _Reduction:
     launch: fx.Node
     realization: list[fx.Node]
     input_aliases: set[fx.Node]
+    preparation: list[fx.Node]
+
+
+def _is_contiguous_method(node: fx.Node) -> bool:
+    return node.op == "call_method" and node.target == "contiguous"
+
+
+def _layout_preparation(launch: fx.Node) -> list[fx.Node]:
+    """Recognize private FSDP contiguous inputs without requiring emitter tags."""
+    inputs = launch.all_input_nodes
+    if len(inputs) != 1:
+        return []
+    source = inputs[0]
+    if set(source.users) != {launch} or source.meta.get("autograd_backward") is False:
+        return []
+    owner = source.meta.get("fsdp_reduce_scatter_prepare")
+    if owner is not None and owner != launch.name:
+        return []
+    if _is_contiguous_method(source):
+        if len(source.args) == 1 and isinstance(source.args[0], fx.Node) and not source.kwargs:
+            return [source]
+    if is_op(source, aten.contiguous) and owner == launch.name:
+        return [source]
+    return []
 
 
 def _alias_ancestors(inputs: list[fx.Node]) -> set[fx.Node]:
@@ -53,7 +77,8 @@ def _alias_ancestors(inputs: list[fx.Node]) -> set[fx.Node]:
     stack = list(inputs)
     while stack:
         node = stack.pop()
-        if is_view(node):
+        # Even an unmovable/shared Tensor.contiguous may return its input.
+        if is_view(node) or _is_contiguous_method(node):
             for arg in node.all_input_nodes:
                 if arg not in aliases:
                     aliases.add(arg)
@@ -67,10 +92,11 @@ def _is_input_release(node: fx.Node, match: _Reduction) -> bool:
     )
 
 
-def _collect_reductions(graph: fx.Graph) -> list[_Reduction]:
-    """Collect tagged backward reductions and their complete wait/alias DAGs."""
+def _collect_reductions(graph: fx.Graph) -> tuple[list[_Reduction], int]:
+    """Collect reductions and normalize their private method preparations."""
     order = {node: index for index, node in enumerate(graph.nodes)}
     matches = []
+    normalized = 0
     for launch in graph.nodes:
         if launch.meta.get("comm_type") != "fsdp_reduce_scatter":
             continue
@@ -89,9 +115,18 @@ def _collect_reductions(graph: fx.Graph) -> list[_Reduction]:
                 if is_view(user) and user not in realization:
                     realization.add(user)
                     stack.append(user)
+        preparation = _layout_preparation(launch)
+        for source in preparation:
+            if source.op == "call_method":
+                # Only a matched backward RS owns this default Tensor method.
+                # Its ATen schema exposes both purity and possible input aliasing.
+                source.op = "call_function"
+                source.target = aten.contiguous.default
+                source.meta.update(autograd_backward=True, fsdp_reduce_scatter_prepare=launch.name)
+                normalized += 1
         matches.append(_Reduction(launch, sorted(realization, key=order.get),
-                                  _alias_ancestors(launch.all_input_nodes)))
-    return matches
+                                  _alias_ancestors(launch.all_input_nodes), preparation))
+    return matches, normalized
 
 
 def _group(node: fx.Node) -> object:
@@ -132,22 +167,25 @@ def _advance_launches(graph: fx.Graph, matches: list[_Reduction]) -> int:
     nodes = list(graph.nodes)
     order = {node: index for index, node in enumerate(nodes)}
     boundaries = _launch_boundaries(nodes, matches)
-    launches = {match.launch for match in matches}
+    moving = {node for match in matches for node in [*match.preparation, match.launch]}
     moves = []
     for match in matches:
         launch = match.launch
-        ready = max(boundaries[launch], *(order[arg] for arg in launch.all_input_nodes))
+        chain = [*match.preparation, launch]
+        inputs = [arg for node in chain for arg in node.all_input_nodes if arg not in chain]
+        ready = max(boundaries[launch], *(order[arg] for arg in inputs))
         # Targets remain stationary until all launches have moved. A target
         # that is itself a moving reduction could invalidate dependencies.
         position = ready + 1
-        while position < len(nodes) and nodes[position] in launches:
+        while position < len(nodes) and nodes[position] in moving:
             position += 1
-        if position < order[launch]:
-            moves.append((position, order[launch], launch))
-    for position, _, launch in sorted(moves):
+        if position < order[chain[0]]:
+            moves.append((position, order[launch], chain))
+    for position, _, chain in sorted(moves):
         target = nodes[position]
-        target.prepend(launch)
-        launch.meta["fsdp_grad_overlap_anchor"] = target.name
+        for node in chain:
+            target.prepend(node)
+        chain[-1].meta["fsdp_grad_overlap_anchor"] = target.name
     return len(moves)
 
 
@@ -196,11 +234,11 @@ def overlap_grad_comm(graph_module: fx.GraphModule, pass_config: PassConfig) -> 
         return graph_module
     graph = graph_module.graph
     graph.lint()
-    matches = _collect_reductions(graph)
+    matches, normalized = _collect_reductions(graph)
     advanced = _advance_launches(graph, matches)
     sunk = _sink_waits(graph, matches)
     graph.lint()
-    if advanced or sunk:
+    if normalized or advanced or sunk:
         graph_module.recompile()
     graph_module.meta["fsdp_grad_overlap"] = {
         "matched": len(matches), "launches_advanced": advanced, "wait_view_nodes_sunk": sunk,
