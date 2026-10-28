@@ -38,6 +38,7 @@ from hyper_parallel.core.optimizer.sharding_category import (
     group_parameters_for_hsdp
 )
 from hyper_parallel.core.optimizer.swap_optimizer import is_swap_optimizer
+from hyper_parallel.core.optimizer.swap_optimizer_base import _restore_dtensor_metadata
 from hyper_parallel.core.optimizer.utils import empty_accelerator_cache, get_current_device, get_device_count
 
 logger = logging.getLogger(__name__)
@@ -193,11 +194,11 @@ class ChainedOptimizer:
         return self.chained_optimizers[0].defaults
 
     def state_dict(self) -> Dict[str, Any]:
-        """Return state dicts with DTensor values localized to CPU for serialization.
+        """Return state dicts with owning checkpoint tensor copies.
 
         In HSDP, optimizer state is only populated on the owner rank for replicated
         parameters. This method first broadcasts state to all replicate-group peers,
-        then converts DTensor values to local CPU tensors for serialization.
+        then clones exported values while preserving every DTensor layout.
         """
         prepared = []
         try:
@@ -248,23 +249,24 @@ class ChainedOptimizer:
 
     @staticmethod
     def _localize_state_dict_tensors(state_dict: Dict[str, Any]) -> None:
-        """Replace exported tensors with CPU copies that own their storage.
+        """Replace exported tensors with owning copies that retain DTensor layouts.
 
         Swap-managed optimizer state lives in CPU mirrors while its device
         storage is released, so a checkpoint entry must not alias a tensor whose
         storage the swap runtime is about to free.
         """
         def localize(value: Any) -> Any:
-            """Clone tensors in one nested checkpoint value onto CPU.
+            """Clone tensors in one nested checkpoint value.
 
             Args:
                 value: Checkpoint value or nested container to localize.
 
             Returns:
-                The value with every nested tensor replaced by an owning CPU copy.
+                The value with owning tensor copies and unchanged DTensor metadata.
             """
             if isinstance(value, torch.Tensor):
-                return to_local_if_dtensor(value).detach().cpu().clone()
+                local_copy = to_local_if_dtensor(value).detach().cpu().clone()
+                return _restore_dtensor_metadata(value, local_copy)
             if isinstance(value, dict):
                 return {key: localize(item) for key, item in value.items()}
             if isinstance(value, list):
