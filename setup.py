@@ -260,6 +260,7 @@ if __name__ == '__main__':
                 'generated/*.json', 'generated/*.diff',
             ],
             'hyper_parallel.auto_parallel': ['op_profiles/*.yaml', 'op_records.yaml'],
+            'hyper_parallel.models.deepseek_v3': ['recipes/*.yaml'],
             'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
                 'configs_eval/default.yaml',
             ],
