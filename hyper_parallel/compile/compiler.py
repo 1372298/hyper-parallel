@@ -41,7 +41,11 @@ from torch.distributed.distributed_c10d import _register_process_group
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 
-from .pass_config import PassConfig, normalize_dp_mode, build_pass_config_from_trainer_config
+from .pass_config import (
+    PassConfig,
+    normalize_dp_mode,
+    build_pass_config_from_trainer_config,
+)
 from .graph_parallel_plan import GraphParallelPlan
 from .passes.pipeline import PassPipeline
 from .tracer.dynamic_shapes import normalize_dynamic_arg_dims
@@ -94,7 +98,9 @@ class GraphCompiler:
                 Overrides automatic dimension selection and inherits trainer configuration when omitted.
         """
         compile_config = getattr(trainer_config, "compile", None)
-        self.dynamic = getattr(compile_config, "dynamic", False) if dynamic is None else dynamic
+        self.dynamic = (
+            getattr(compile_config, "dynamic", False) if dynamic is None else dynamic
+        )
         if not isinstance(self.dynamic, bool):
             raise ValueError("dynamic must be a bool")
         if dynamic_arg_dims is None:
@@ -119,6 +125,9 @@ class GraphCompiler:
         self._joint_graph = None
         self._expert_param_names: set[str] = set()
         self._pytree_pre_hook: Optional[Callable[[], None]] = None
+        # Set when the PP hybrid mesh registered a "pp" process group; makes
+        # ``_build_pass_kwargs`` hand the group name to ``PpPass``.
+        self._pp_group_name: Optional[str] = None
 
     @staticmethod
     def _resolve_pass_config(
@@ -149,7 +158,9 @@ class GraphCompiler:
             **inputs: Model inputs, forwarded to ``train_fn`` as keyword
                 arguments and used to trace the joint graph
         """
-        if (self.dynamic or self.dynamic_arg_dims is not None) and self.pass_config.pp_enabled:
+        if (
+            self.dynamic or self.dynamic_arg_dims is not None
+        ) and self.pass_config.pp_enabled:
             raise ValueError(
                 "Dynamic shapes with pipeline parallel are not supported yet; disable PP or dynamic shapes"
             )
@@ -167,8 +178,13 @@ class GraphCompiler:
 
         trace_kwargs = {}
         if self.dynamic or self.dynamic_arg_dims is not None:
-            trace_kwargs = {"dynamic": self.dynamic, "dynamic_arg_dims": self.dynamic_arg_dims}
-        joint_graph = trace_model_graph(self.model, self.train_fn, inputs, **trace_kwargs)
+            trace_kwargs = {
+                "dynamic": self.dynamic,
+                "dynamic_arg_dims": self.dynamic_arg_dims,
+            }
+        joint_graph = trace_model_graph(
+            self.model, self.train_fn, inputs, **trace_kwargs
+        )
 
         pipeline = PassPipeline.from_config(self.pass_config, self.parallel_plan)
 
@@ -223,7 +239,7 @@ class GraphCompiler:
     def _init_device_mesh(self, mesh_context: Optional[Any] = None):
         """Initialize the DP process group(s) for the configured ``dp_mode``.
 
-        Three modes (see ``PassConfig.dp_mode``), matching simplefsdp's
+        Four modes (see ``PassConfig.dp_mode``), matching simplefsdp's
         ``data_parallel`` and the eager ``fully_shard`` conventions:
 
         * ``"fsdp"`` (default): a 1-D ``("fsdp_shard",)`` mesh; the group is
@@ -232,24 +248,29 @@ class GraphCompiler:
           ``"dp_replicate"`` (no parameter sharding, grads all-reduced).
         * ``"hsdp"``: a 2-D ``("fsdp_replicate", "fsdp_shard")`` mesh
           (replicate, shard); both groups registered.
+        * PP hybrid (``pp_enabled``): a 2-D ``(pp, DP)`` mesh — see
+          ``_init_pp_dp_mesh``; the intra-stage DP group and the cross-stage
+          ``"pp"`` group are both registered.
 
         An external automodel ``MeshContext`` is reused when provided — its
         ``fsdp_replicate`` / ``fsdp_shard`` sub-meshes are registered under the
         graph-mode names, mirroring the eager ``FSDP2Manager``. The fallback
         builds the mesh with the repo ``init_device_mesh`` (the same builder the
-        eager stack uses) and only supports **pure DP** (``tp_size == 1``, PP
-        off); TP/PP topologies must supply a ``MeshContext``.
+        eager stack uses) and only supports pure DP (``tp_size == 1``) plus the
+        PP hybrid; TP topologies must supply a ``MeshContext``.
         """
         dp_mode = normalize_dp_mode(self.pass_config.dp_mode)
+        if self.pass_config.pp_enabled:
+            self._init_pp_dp_mesh(dp_mode, mesh_context)
+            return
+
         if mesh_context is not None:
             self._init_mesh_from_context(mesh_context, dp_mode)
             self._init_expert_dp(mesh_context)
             return
 
         self._require_pure_dp_fallback()
-        device_type = (
-            "npu" if (hasattr(torch, "npu") and torch.npu.is_available()) else "cpu"
-        )
+        device_type = self._mesh_device_type()
         world_size = dist.get_world_size()
         rank_list = tuple(range(world_size))
 
@@ -299,7 +320,9 @@ class GraphCompiler:
         context = self._mesh_context
         if context is None or getattr(context, "ep_size", 1) <= 1:
             return
-        if any(getattr(context, axis, 1) != 1 for axis in ("tp_size", "cp_size", "pp_size")):
+        if any(
+            getattr(context, axis, 1) != 1 for axis in ("tp_size", "cp_size", "pp_size")
+        ):
             raise ValueError("Graph EP currently requires TP=CP=PP=1")
         if self.pass_config.enable_overlap:
             raise ValueError("Graph EP currently requires enable_overlap=False")
@@ -312,39 +335,154 @@ class GraphCompiler:
         if mesh is None or "edp_shard" not in mesh.mesh_dim_names:
             raise ValueError("Graph EP requires the expert data-parallel shard mesh")
         if self.pass_config.dp_mode != "fsdp":
-            raise ValueError("Graph EP currently supports sharded data parallelism without replication")
+            raise ValueError(
+                "Graph EP currently supports sharded data parallelism without replication"
+            )
         if "edp_replicate" in mesh.mesh_dim_names and mesh["edp_replicate"].size() > 1:
-            raise ValueError("Graph EP currently does not support expert data-parallel replication")
+            raise ValueError(
+                "Graph EP currently does not support expert data-parallel replication"
+            )
         parameters = {
             id(parameter)
-            for module in self.model.modules() if hasattr(module, "local_expert_count")
+            for module in self.model.modules()
+            if hasattr(module, "local_expert_count")
             for parameter in module.parameters(recurse=False)
         }
         self._expert_param_names = {
-            name for name, parameter in self.model.named_parameters(remove_duplicate=False)
+            name
+            for name, parameter in self.model.named_parameters(remove_duplicate=False)
             if id(parameter) in parameters
         }
         if not self._expert_param_names:
             raise ValueError("Graph EP requires bound local expert parameters")
         self._register_mesh_group("fsdp_expert", mesh["edp_shard"])
 
-    def _require_pure_dp_fallback(self) -> None:
-        """Reject TP/PP topologies for the self-built DP mesh.
+    def _init_pp_dp_mesh(
+        self, dp_mode: str, mesh_context: Optional[Any] = None
+    ) -> None:
+        """Initialize the 2-D ``(pp, DP)`` mesh for the PP+FSDP/DDP hybrid.
 
-        The fallback mesh spans the whole world; with a TP or PP axis it would
-        shard/reduce across the wrong ranks. Those topologies must supply an
-        automodel ``MeshContext`` (which carries the proper DP sub-mesh).
+        Builds the mesh over the identity rank list (``rank = pp_idx *
+        dp_size + dp_idx``, PP-outer) and registers the intra-stage DP group
+        plus the cross-stage ``"pp"`` group that ``PpPass`` pipelines over.
+
+        Args:
+            dp_mode: Normalized DP mode (``"fsdp"`` or ``"ddp"``).
+            mesh_context: Must be ``None``; an external automodel
+                ``MeshContext`` composed with PP is not supported yet.
 
         Raises:
-            ValueError: When ``tp_size != 1`` or ``pp_enabled``.
+            ValueError: On a ``mesh_context``, ``"hsdp"``, missing degrees, or
+                degrees that do not tile the world.
+        """
+        if mesh_context is not None:
+            raise ValueError(
+                "PP composed with an external automodel MeshContext is not "
+                "supported yet; run the PP hybrid with the self-built mesh "
+                "(omit mesh_context and set pp_degree plus fsdp_degree / "
+                "dp_replicate_degree)"
+            )
+        if dp_mode == "hsdp":
+            raise ValueError(
+                "PP + HSDP requires a 3-D (pp, dp_replicate, fsdp_shard) "
+                "mesh, which is not supported yet; run PP with dp_mode='fsdp' "
+                "or 'ddp'"
+            )
+        pp_degree, dp_degree, dp_mesh_name = self._resolve_pp_dp_degrees(dp_mode)
+        world_size = dist.get_world_size()
+        mesh = init_device_mesh(
+            self._mesh_device_type(),
+            (pp_degree, dp_degree),
+            mesh_dim_names=("pp", dp_mesh_name),
+            rank_list=tuple(range(world_size)),
+            init_backend=True,
+        )
+        self._register_pp_dp_groups(mesh, dp_mode, dp_mesh_name, pp_degree, dp_degree)
+        _LOG.info(
+            "PP+DP mesh: pp_degree=%s dp_mode=%s dp_degree=%s world_size=%s",
+            pp_degree,
+            dp_mode,
+            dp_degree,
+            world_size,
+        )
+
+    def _resolve_pp_dp_degrees(self, dp_mode: str) -> Tuple[int, int, str]:
+        """Resolve and validate the ``(pp, DP)`` degrees and DP dim name."""
+        world_size = dist.get_world_size()
+        pp_degree = self.pass_config.pp_degree
+        if dp_mode == "ddp":
+            dp_degree = self.pass_config.dp_replicate_degree
+            dp_mesh_name = "dp_replicate"
+        else:
+            dp_degree = self.pass_config.fsdp_degree
+            dp_mesh_name = "fsdp_shard"
+        if pp_degree is None and dp_degree is None:
+            raise ValueError(
+                "PP + DP hybrid requires pp_degree together with (or instead "
+                "of) fsdp_degree / dp_replicate_degree so the 2-D mesh can be "
+                "sized; got both None"
+            )
+        if pp_degree is None:
+            if world_size % dp_degree != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) not divisible by the DP degree "
+                    f"({dp_degree}); cannot derive pp_degree"
+                )
+            pp_degree = world_size // dp_degree
+        if dp_degree is None:
+            if world_size % pp_degree != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) not divisible by pp_degree "
+                    f"({pp_degree}); cannot derive the DP degree"
+                )
+            dp_degree = world_size // pp_degree
+        if pp_degree * dp_degree != world_size:
+            raise ValueError(
+                f"PP+DP degrees must tile the world: pp_degree ({pp_degree}) "
+                f"x dp_degree ({dp_degree}) != world_size ({world_size})"
+            )
+        return pp_degree, dp_degree, dp_mesh_name
+
+    def _register_pp_dp_groups(
+        self, mesh: Any, dp_mode: str, dp_mesh_name: str, pp_degree: int, dp_degree: int
+    ) -> None:
+        """Register both hybrid groups and back-fill the pass-config degrees."""
+        self._register_mesh_group("pp", mesh["pp"])
+        self._register_mesh_group(
+            "fsdp" if dp_mesh_name == "fsdp_shard" else "dp_replicate",
+            mesh[dp_mesh_name],
+        )
+        self._pp_group_name = "pp"
+        self.pass_config.pp_degree = pp_degree
+        if dp_mode == "ddp":
+            self.pass_config.dp_replicate_degree = dp_degree
+        else:
+            self.pass_config.fsdp_degree = dp_degree
+
+    @staticmethod
+    def _mesh_device_type() -> str:
+        """Return the backend device type for the self-built mesh."""
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return "npu"
+        return "cpu"
+
+    def _require_pure_dp_fallback(self) -> None:
+        """Reject TP topologies for the self-built DP mesh.
+
+        The fallback mesh spans the whole world; with a TP axis it would
+        shard/reduce across the wrong ranks. TP topologies must supply an
+        automodel ``MeshContext`` (which carries the proper DP sub-mesh). PP
+        is handled by ``_init_pp_dp_mesh`` before this guard is reached.
+
+        Raises:
+            ValueError: When ``tp_size != 1``.
         """
         cfg = self.pass_config
-        if cfg.tp_size != 1 or cfg.pp_enabled:
+        if cfg.tp_size != 1:
             raise ValueError(
                 "Graph-mode DP without a MeshContext only supports pure data "
-                f"parallelism (tp_size=1, PP disabled); got tp_size={cfg.tp_size}, "
-                f"pp_enabled={cfg.pp_enabled}. Pass a MeshContext carrying the DP "
-                "sub-mesh for TP/PP hybrids."
+                f"parallelism (tp_size=1); got tp_size={cfg.tp_size}. Pass a "
+                "MeshContext carrying the DP sub-mesh for TP hybrids."
             )
 
     def _init_mesh_from_context(self, mesh_context: Any, dp_mode: str) -> None:
@@ -508,6 +646,13 @@ class GraphCompiler:
             # DDP / HSDP also reduce gradients on the replicate axis.
             if normalize_dp_mode(self.pass_config.dp_mode) in ("ddp", "hsdp"):
                 kwargs["dp_replicate_group_name"] = "dp_replicate"
+
+        # The PP hybrid mesh registered the cross-stage "pp" group; PpPass
+        # resolves its stage index from it and runs boundary P2P over it.
+        # Pure PP (fsdp_enabled=False) leaves it unset — PpPass then builds
+        # its world-sized group itself.
+        if self.pass_config.pp_enabled and self._pp_group_name is not None:
+            kwargs["pp_group_name"] = self._pp_group_name
 
         return kwargs
 

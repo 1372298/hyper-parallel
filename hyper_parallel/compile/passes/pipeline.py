@@ -27,10 +27,14 @@ Execution Order:
      while foreign stages' collectives are simply never copied. Splitting
      first would hand FSDPPass two subgraphs and a loss-less output list,
      breaking its grad-index contract.
-3. Communication-compute overlap: AutoOverlapPass (a no-op under PP — the
-   stage stub carries no wait_tensor nodes; the GPipe schedule overlaps
-   comm/compute at the Python level). Independent FSDP all-gather prefetch
-   and gradient overlap are scheduled by FsdpOverlapPass after AutoOverlapPass.
+3. Communication-compute overlap: AutoOverlapPass, then FsdpOverlapPass
+   (independent FSDP all-gather prefetch and gradient overlap).
+4. Pipeline split: PpPass runs last, after every graph-level pass. It
+   replaces the joint graph with a schedule stub, moving the collectives
+   into the schedule's per-stage submodules where a graph-level pass can
+   no longer reach them. Running it last keeps the non-PP pass order
+   untouched and still lets FsdpOverlapPass reorder the FSDP collectives
+   before the split.
 
 The backend compilation slot (InductorPass) is intentionally not wired yet;
 add it here when an inductor backend integration lands.
@@ -82,15 +86,19 @@ class PassPipeline:
         # 2. Execution layer: Parallel dimension partitioning
         if getattr(self.config, "fsdp_enabled", False):
             self.passes.append(FSDPPass(parallel_plan=self.parallel_plan))
-        if getattr(self.config, "pp_enabled", False):
-            self.passes.append(PpPass(parallel_plan=self.parallel_plan))
 
         # 3. Communication-compute overlap optimization
         if getattr(self.config, "enable_overlap", False):
             self.passes.append(AutoOverlapPass())
-
         if self.config.fsdp_allgather_prefetch or self.config.fsdp_overlap_grad_reduce:
             self.passes.append(FsdpOverlapPass())
+
+        # 4. Pipeline split must run last: it replaces the joint graph with a
+        # schedule stub, moving the collectives into the schedule's per-stage
+        # submodules. Every graph-level pass (notably FsdpOverlapPass) must
+        # therefore see the collectives before the split.
+        if getattr(self.config, "pp_enabled", False):
+            self.passes.append(PpPass(parallel_plan=self.parallel_plan))
 
         return self
 

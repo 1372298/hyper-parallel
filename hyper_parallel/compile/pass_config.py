@@ -129,10 +129,12 @@ class PassConfig:
             initialized or ``world_size == 1``.
         pp_degree: Number of pipeline-parallel ranks (== number of stages
             for the single-virtual-stage schedule shipped here). ``None``
-            means "resolve at runtime" from ``world_size`` (the pure-PP
-            path); for a PP+FSDP hybrid the FSDP group is a proper
-            sub-group of the world and the trainer back-fills this from
-            the mesh, exactly like ``fsdp_degree``.
+            means "resolve at runtime": pure-PP resolves it from
+            ``world_size``; the PP+DP hybrid resolves it from the 2-D
+            ``(pp, DP)`` mesh built by ``GraphCompiler._init_pp_dp_mesh``
+            (which also back-fills ``fsdp_degree`` /
+            ``dp_replicate_degree``), subject to
+            ``pp_degree * dp_degree == world_size``.
         pp_microbatch_size: Number of samples per microbatch for the
             pipeline schedule. The per-step batch size (the leading dim of
             the trainer's input tensor) must be divisible by this. ``1`` means
@@ -186,13 +188,27 @@ class PassConfig:
                 ``pp_microbatch_size``, an unknown ``pp_schedule`` /
                 ``dp_mode``, or a non-positive ``dp_replicate_degree``.
         """
+        self._validate_flags()
+        self._validate_dp()
+        self._validate_pp()
+
+    def _validate_flags(self) -> None:
+        """Validate boolean flags and the overlap memory budget."""
         for name in ("fsdp_allgather_prefetch", "fsdp_overlap_grad_reduce"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"{name} must be a bool")
         value = self.max_in_flight_gb
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
             raise ValueError("max_in_flight_gb must be a finite non-negative number")
+
+    def _validate_dp(self) -> None:
+        """Validate the tensor-parallel and data-parallel degrees."""
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
         if self.fsdp_degree is not None and self.fsdp_degree < 1:
@@ -209,6 +225,9 @@ class PassConfig:
                 f"dp_replicate_degree must be None or a positive int, "
                 f"got {self.dp_replicate_degree}"
             )
+
+    def _validate_pp(self) -> None:
+        """Validate the pipeline-parallel degree, microbatch size, and schedule."""
         if self.pp_degree is not None and self.pp_degree < 1:
             raise ValueError(
                 f"pp_degree must be None or a positive int, got {self.pp_degree}"
@@ -253,9 +272,15 @@ def build_pass_config_from_trainer_config(
         tp_size=accelerator.tp_size,
         sequence_parallel=accelerator.sequence_parallel,
         loss_parallel=accelerator.loss_parallel,
-        fsdp_reshard_after_forward=getattr(config.fsdp_config, "reshard_after_forward", True),
-        fsdp_allgather_prefetch=getattr(compile_config, "fsdp_allgather_prefetch", True),
-        fsdp_overlap_grad_reduce=getattr(compile_config, "fsdp_overlap_grad_reduce", True),
+        fsdp_reshard_after_forward=getattr(
+            config.fsdp_config, "reshard_after_forward", True
+        ),
+        fsdp_allgather_prefetch=getattr(
+            compile_config, "fsdp_allgather_prefetch", True
+        ),
+        fsdp_overlap_grad_reduce=getattr(
+            compile_config, "fsdp_overlap_grad_reduce", True
+        ),
         max_in_flight_gb=getattr(compile_config, "max_in_flight_gb", 0.25),
     )
 

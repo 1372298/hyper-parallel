@@ -87,9 +87,14 @@ Both come from `GraphParallelPlan.pp_stage(stage_idx, fqns)` /
 
 ## Current constraints (v1)
 
-- **Pure PP only**: `fsdp_enabled=False`. PP+FSDP hybrid requires a device
-  mesh expressing both dims (`mesh_context` path); the 1-D fallback FSDP
-  mesh cannot host PP and is rejected with a clear error.
+- **Pure PP by default**: `fsdp_enabled=False`. The PP+FSDP / PP+DDP hybrid
+  is supported through the compiler's 2-D `(pp, DP)` mesh: set
+  `fsdp_enabled=True` plus `pp_degree` and `fsdp_degree` /
+  `dp_replicate_degree` with `pp_degree * dp_degree == world_size` — the
+  intra-stage DP group and the cross-stage `pp` group are registered
+  automatically (PP-outer rank layout: each stage's DP ranks are
+  contiguous). PP+HSDP and PP composed with an external `MeshContext` are
+  not supported yet.
 - **Microbatch-shaped compile**: the trainer must `compile()` once with a
   microbatch-shaped sample (see `train.py`) — the traced graph bakes view
   sizes for one microbatch, and the schedule slices every full batch into
