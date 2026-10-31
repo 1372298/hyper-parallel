@@ -17,7 +17,6 @@
 from typing import Any, Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
 
 class _DSAKLLoss(torch.autograd.Function):
@@ -40,10 +39,37 @@ class _DSAKLLoss(torch.autograd.Function):
         actual_seq_kvlen: torch.Tensor,
         scale: float,
         loss_coeff: float,
+        backend: str,
     ) -> torch.Tensor:
         """Compute the KL loss and save its precomputed indexer gradients."""
-        grad_index_query, grad_index_key, grad_merge_weight, inner_loss = (
-            torch.ops.custom.npu_sparse_lightning_indexer_grad_kl_loss_enhance(
+        divisor = query.size(0)
+        if divisor == 0:
+            raise ValueError("DSA KL requires at least one valid query token")
+        # Load only the selected optional backend so either can be used independently.
+        # pylint: disable=import-outside-toplevel
+        if backend == "cann":
+            from hyper_parallel.components.functional.dsa_ops import _cann_dsa_sparse_indexer_kl_loss_grad
+
+            result = _cann_dsa_sparse_indexer_kl_loss_grad(
+                query,
+                key,
+                index_query,
+                index_key,
+                merge_weight,
+                topk_indices,
+                softmax_max,
+                softmax_sum,
+                scale,
+                query_rope=query_rope,
+                key_rope=key_rope,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_klen=actual_seq_kvlen,
+                layout="TND",
+            )
+        else:
+            import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+
+            result = torch.ops.custom.npu_sparse_lightning_indexer_grad_kl_loss_enhance(
                 query=query,
                 key=key,
                 query_index=index_query,
@@ -62,8 +88,8 @@ class _DSAKLLoss(torch.autograd.Function):
                 deterministic=torch.are_deterministic_algorithms_enabled(),
                 sparse_block_size=1,
             )
-        )
-        divisor = query.size(0)
+        # pylint: enable=import-outside-toplevel
+        grad_index_query, grad_index_key, grad_merge_weight, inner_loss = result
         ctx.save_for_backward(
             grad_index_query / divisor * loss_coeff,
             grad_index_key / divisor * loss_coeff,
@@ -79,7 +105,7 @@ class _DSAKLLoss(torch.autograd.Function):
             grad_index_query * grad_loss,
             grad_index_key * grad_loss,
             grad_merge_weight * grad_loss,
-            *((None,) * 11),
+            *((None,) * 12),
         )
 
 
@@ -98,6 +124,8 @@ def dsa_kl_loss(
     actual_seq_kvlen: torch.Tensor,
     scale: float,
     loss_coeff: float,
+    *,
+    backend: str = "omni",
 ) -> torch.Tensor:
     """Compute the DSA indexer KL loss.
 
@@ -106,8 +134,11 @@ def dsa_kl_loss(
     and ``softmax_sum`` come from :func:`dsa_sparse_attention`. The MLA query,
     key, and rotary states use TND layout; sequence lengths are cumulative
     int32 tensors, following the custom-operator call contract.
-    The result is a scalar auxiliary loss.
+    The result is a scalar auxiliary loss. The keyword-only ``backend`` selects
+    ``"omni"`` (default) or ``"cann"``.
     """
+    if backend not in ("cann", "omni"):
+        raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")
     return _DSAKLLoss.apply(
         index_query,
         index_key,
@@ -123,4 +154,5 @@ def dsa_kl_loss(
         actual_seq_kvlen,
         scale,
         loss_coeff,
+        backend,
     )

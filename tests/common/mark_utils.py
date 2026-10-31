@@ -1,4 +1,4 @@
-# Copyright 2024-2025 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,8 @@ from tests.common.random_generator import set_numpy_global_seed
 
 def arg_mark(plat_marks, level_mark, card_mark, essential_mark):
     """Apply pytest marks for platform, level, card and essential."""
-    optional_plat_marks = ['platform_ascend', 'platform_ascend910b', 'platform_ascend310p', 'platform_gpu',
-                           'cpu_linux', 'cpu_windows', 'cpu_macos']
+    optional_plat_marks = ['platform_ascend', 'platform_ascend910b', 'platform_ascend950', 'platform_ascend310p',
+                           'platform_gpu', 'cpu_linux', 'cpu_windows', 'cpu_macos']
     optional_level_marks = ['level0', 'level1', 'level2', 'level3', 'level4']
     optional_card_marks = ['onecard', 'allcards', 'dryrun', 'dryrun_only']
     optional_essential_marks = ['essential', 'unessential']

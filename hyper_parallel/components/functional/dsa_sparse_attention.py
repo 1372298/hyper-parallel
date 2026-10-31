@@ -19,7 +19,6 @@ from typing import Tuple
 import torch  # pylint: disable=forbidden-backend-import
 import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
 from einops import rearrange
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
 
 def dsa_sparse_attention(
@@ -31,6 +30,8 @@ def dsa_sparse_attention(
     scale: float,
     actual_seq_qlen: torch.Tensor,
     actual_seq_kvlen: torch.Tensor,
+    *,
+    backend: str = "omni",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute NPU DSA sparse flash attention without parameter-sink rescaling.
 
@@ -43,6 +44,7 @@ def dsa_sparse_attention(
         scale: Attention score scaling factor.
         actual_seq_qlen: Cumulative query lengths as an int32 NPU tensor.
         actual_seq_kvlen: Cumulative key lengths as an int32 NPU tensor.
+        backend: ``"omni"`` (default) or ``"cann"``.
 
     Returns:
         Attention output in BSND layout, followed by the softmax maximum and
@@ -50,28 +52,51 @@ def dsa_sparse_attention(
         the compressed-KV dimension followed by zero padding for the RoPE
         dimension required by the sparse-attention backward operator.
     """
+    if backend not in ("cann", "omni"):
+        raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")
     query_tnd = rearrange(query_nope, "b s n d -> (b s) n d")
     key_tnd = rearrange(compressed_kv, "b s n d -> (b s) n d")
     query_rope_tnd = rearrange(query_rope, "b s n d -> (b s) n d")
     key_rope_tnd = rearrange(key_rope, "b s n d -> (b s) n d")
-    output, softmax_max, softmax_sum = torch.ops.custom.npu_sparse_flash_attention_enhance(
-        query_tnd,
-        key_tnd,
-        key_tnd,
-        topk_indices,
-        scale,
-        block_table=None,
-        actual_seq_lengths_query=actual_seq_qlen,
-        actual_seq_lengths_kv=actual_seq_kvlen,
-        query_rope=query_rope_tnd,
-        key_rope=key_rope_tnd,
-        sparse_block_size=1,
-        layout_query="TND",
-        layout_kv="TND",
-        sparse_mode=3,
-        attention_mode=2,
-        return_softmax_lse=True,
-    )
+    # Load only the selected optional backend so either can be used independently.
+    # pylint: disable=import-outside-toplevel
+    if backend == "cann":
+        from hyper_parallel.components.functional.dsa_ops import _cann_dsa_sparse_attention
+
+        output, softmax_max, softmax_sum = _cann_dsa_sparse_attention(
+            query_tnd,
+            key_tnd,
+            key_tnd,
+            topk_indices,
+            scale,
+            query_rope=query_rope_tnd,
+            key_rope=key_rope_tnd,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_klen=actual_seq_kvlen,
+            layout="TND",
+        )
+    else:
+        import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+
+        output, softmax_max, softmax_sum = torch.ops.custom.npu_sparse_flash_attention_enhance(
+            query_tnd,
+            key_tnd,
+            key_tnd,
+            topk_indices,
+            scale,
+            block_table=None,
+            actual_seq_lengths_query=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_kvlen,
+            query_rope=query_rope_tnd,
+            key_rope=key_rope_tnd,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="TND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=True,
+        )
+    # pylint: enable=import-outside-toplevel
     if query_rope.size(-1) > 0:
         output = F.pad(output, [0, query_rope.size(-1)])
     output = rearrange(output, "(b s) n d -> b s n d", b=query_nope.shape[0])

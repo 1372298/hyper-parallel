@@ -18,7 +18,6 @@ from typing import Tuple
 
 import torch  # pylint: disable=forbidden-backend-import
 from einops import rearrange
-import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
 
 
 def dsa_indexer(
@@ -28,6 +27,8 @@ def dsa_indexer(
     actual_seq_qlen: torch.Tensor,
     actual_seq_kvlen: torch.Tensor,
     sparse_count: int,
+    *,
+    backend: str = "omni",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate top-k token indices for DSA sparse attention.
 
@@ -38,6 +39,7 @@ def dsa_indexer(
         actual_seq_qlen: Cumulative query lengths as an int32 NPU tensor.
         actual_seq_kvlen: Cumulative key lengths as an int32 NPU tensor.
         sparse_count: Number of token indices selected for each query.
+        backend: ``"omni"`` (default) or ``"cann"``.
 
     Returns:
         Top-k indices in ``[T, N_kv, K]`` int32 layout, followed by the query,
@@ -45,20 +47,40 @@ def dsa_indexer(
         without enough causal candidates are filled with ``-1``. The flattened
         tensors can be passed directly to :func:`dsa_kl_loss`.
     """
+    if backend not in ("cann", "omni"):
+        raise ValueError(f"backend must be 'cann' or 'omni', got {backend!r}")
     index_query_tnd = rearrange(index_query, "b s n d -> (b s) n d")
     index_key_tnd = rearrange(index_key, "b s n d -> (b s) n d")
     merge_weight_tnd = rearrange(merge_weight, "b s n -> (b s) n")
-    topk_indices, _ = torch.ops.custom.npu_lightning_indexer_enhance(
-        index_query_tnd,
-        index_key_tnd,
-        merge_weight_tnd,
-        actual_seq_lengths_query=actual_seq_qlen,
-        actual_seq_lengths_key=actual_seq_kvlen,
-        block_table=None,
-        layout_query="TND",
-        layout_key="TND",
-        sparse_count=sparse_count,
-        sparse_mode=3,
-        return_value=False,
-    )
+    # Load only the selected optional backend so either can be used independently.
+    # pylint: disable=import-outside-toplevel
+    if backend == "cann":
+        from hyper_parallel.components.functional.dsa_ops import _cann_dsa_indexer
+
+        topk_indices, _ = _cann_dsa_indexer(
+            index_query_tnd,
+            index_key_tnd,
+            merge_weight_tnd,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_klen=actual_seq_kvlen,
+            layout="TND",
+            sparse_count=sparse_count,
+        )
+    else:
+        import omni_training_custom_ops  # noqa: F401  # pylint: disable=unused-import
+
+        topk_indices, _ = torch.ops.custom.npu_lightning_indexer_enhance(
+            index_query_tnd,
+            index_key_tnd,
+            merge_weight_tnd,
+            actual_seq_lengths_query=actual_seq_qlen,
+            actual_seq_lengths_key=actual_seq_kvlen,
+            block_table=None,
+            layout_query="TND",
+            layout_key="TND",
+            sparse_count=sparse_count,
+            sparse_mode=3,
+            return_value=False,
+        )
+    # pylint: enable=import-outside-toplevel
     return topk_indices, index_query_tnd, index_key_tnd, merge_weight_tnd
