@@ -19,10 +19,12 @@ from torch import nn
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32RotaryEmbedding
 
 from hyper_parallel.models.materialization import register_rebuildable_buffer
+from hyper_parallel.models.deepseek_v32.adapter.indexer_share import install_indexer_share
 
 
 def register_rotary_materialization(model: nn.Module) -> None:
     """Retain native CPU RoPE initialization outside storage replaced by to_empty."""
+    install_indexer_share(model)
     for module in model.modules():
         if not isinstance(module, DeepseekV32RotaryEmbedding):
             continue

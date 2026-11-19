@@ -24,7 +24,12 @@ from hyper_parallel.components.modules.attention.deepseek_sparse_attention.cp_de
     CPDeepseekSparseAttentionModule, CPDeepseekV32SparseAttentionModule,
 )
 
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import (
+    IndexShareContext, IndexSharePlan, resolve_index_share_plan,
+)
+
 __all__ = [
+    "IndexShareContext", "IndexSharePlan", "resolve_index_share_plan",
     "DeepseekSparseAttention", "DeepseekSparseAttentionModule", "CPDeepseekSparseAttentionModule",
     "DeepseekV32SparseAttention", "DeepseekV32SparseAttentionModule", "CPDeepseekV32SparseAttentionModule",
 ]

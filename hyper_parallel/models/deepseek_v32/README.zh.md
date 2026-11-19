@@ -103,3 +103,16 @@ bash hyper_parallel/models/deepseek_v32/recipes/run_parallel_offline.sh \
 每篇 packed 文档须在每个 CP rank 上都有 query token。
 启用 sparse Indexer KL 时，当前 CANN 9.2 算子要求 **TP 切分后每个 rank** 的 query head 数为 32、64 或 128。
 其他限制见 [Attention 支持范围](../../components/modules/attention/deepseek_sparse_attention/readme.md#支持范围)。
+
+## Indexer Share
+
+支持在 Trainer YAML 的 `model.config_overrides` 设置 `dsa_indexer_types` 或 `dsa_index_topk_freq`，让 Shared 层省去 Indexer，
+复用前一个 Full 层的 Top-K。支持 `served`/`leader` 监督及 dense warm-up。
+支持 local 和 KV AllGather CP，不额外限制已有 TP、DP、EP 和 FSDP 能力；
+PP/SP 仍受模型原有边界限制。训练使用非重入 checkpoint；
+普通 Trainer 配方保留 `activation_checkpoint.mode: full`，由模型 adapter 自动接入。
+当前 HF loader 只覆盖已有 config 属性；须先在本地模型 config.json 补齐共享字段，
+否则 YAML 中新增的字段可能被忽略。操作步骤、字段含义和实际布局检查见
+[设计第 2 节](../../../docs/design/dsa_indexer_share.md#2-配置和布局)，
+可复制 [YAML 配置片段](recipes/indexer_share.fragment.yaml) 合入现有配方。
+手工安装入口、checkpoint 边界和单卡/CP2/CP4 精度复跑示例也见该设计文档。

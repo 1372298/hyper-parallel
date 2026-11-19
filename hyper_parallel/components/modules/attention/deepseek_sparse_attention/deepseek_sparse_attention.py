@@ -32,6 +32,9 @@ from hyper_parallel.components.functional.dsa_indexer import dsa_indexer
 from hyper_parallel.components.functional.dsa_kl_loss import dsa_kl_loss
 from hyper_parallel.components.functional.dsa_sparse_attention import dsa_sparse_attention
 from hyper_parallel.components.functional.npu_fusion_attention import resolve_packed_sequence_lengths
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import (
+    IndexShareContext, IndexShareState, resolve_index_share_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -277,6 +280,7 @@ def _deepseek_v32_dense_attention(
     index_states: tuple[torch.Tensor, ...],
     attention_states: tuple[torch.Tensor, ...],
     sequence_lengths: tuple[torch.Tensor, torch.Tensor],
+    *, loss_coefficient: float | None = None,
 ) -> torch.Tensor:
     """Run unabsorbed MLA FA and the fused dense indexer KL on local states."""
     query, compressed_kv, query_rope, key_rope = attention_states
@@ -285,7 +289,8 @@ def _deepseek_v32_dense_attention(
     )
     key, value = projected_kv.split((module.qk_nope_head_dim, module.v_head_dim), dim=-1)
     key_rope = key_rope.expand(-1, -1, query.shape[2], -1)
-    need_stats = bool(module.training and not module.freeze_dsa and module.dsa_loss_coeff)
+    coefficient = module.dsa_loss_coeff if loss_coefficient is None else loss_coefficient
+    need_stats = bool(module.training and not module.freeze_dsa and coefficient)
     output, maximum, total = _dense_flash_attention(
         module, torch.cat((query, query_rope), dim=-1), torch.cat((key, key_rope), dim=-1),
         value, sequence_lengths, need_stats=need_stats,
@@ -312,7 +317,7 @@ def _deepseek_v32_dense_attention(
             index_query, index_key, weights, teacher_query, teacher_key,
             maximum, total, indexer_stats, scale=module.scaling,
             query_rope=teacher_qrope, key_rope=teacher_krope,
-            query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=module.dsa_loss_coeff,
+            query_lengths=query_lengths, key_lengths=key_lengths, loss_coefficient=coefficient,
         )
         output = aux_loss_auto_scale(output, loss)
     return output
@@ -425,6 +430,9 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim, config.hidden_size, bias=bias, **factory_kwargs,
         )
+        self.indexer = None
+        if not self.is_index_leader:
+            return
         self.indexer = nn.Module()
         self.indexer.n_heads, self.indexer.head_dim = self.num_index_heads, self.index_head_dim
         self.indexer.index_topk = self.index_topk
@@ -466,7 +474,8 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         if module.kv_b_proj.bias is not None:
             raise ValueError("Absorbed KV projection requires a bias-free Linear")
         self.kv_b_proj = module.kv_b_proj
-        self.o_proj, self.indexer = module.o_proj, module.indexer
+        self.o_proj = module.o_proj
+        self.indexer = module.indexer if self.is_index_leader else None
 
     def _reuse_local_member(self, module: DeepseekV32SparseAttentionModule) -> None:
         """Promote a loaded unbound member without re-fusing or reinitializing values."""
@@ -477,6 +486,7 @@ class DeepseekV32SparseAttentionModule(nn.Module):
             "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim", "qk_head_dim", "index_head_dim",
             "num_index_heads", "index_topk", "scaling", "rotary_interleaved", "index_rotary_interleaved",
             "dsa_loss_coeff", "freeze_dsa", "dsa_dense_warm_up",
+            "index_share_plan", "is_index_leader",
             "_q_latent_output_size", "_kv_latent_output_size",
         )
         for name in fields:
@@ -520,6 +530,14 @@ class DeepseekV32SparseAttentionModule(nn.Module):
                 )
             self._initialize_dimensions(module)
             self._initialize_options(module)
+            self.index_share_plan = resolve_index_share_plan(self.config)
+            if self.index_share_plan.enabled and (
+                type(self.layer_idx) is not int or not 0 <= self.layer_idx < len(self.index_share_plan.leaders)
+            ):
+                raise ValueError("Indexer sharing requires a zero-based global layer_idx within num_hidden_layers")
+            self.is_index_leader = (
+                not self.index_share_plan.enabled or self.index_share_plan.leaders[self.layer_idx] == self.layer_idx
+            )
             if module is None:
                 self._initialize_config_layers(config)
             else:
@@ -533,10 +551,12 @@ class DeepseekV32SparseAttentionModule(nn.Module):
             return
         for child in (
             self.linear_qkv, self.q_a_layernorm, self.kv_a_layernorm, self.q_b_proj,
-            self.kv_b_proj, self.o_proj, self.indexer.wq_b, self.indexer.wk,
-            self.indexer.k_norm, self.indexer.weights_proj,
+            self.kv_b_proj, self.o_proj,
         ):
             child.reset_parameters()
+        if self.indexer is not None:
+            for child in self.indexer.children():
+                child.reset_parameters()
 
     def make_transforms(self) -> list[WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""
@@ -681,9 +701,11 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         softmax_stats: tuple[torch.Tensor, torch.Tensor],
         actual_q_len: torch.Tensor,
         actual_kv_len: torch.Tensor,
+        *, loss_coefficient: float | None = None,
     ) -> torch.Tensor:
         """Attach the sparse attention KL auxiliary loss when training enables it."""
-        if not (self.training and not self.freeze_dsa and self.dsa_loss_coeff):
+        coefficient = self.dsa_loss_coeff if loss_coefficient is None else loss_coefficient
+        if not (self.training and not self.freeze_dsa and coefficient):
             return attn_output
         query_tnd, key_tnd, q_rot_tnd, k_rot_tnd = (
             tensor.reshape(-1, tensor.shape[2], tensor.shape[3])
@@ -695,7 +717,7 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         aux_loss = dsa_kl_loss(
             *index_states, query_tnd, key_tnd,
             topk_indices, maximum, total, q_rot_tnd, k_rot_tnd,
-            actual_q_len, actual_kv_len, self.scaling, self.dsa_loss_coeff,
+            actual_q_len, actual_kv_len, self.scaling, coefficient,
             backend="cann",
         )
         return aux_loss_auto_scale(attn_output, aux_loss)
@@ -728,7 +750,9 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         query_rope, key_rope = _apply_attention_rope(
             query_rope, key_rope, position_embeddings, interleaved=self.rotary_interleaved,
         )
-        index_states = self._project_index_states(hidden_states, q_resid, position_embeddings)
+        index_states = (
+            self._project_index_states(hidden_states, q_resid, position_embeddings) if self.is_index_leader else ()
+        )
         return index_states, (query, latent_kv, query_rope, key_rope)
 
     def prepare_attention_inputs(
@@ -748,20 +772,50 @@ class DeepseekV32SparseAttentionModule(nn.Module):
     def run_attention(
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
         sequence_lengths: tuple[torch.Tensor, torch.Tensor], *, use_dense: bool,
+        index_share_context: IndexShareContext | None = None,
     ) -> torch.Tensor:
-        """Execute the shared dense/sparse kernel and restore local-head output."""
+        """Run selection once per group and supervise with each served layer's teacher."""
+        coefficient = self.dsa_loss_coeff
+        plan = self.index_share_plan
+        if plan.enabled:
+            if not isinstance(index_share_context, IndexShareContext):
+                raise ValueError("Indexer sharing requires a fresh IndexShareContext for each model forward")
+            leader = plan.leaders[self.layer_idx]
+            if plan.loss_mode == "served":
+                coefficient /= plan.group_size(self.layer_idx)
+            elif not self.is_index_leader:
+                coefficient = 0.0
+            if not self.is_index_leader:
+                state = index_share_context.groups.get(leader)
+                if state is None:
+                    raise ValueError(f"Shared layer {self.layer_idx} requires leader {leader} to run first")
+                if (state.use_dense != use_dense or state.index_topk != self.index_topk
+                        or state.index_states[0].shape[:2] != attention_states[0].shape[:2]
+                        or state.index_states[0].device != attention_states[0].device):
+                    raise ValueError("Shared Indexer requires matching stage, Top-K, batch/sequence and device")
+                index_states, topk = state.index_states, state.topk
+        if self.is_index_leader:
+            if use_dense:
+                topk = None
+            else:
+                topk, *_ = dsa_indexer(
+                    *index_states, *sequence_lengths, self.index_topk, backend="cann",
+                )
+            if plan.enabled:
+                index_share_context.groups[self.layer_idx] = IndexShareState(
+                    index_states, None if topk is None else topk.detach(), use_dense, self.index_topk,
+                )
         if use_dense:
             return _deepseek_v32_dense_attention(
-                self, index_states, attention_states, sequence_lengths,
+                self, index_states, attention_states, sequence_lengths, loss_coefficient=coefficient,
             ).flatten(2)
-        topk, *flattened = dsa_indexer(
-            *index_states, *sequence_lengths, self.index_topk, backend="cann",
-        )
+        flattened = tuple(tensor.flatten(0, 1) for tensor in index_states)
         output, maximum, total = dsa_sparse_attention(
             *attention_states, topk, self.scaling, *sequence_lengths, backend="cann",
         )
         output = self._apply_auxiliary_loss(
             output, tuple(flattened), attention_states, topk, (maximum, total), *sequence_lengths,
+            loss_coefficient=coefficient,
         )
         heads = output.shape[2]
         weight = self.kv_b_proj.weight.view(
@@ -782,10 +836,16 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_mask: torch.Tensor | None = None, past_key_values: Any | None = None,
         position_ids: torch.Tensor | None = None,
-        actual_seq_len: torch.Tensor | Sequence[int] | None = None, **kwargs: Any,
+        actual_seq_len: torch.Tensor | Sequence[int] | None = None,
+        index_share_context: IndexShareContext | None = None, **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         """Run causal or packed sparse attention while retaining the Transformers output ABI."""
         use_dense = self.use_dense_attention()
+        if self.index_share_plan.enabled and not isinstance(index_share_context, IndexShareContext):
+            raise ValueError("Indexer sharing requires a fresh IndexShareContext for each model forward")
+        if (self.index_share_plan.enabled and self.training and self.dsa_loss_coeff and not self.freeze_dsa
+                and not torch.is_grad_enabled()):
+            raise ValueError("Indexer sharing training requires grad-enabled forward and non-reentrant checkpointing")
         metadata = self.preflight_attention(
             hidden_states, attention_mask, past_key_values, position_ids, actual_seq_len, kwargs,
             use_dense=use_dense,
@@ -796,6 +856,7 @@ class DeepseekV32SparseAttentionModule(nn.Module):
         inputs = self.exchange_attention(inputs)
         output = self.run_attention(
             inputs.index_states, inputs.attention_states, inputs.metadata.sequence_lengths, use_dense=inputs.use_dense,
+            index_share_context=index_share_context,
         )
         del inputs
         return self.project_output(output), None

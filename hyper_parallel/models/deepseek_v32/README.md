@@ -107,3 +107,23 @@ or KV cache. Every packed document must have query tokens on every CP rank.
 With sparse Indexer KL enabled, the current CANN 9.2 operator requires 32, 64 or 128 query heads **per TP rank**.
 See the [attention guide](../../components/modules/attention/deepseek_sparse_attention/readme.md#支持范围)
 for the remaining constraints.
+
+## Indexer Share
+
+Set `dsa_indexer_types` or `dsa_index_topk_freq` under the Trainer YAML's
+`model.config_overrides` to reuse a
+Full layer's Top-K in following Shared layers, which own no Indexer parameters.
+Both `served` and `leader` supervision and dense warm-up support local and KV
+AllGather CP execution. Sharing adds no restrictions to the existing TP, DP, EP
+or FSDP support; the model's PP/SP limitations still apply. Use non-reentrant
+checkpointing. The Trainer's
+`activation_checkpoint.mode: full` selects model-owned non-reentrant regions and
+installs the per-forward carrier automatically. See the
+[design and runnable validation examples](../../../docs/design/dsa_indexer_share.md)
+for the explicit Python installation path, CP2/CP4 precision checks and checkpoint limitations.
+
+The current HF config loader only overrides existing attributes: seed the custom
+sharing keys in the local model's `config.json` before applying YAML overrides.
+See design section 2 for preparation, field definitions and an effective-layout
+check. Merge the [YAML fragment](recipes/indexer_share.fragment.yaml) into an
+existing recipe; it is not a standalone training configuration.

@@ -16,6 +16,7 @@
 
 from hyper_parallel.models.adapter_spec import ModelAdapterSpec
 from hyper_parallel.models.deepseek_v32.adapter.materialization import register_rotary_materialization
+from hyper_parallel.models.deepseek_v32.adapter.indexer_share import build_recompute_policy
 from hyper_parallel.models.deepseek_v32.adapter.policies.sharding import (
     build_parameter_sharding_rules,
 )
@@ -36,6 +37,7 @@ DEEPSEEK_V32_ADAPTER_SPEC = ModelAdapterSpec(
     model_type="deepseek_v32",
     replacements=_load_replacements,
     materialization=register_rotary_materialization,
+    recompute=build_recompute_policy,
     sharding_rules=build_parameter_sharding_rules,
 )
 register_model_adapter(DEEPSEEK_V32_ADAPTER_SPEC)

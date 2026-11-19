@@ -70,3 +70,14 @@ attention = DeepseekV32SparseAttention(module=source_attention)
 - 启用 sparse Indexer KL 时，当前 CANN 9.2 算子要求 TP 切分后的本地 query head 数为 32、64 或 128。
 - FSDP 包裹完整 attention 或外层 decoder block，不单独包裹 KV / 输出投影。
 - 扁平布局的 MOME / parameter-sink 扩展仅支持 TP1、CP1，默认关闭；V3.2 不支持这两个扩展。
+
+## V3.2 Indexer Share
+
+V3.2 local/CP member 支持配置 `dsa_indexer_types`、`dsa_index_topk_freq`、
+`dsa_index_skip_topk_offset` 和 `dsa_index_share_loss`。Shared 层无 Indexer 参数，
+复用前方 Full 层的选择；served 监督按真实组大小取均值。
+CP 下 Full gather 三路 key bank，Shared 仅 gather 本层的 main KV/RoPE key，
+复用 leader 已 gather 的 student 状态和本 rank query 的 Top-K。
+共享不额外限制已有 TP/DP/EP/FSDP；PP/SP 保留原有限制，不支持 generic 扁平 family 和 Top-K offload。
+模型需安装每次 forward 的共享状态入口，并使用非重入 checkpoint；
+详细配置与接入代码见 [Indexer Share 设计](../../../../../docs/design/dsa_indexer_share.md)。

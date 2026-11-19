@@ -107,19 +107,23 @@ def _gather_key_banks(
     index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
     metadata: SparseAttentionSequenceMetadata,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """Gather the three key banks in a fixed order, then select the causal prefix."""
-    index_query, index_key, weights = index_states
+    """Gather each layer's KV and only a Full layer's Indexer key bank.
+
+    Shared layers consume their leader's already-gathered Indexer states and
+    local-query Top-K. Their own main-attention KV must still be exchanged.
+    Every rank follows the same construction-time role and collective order.
+    """
     query, latent_kv, query_rope, key_rope = attention_states
-    tensors = (index_key, latent_kv, key_rope)
+    tensors = (index_states[1], latent_kv, key_rope) if index_states else (latent_kv, key_rope)
     if overlap:
         pending = tuple(context.launch_gather_sequence(tensor, dim=1) for tensor in tensors)
         gathered = tuple(receipt.wait()[0] for receipt in pending)
     else:
         gathered = tuple(context.gather_sequence(tensor, dim=1)[0] for tensor in tensors)
-    index_key, latent_kv, key_rope = (
-        tensor[:, :metadata.kv_prefix_length].contiguous() for tensor in gathered
-    )
-    return (index_query, index_key, weights), (query, latent_kv, query_rope, key_rope)
+    gathered = tuple(tensor[:, :metadata.kv_prefix_length].contiguous() for tensor in gathered)
+    latent_kv, key_rope = gathered[-2:]
+    ready_index_states = (index_states[0], gathered[0], index_states[2]) if index_states else ()
+    return ready_index_states, (query, latent_kv, query_rope, key_rope)
 
 
 class CPDeepseekV32SparseAttentionModule(DeepseekV32SparseAttentionModule):
@@ -160,7 +164,7 @@ class CPDeepseekV32SparseAttentionModule(DeepseekV32SparseAttentionModule):
         self, index_states: tuple[torch.Tensor, ...], attention_states: tuple[torch.Tensor, ...],
         metadata: SparseAttentionSequenceMetadata,
     ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-        """Gather three banks in fixed order and consume their causal prefixes.
+        """Gather owned banks in fixed order and consume their causal prefixes.
 
         All readiness receipts belong to this invocation. The existing gather
         adjoint sums consumers into each source shard, including the zero

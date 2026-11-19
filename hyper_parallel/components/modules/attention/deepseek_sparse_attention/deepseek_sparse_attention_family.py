@@ -20,6 +20,7 @@ from typing import Any
 
 from torch import nn
 
+from hyper_parallel.components.modules.attention.deepseek_sparse_attention.indexer_share import resolve_index_share_plan
 from hyper_parallel.components.modules.module_family import (
     ModuleFamily, VariantRule, build_family, register_module_family,
 )
@@ -48,6 +49,8 @@ def validate_generic_sparse_attention_family(
     """Keep MOME and parameter sinks local until their own distributed algorithms exist."""
     validate_sparse_attention_family(config=config, module=module, context=context, member=member)
     config = config if module is None else module.config
+    if resolve_index_share_plan(config).enabled:
+        raise ValueError("Indexer sharing is supported by DeepseekV32SparseAttention, not the generic flat family")
     use_mome = getattr(module, "use_mome", getattr(config, "use_mome", False))
     sink_count = getattr(module, "param_sink_number", getattr(config, "param_sink_number", 0))
     if (member.axis_sizes["tp"] > 1 or member.axis_sizes["cp"] > 1) and (
@@ -131,7 +134,7 @@ def v32_sparse_attention_parallel_spec(*, module: nn.Module, member: Any) -> Par
             ),
             "prepare_attention_inputs": ("hidden_states", "position_embeddings", "metadata", "use_dense"),
             "exchange_attention": ("inputs",),
-            "run_attention": ("index_states", "attention_states", "sequence_lengths", "use_dense"),
+            "run_attention": ("index_states", "attention_states", "sequence_lengths", "use_dense", "index_share_context"),
             "project_output": ("output",),
         },
         validate=validate_sparse_attention_layout,
