@@ -7,7 +7,7 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
+| Attention | `GroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DeepseekSparseAttention`, `DeepseekV32SparseAttention` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
@@ -28,6 +28,11 @@ output = norm(hidden_states)
 Registered module families select an implementation from explicit configuration rules before model construction.
 See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
 
+For attention replacement parameters, topology settings and framework-injected arguments, see
+[Attention YAML configuration](attention/readme.md). The
+[DeepSeek Sparse Attention guide](attention/deepseek_sparse_attention/readme.md) explains the flat and V3.2
+parameter layouts, native `config=` construction, source-module replacement, and CP / TP support.
+
 ## Attention families
 
 Choose an attention family for the model's mathematical variant:
@@ -38,6 +43,7 @@ Choose an attention family for the model's mathematical variant:
 | [GatedGroupedQueryAttention](attention/gated_grouped_query_attention/README.md) | Qwen3.5 full attention with RoPE and a sigmoid output gate |
 | [MultiLatentAttention](attention/multi_latent_attention/README.md) | MLA with expanded or latent KV communication and supported forward/backward overlap |
 | [GatedMultiLatentAttention](attention/gated_multi_latent_attention/README.md) | NoPE MLA with an independent output gate and gate-aware CP scheduling |
+| [DeepseekSparseAttention / DeepseekV32SparseAttention](attention/deepseek_sparse_attention/readme.md) | Sparse attention with flat or V3.2 parameter layouts, native construction and KV-AllGather CP |
 
 Each guide includes a YAML fragment, configuration choices, file responsibilities, the execution flow and support limits.
 Families support direct `config=` construction or `module=` conversion from a compatible source.

@@ -36,16 +36,16 @@ def replace_deepseek_v32_rms_norm(
 
 
 @module_replacement
-def replace_deepseek_v32_dsa_attention(
+def replace_deepseek_v32_sparse_attention(
     *,
     module: nn.Module,
     module_fqn: str,
     context: Mapping[str, Any],
 ) -> nn.Module:
-    """Replace DeepSeek-V3.2 MLA/indexer attention with the fused DSA module."""
-    from hyper_parallel.components.modules import DeepseekV32DSAAttention  # pylint: disable=C0415
+    """Preserve the legacy replacement entry point through the sparse attention family."""
+    from hyper_parallel.components.modules import DeepseekV32SparseAttention  # pylint: disable=C0415
 
-    return DeepseekV32DSAAttention(module=module, module_fqn=module_fqn, context=context)
+    return DeepseekV32SparseAttention(module=module, module_fqn=module_fqn, context=context)
 
 
 @module_replacement
@@ -68,7 +68,7 @@ def replace_deepseek_v32_grouped_experts(
 
 
 __all__ = [
-    "replace_deepseek_v32_dsa_attention",
+    "replace_deepseek_v32_sparse_attention",
     "replace_deepseek_v32_grouped_experts",
     "replace_deepseek_v32_rms_norm",
 ]
